@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3*
+.local-secret
+.env
+staticfiles/
+.coverage
+backups/
