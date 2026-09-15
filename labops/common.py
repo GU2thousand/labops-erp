@@ -7,7 +7,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 from .models import User, RuntimeState, AuditEvent, CommandResult, Project, Task
 
-ROLES = {'ADMIN':'管理员','MANAGER':'项目经理','BUYER':'采购员','STORE':'库管','TECH':'实验员','AUDITOR':'审计员'}
+ROLES = {'ADMIN':'Administrator','MANAGER':'Project manager','BUYER':'Purchasing officer','STORE':'Warehouse operator','TECH':'Lab technician','AUDITOR':'Auditor'}
 class BusinessError(Exception):
     def __init__(self, code, message, status=422, field=''):
         self.code,self.message,self.status,self.field = code,message,status,field
@@ -17,41 +17,41 @@ def require(condition, code, message, status=422, field=''):
     if not condition: fail(code,message,status,field)
 def roles(user): return set(user.groups.values_list('name',flat=True))
 def allow(user, *allowed):
-    require(user.is_active, 'UNAUTHORIZED','账号已停用',401)
-    require(bool(roles(user) & set(allowed)), 'FORBIDDEN','当前角色没有此操作权限',403)
+    require(user.is_active, 'UNAUTHORIZED','Account is inactive',401)
+    require(bool(roles(user) & set(allowed)), 'FORBIDDEN','Your role does not permit this action',403)
 def project_scope(user, project, write=False):
     r = roles(user)
     if 'ADMIN' in r: return
     if not write and 'AUDITOR' in r: return
-    require(bool(r & {'MANAGER','TECH'}) and project.members.filter(id=user.id).exists(), 'NOT_FOUND','项目不存在或无权访问',404)
+    require(bool(r & {'MANAGER','TECH'}) and project.members.filter(id=user.id).exists(), 'NOT_FOUND','Project not found or access denied',404)
 def visible_projects(user):
     if roles(user) & {'ADMIN','AUDITOR'}: return Project.objects.all()
     if roles(user) & {'MANAGER','TECH'}: return Project.objects.filter(members=user).distinct()
     return Project.objects.none()
 def require_open(project):
-    require(project.status not in ['ARCHIVED','COMPLETED','CANCELLED'],'PROJECT_READ_ONLY','项目已结束，不可修改')
+    require(project.status not in ['ARCHIVED','COMPLETED','CANCELLED'],'PROJECT_READ_ONLY','The project has ended and cannot be edited')
 def obj(model, id):
     try: return model.objects.get(pk=id)
-    except (model.DoesNotExist, ValueError, ValidationError): fail('NOT_FOUND','记录不存在或已不可用',404)
+    except (model.DoesNotExist, ValueError, ValidationError): fail('NOT_FOUND','Record not found or no longer available',404)
 def text(value, field, max_len=160, required=True):
-    require(isinstance(value,str),'INVALID_FIELD',f'{field} 必须是文本',400,field)
+    require(isinstance(value,str),'INVALID_FIELD',f'{field} must be text',400,field)
     s=value.strip()
-    require((not required or bool(s)) and len(s)<=max_len,'INVALID_FIELD',f'{field} 不能为空且最多 {max_len} 字符',422,field)
+    require((not required or bool(s)) and len(s)<=max_len,'INVALID_FIELD',f'{field} is required and must not exceed {max_len} characters',422,field)
     return s
 
 def qty(value, field='qty', positive=True):
     try: d=Decimal(str(value))
-    except (InvalidOperation, ValueError): fail('INVALID_NUMBER','请输入有效数字',422,field)
-    require(d.is_finite() and abs(d)<Decimal('1000000000000') and d==d.quantize(Decimal('0.000001')),'INVALID_NUMBER','最多十二位整数和六位小数',422,field)
-    require(d>0 if positive else d>=0,'INVALID_NUMBER','数值必须大于 0' if positive else '数值不能小于 0',422,field)
+    except (InvalidOperation, ValueError): fail('INVALID_NUMBER','Enter a valid number',422,field)
+    require(d.is_finite() and abs(d)<Decimal('1000000000000') and d==d.quantize(Decimal('0.000001')),'INVALID_NUMBER','Use at most 12 integer digits and 6 decimal places',422,field)
+    require(d>0 if positive else d>=0,'INVALID_NUMBER','Value must be greater than 0' if positive else 'Value must be at least 0',422,field)
     return d
 
 def day(value, field='date', optional=False):
     if not value and optional: return None
     try: return date.fromisoformat(value)
-    except (ValueError,TypeError): fail('INVALID_DATE','请输入 YYYY-MM-DD 日期',422,field)
+    except (ValueError,TypeError): fail('INVALID_DATE','Enter a date in YYYY-MM-DD format',422,field)
 def version(record, data):
-    require(type(data.get('expected_version')) is int and data['expected_version']==record.version,'VERSION_CONFLICT','记录已更新，请刷新后核对再提交',409,'expected_version')
+    require(type(data.get('expected_version')) is int and data['expected_version']==record.version,'VERSION_CONFLICT','Record has changed. Refresh, review, and submit again',409,'expected_version')
 def jsonable(x): return json.loads(json.dumps(x, cls=DjangoJSONEncoder))
 def snapshot(record):
     data=jsonable({f.attname:getattr(record,f.attname) for f in record._meta.fields if f.name not in ['password','last_login']})
@@ -77,7 +77,7 @@ def idempotent(user,key,kind,data,fn):
     hashed=digest({'actor':str(user.id),'kind':kind,'data':data})
     cached=CommandResult.objects.filter(key=key).first()
     if cached:
-        require(cached.request_hash==hashed,'IDEMPOTENCY_CONFLICT','相同幂等键已用于不同请求',409)
+        require(cached.request_hash==hashed,'IDEMPOTENCY_CONFLICT','This idempotency key was used for a different request',409)
         return cached.result_json
     result=jsonable(fn())
     CommandResult.objects.create(key=key,request_hash=hashed,result_json=result)
@@ -91,6 +91,6 @@ def atomic_command(fn):
             # SQLite uses BEGIN IMMEDIATE; PostgreSQL locks this singleton row.
             RuntimeState.objects.select_for_update().get(pk=1)
             user=User.objects.get(pk=user.pk)
-            require(user.is_active,'UNAUTHORIZED','账号已停用',401)
+            require(user.is_active,'UNAUTHORIZED','Account is inactive',401)
             return fn(user,*args,**kwargs)
     return wrapped

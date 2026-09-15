@@ -18,7 +18,7 @@ if os.environ.get('POSTGRES_DB'):
     DATABASES = {'default': {'ENGINE':'django.db.backends.postgresql','NAME':os.environ['POSTGRES_DB'],'USER':os.environ.get('POSTGRES_USER','labops'),'PASSWORD':os.environ.get('POSTGRES_PASSWORD',''),'HOST':os.environ.get('POSTGRES_HOST','127.0.0.1'),'PORT':os.environ.get('POSTGRES_PORT','5432')}}
 AUTH_USER_MODEL = 'labops.User'
 AUTH_PASSWORD_VALIDATORS = [{'NAME':'django.contrib.auth.password_validation.MinimumLengthValidator','OPTIONS':{'min_length':10}},{'NAME':'django.contrib.auth.password_validation.CommonPasswordValidator'}]
-LANGUAGE_CODE = 'zh-hans'
+LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'America/New_York'
 USE_TZ = True
 STATIC_URL = '/static/'

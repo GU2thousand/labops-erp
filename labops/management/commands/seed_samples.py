@@ -7,7 +7,7 @@ class Command(BaseCommand):
     def handle(self,*a,**kw):
         admin=User.objects.filter(email='admin@labops.local').first()
         if not admin:return
-        for code,name,typ in [('TEST-NUT','微量营养素检测（模拟）','SERUM'),('TEST-MOL','分子检测验证（模拟）','BLOOD'),('TEST-QC','质控样本检测（模拟）','PLASMA')]:TestCatalog.objects.get_or_create(code=code,defaults=dict(name=name,sample_type=typ,created_by=admin,updated_by=admin))
+        for code,name,typ in [('TEST-NUT','Micronutrient Testing (Simulated)','SERUM'),('TEST-MOL','Molecular Assay Validation (Simulated)','BLOOD'),('TEST-QC','QC Sample Testing (Simulated)','PLASMA')]:TestCatalog.objects.get_or_create(code=code,defaults=dict(name=name,sample_type=typ,created_by=admin,updated_by=admin))
         if LabOrder.objects.exists():return
         p=Project.objects.filter(code='PRJ-2026-001').first()
         if not p:return

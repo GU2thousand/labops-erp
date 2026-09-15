@@ -6,7 +6,7 @@ def request_scope(user,request,write=False):
     r=roles(user)
     if r & {'ADMIN','BUYER','STORE'}: return
     if not write and 'AUDITOR' in r: return
-    require(request.project_id is not None,'NOT_FOUND','申请不存在或无权访问',404)
+    require(request.project_id is not None,'NOT_FOUND','Request not found or access denied',404)
     project_scope(user,request.project,write)
 
 def request_available(line,exclude=None):
@@ -25,18 +25,18 @@ def write_request(user,data,rid,id=None):
     pr=obj(PurchaseRequest,id) if id else None
     if pr:
         request_scope(user,pr,True)
-        require(pr.created_by_id==user.id,'FORBIDDEN','只能修改自己创建的草稿',403)
-        version(pr,data); require(pr.status in ['DRAFT','REJECTED'],'DOCUMENT_LOCKED','仅草稿或驳回申请可修改')
+        require(pr.created_by_id==user.id,'FORBIDDEN','You can only edit drafts you created',403)
+        version(pr,data); require(pr.status in ['DRAFT','REJECTED'],'DOCUMENT_LOCKED','Only draft or rejected requests can be edited')
     project_id=data.get('project_id',str(pr.project_id) if pr and pr.project_id else '')
     p=obj(Project,project_id) if project_id else None
     if p: project_scope(user,p,True); require_open(p)
-    if not p: require(bool(roles(user)&{'ADMIN','BUYER','STORE'}),'FORBIDDEN','请指定你有权限的项目',403)
+    if not p: require(bool(roles(user)&{'ADMIN','BUYER','STORE'}),'FORBIDDEN','Specify a project you can access',403)
     reason=text(data.get('reason',pr.reason if pr else ''),'reason',5000)
     lines=data.get('lines',[])
-    require(isinstance(lines,list) and len(lines)<=100,'INVALID_LINES','每张申请最多 100 行')
+    require(isinstance(lines,list) and len(lines)<=100,'INVALID_LINES','Maximum lines per request: 100  rows')
     parsed=[]
     for n,x in enumerate(lines,1):
-        item=obj(Item,x.get('item_id')); require(item.is_active,'INACTIVE_ITEM','停用物料不能加入新申请')
+        item=obj(Item,x.get('item_id')); require(item.is_active,'INACTIVE_ITEM','Inactive items cannot be added to a new request')
         parsed.append(dict(line_no=n,item=item,qty=qty(x.get('qty')),needed_by=day(x.get('needed_by'),'needed_by')))
     if pr:
         before=snapshot(pr); pr.project=p; pr.reason=reason; pr.lines.all().delete()
@@ -51,50 +51,50 @@ def request_action(user,id,action,data,rid):
     pr=obj(PurchaseRequest,id); request_scope(user,pr,True); version(pr,data)
     before=snapshot(pr)
     if action=='submit':
-        require(pr.created_by_id==user.id,'FORBIDDEN','只能提交自己的申请',403)
-        require(pr.status=='DRAFT','INVALID_TRANSITION','请先将申请恢复为草稿')
-        require(pr.lines.exists(),'EMPTY_LINES','请至少添加一条申请明细')
-        require(not pr.lines.filter(item__is_active=False).exists(),'INACTIVE_ITEM','申请包含停用物料')
+        require(pr.created_by_id==user.id,'FORBIDDEN','You can only submit your own requests',403)
+        require(pr.status=='DRAFT','INVALID_TRANSITION','Restore the request to draft first')
+        require(pr.lines.exists(),'EMPTY_LINES','Add at least one request line')
+        require(not pr.lines.filter(item__is_active=False).exists(),'INACTIVE_ITEM','The request contains inactive items')
         if pr.project: require_open(pr.project)
         pr.status='SUBMITTED'; pr.submitted_at=timezone.now(); pr.approved_by=None; pr.approved_at=None; pr.decision_reason=''
     elif action=='decision':
         allow(user,'ADMIN')
-        require(pr.created_by_id!=user.id,'SELF_APPROVAL_DENIED','不能审批自己创建的申请，请由另一位管理员审批',403)
-        require(pr.status=='SUBMITTED','INVALID_TRANSITION','申请不处于待审批状态')
-        require(data.get('decision') in ['APPROVE','REJECT'],'INVALID_DECISION','审批决定无效')
+        require(pr.created_by_id!=user.id,'SELF_APPROVAL_DENIED','You cannot approve your own request; ask another administrator',403)
+        require(pr.status=='SUBMITTED','INVALID_TRANSITION','The request is not awaiting approval')
+        require(data.get('decision') in ['APPROVE','REJECT'],'INVALID_DECISION','Invalid approval decision')
         pr.decision_reason=text(data.get('reason',''),'reason',2000)
         pr.status='APPROVED' if data['decision']=='APPROVE' else 'REJECTED'
         pr.approved_by=user; pr.approved_at=timezone.now()
         from labops.operations.services import emit
-        emit('PURCHASE_DECISION',pr,'采购申请已批准' if pr.status=='APPROVED' else '采购申请已驳回',pr.request_no+' · '+pr.reason,[pr.created_by_id],suffix=str(pr.version))
+        emit('PURCHASE_DECISION',pr,'Purchase request approved' if pr.status=='APPROVED' else 'Purchase request rejected',pr.request_no+' · '+pr.reason,[pr.created_by_id],suffix=str(pr.version))
     elif action=='withdraw':
-        require(pr.created_by_id==user.id,'FORBIDDEN','只能撤回自己的申请',403)
-        require(pr.status in ['SUBMITTED','REJECTED'],'INVALID_TRANSITION','只能撤回待审或恢复已驳回申请')
+        require(pr.created_by_id==user.id,'FORBIDDEN','You can only withdraw your own requests',403)
+        require(pr.status in ['SUBMITTED','REJECTED'],'INVALID_TRANSITION','Only submitted requests can be withdrawn or rejected requests restored')
         pr.status='DRAFT'; pr.approved_by=None; pr.approved_at=None; pr.decision_reason=''; pr.submitted_at=None
     elif action=='cancel':
         if pr.status=='APPROVED':
             allow(user,'ADMIN')
-            require(not OrderLine.objects.filter(request_line__request=pr).exclude(order__status='CANCELLED').exists(),'ORDER_EXISTS','已有关联有效订单，不能取消申请')
+            require(not OrderLine.objects.filter(request_line__request=pr).exclude(order__status='CANCELLED').exists(),'ORDER_EXISTS','This request has active orders and cannot be cancelled')
         else:
-            require(pr.created_by_id==user.id,'FORBIDDEN','只能取消自己的申请',403)
-            require(pr.status in ['DRAFT','REJECTED'],'INVALID_TRANSITION','当前状态不能取消')
+            require(pr.created_by_id==user.id,'FORBIDDEN','You can only cancel your own requests',403)
+            require(pr.status in ['DRAFT','REJECTED'],'INVALID_TRANSITION','Cannot cancel in the current status')
         pr.status='CANCELLED'
-    else: fail('INVALID_ACTION','操作不存在',404)
+    else: fail('INVALID_ACTION','Action not found',404)
     save_change(user,pr,rid,before,action.upper())
     return pr
 
 @atomic_command
 def write_order(user,data,rid):
     allow(user,'ADMIN','BUYER')
-    supplier=obj(Supplier,data.get('supplier_id')); require(supplier.is_active,'INACTIVE_SUPPLIER','供应商已停用')
-    lines=data.get('lines',[]); require(isinstance(lines,list) and len(lines)<=100,'INVALID_LINES','每张订单最多 100 行')
+    supplier=obj(Supplier,data.get('supplier_id')); require(supplier.is_active,'INACTIVE_SUPPLIER','Supplier is inactive')
+    lines=data.get('lines',[]); require(isinstance(lines,list) and len(lines)<=100,'INVALID_LINES','Maximum lines per order: 100  rows')
     requested=defaultdict(Decimal); parsed=[]
     for n,x in enumerate(lines,1):
         line=obj(RequestLine,x.get('request_line_id'))
-        require(line.request.status=='APPROVED','REQUEST_NOT_APPROVED','订单只能引用已批准的申请行')
-        require(line.item.is_active,'INACTIVE_ITEM','物料已停用')
+        require(line.request.status=='APPROVED','REQUEST_NOT_APPROVED','Orders can only reference approved request lines')
+        require(line.item.is_active,'INACTIVE_ITEM','Item is inactive')
         q=qty(x.get('qty')); requested[line.id]+=q
-        require(requested[line.id]<=request_available(line),'OVER_ORDERED','累计订单数量超过申请剩余可分配量',422,'qty')
+        require(requested[line.id]<=request_available(line),'OVER_ORDERED','Total order quantity exceeds the unallocated request quantity',422,'qty')
         parsed.append(dict(line_no=n,request_line=line,qty=q,unit_price=qty(x.get('unit_price'),'unit_price')))
     po=new(PurchaseOrder,user,rid,order_no=number('PO'),supplier=supplier)
     for x in parsed: OrderLine.objects.create(order=po,**x)
@@ -105,36 +105,36 @@ def write_order(user,data,rid):
 def order_action(user,id,action,data,rid):
     allow(user,'ADMIN','BUYER'); po=obj(PurchaseOrder,id); version(po,data); before=snapshot(po)
     if action=='confirm':
-        require(po.status=='DRAFT','INVALID_TRANSITION','只有草稿订单可以确认')
-        require(po.supplier.is_active,'INACTIVE_SUPPLIER','供应商已停用')
-        require(po.lines.exists(),'EMPTY_LINES','订单至少需要一条明细')
+        require(po.status=='DRAFT','INVALID_TRANSITION','Only draft orders can be confirmed')
+        require(po.supplier.is_active,'INACTIVE_SUPPLIER','Supplier is inactive')
+        require(po.lines.exists(),'EMPTY_LINES','An order needs at least one line')
         for l in po.lines.select_related('request_line__item','request_line__request'):
-            require(l.request_line.item.is_active and l.request_line.request.status=='APPROVED','SOURCE_UNAVAILABLE','申请或物料当前不可用')
+            require(l.request_line.item.is_active and l.request_line.request.status=='APPROVED','SOURCE_UNAVAILABLE','The request or item is currently unavailable')
         po.status='CONFIRMED'; po.ordered_at=timezone.now()
     elif action=='cancel':
-        require(po.status in ['DRAFT','CONFIRMED'],'INVALID_TRANSITION','当前订单不能取消')
-        require(not po.receipts.filter(status='POSTED').exists(),'RECEIPT_EXISTS','已有净有效收货，请先冲销收货')
+        require(po.status in ['DRAFT','CONFIRMED'],'INVALID_TRANSITION','This order cannot be cancelled in its current status')
+        require(not po.receipts.filter(status='POSTED').exists(),'RECEIPT_EXISTS','Reverse all effective receipts before cancelling')
         po.status='CANCELLED'
-    else: fail('INVALID_ACTION','操作不存在',404)
+    else: fail('INVALID_ACTION','Action not found',404)
     save_change(user,po,rid,before,action.upper()); return po
 
 @atomic_command
 def create_receipt(user,data,rid):
     allow(user,'ADMIN','STORE')
     po=obj(PurchaseOrder,data.get('order_id'))
-    require(po.status in ['CONFIRMED','CLOSED'],'ORDER_NOT_CONFIRMED','只能从已确认订单收货')
-    require(po.supplier.is_active,'INACTIVE_SUPPLIER','供应商已停用')
-    lines=data.get('lines',[]); require(isinstance(lines,list) and 0<len(lines)<=100,'EMPTY_LINES','请添加 1 至 100 条收货明细')
+    require(po.status in ['CONFIRMED','CLOSED'],'ORDER_NOT_CONFIRMED','Receipts require a confirmed purchase order')
+    require(po.supplier.is_active,'INACTIVE_SUPPLIER','Supplier is inactive')
+    lines=data.get('lines',[]); require(isinstance(lines,list) and 0<len(lines)<=100,'EMPTY_LINES','Add 1 to 100 receipt lines')
     receipt=new(Receipt,user,rid,receipt_no=number('RCV'),order=po)
     totals=defaultdict(Decimal)
     for n,x in enumerate(lines,1):
-        line=obj(OrderLine,x.get('order_line_id')); require(line.order_id==po.id,'WRONG_ORDER','收货行不属于所选订单')
-        item=line.request_line.item; require(item.is_active,'INACTIVE_ITEM','物料已停用')
-        warehouse=obj(Warehouse,x.get('warehouse_id')); require(warehouse.is_active,'INACTIVE_WAREHOUSE','仓库已停用')
+        line=obj(OrderLine,x.get('order_line_id')); require(line.order_id==po.id,'WRONG_ORDER','The receipt line does not belong to the selected order')
+        item=line.request_line.item; require(item.is_active,'INACTIVE_ITEM','Item is inactive')
+        warehouse=obj(Warehouse,x.get('warehouse_id')); require(warehouse.is_active,'INACTIVE_WAREHOUSE','Warehouse is inactive')
         q=qty(x.get('qty')); totals[line.id]+=q
-        require(totals[line.id]<=line.qty-received_qty(line),'OVER_RECEIVED','收货数量超过订单剩余数量',422,'qty')
+        require(totals[line.id]<=line.qty-received_qty(line),'OVER_RECEIVED','Received quantity exceeds the remaining order quantity',422,'qty')
         batch_no=text(x.get('batch_no',''),'batch_no',64).upper()
-        require(not Batch.objects.filter(item=item,batch_no=batch_no).exists(),'DUPLICATE_BATCH','该物料内部批次已存在',409,'batch_no')
+        require(not Batch.objects.filter(item=item,batch_no=batch_no).exists(),'DUPLICATE_BATCH','This internal batch already exists for the item',409,'batch_no')
         batch=new(Batch,user,rid,item=item,batch_no=batch_no,supplier_lot=text(x.get('supplier_lot',''),'supplier_lot',128,False),expires_on=day(x.get('expires_on'),'expires_on',True),unit_cost=line.unit_price,origin='PURCHASE')
         ReceiptLine.objects.create(receipt=receipt,line_no=n,order_line=line,batch=batch,warehouse=warehouse,qty=q)
     audit(user,receipt,'LINES_SAVED',rid)

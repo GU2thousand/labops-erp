@@ -1,52 +1,62 @@
-# LabOps 验收记录
+# LabOps Acceptance Record
 
-执行日期：2026-09-12。环境：本机 macOS、Python 3.14、Django 5.2.17、SQLite 文件数据库。没有在 PostgreSQL 或生产部署环境运行这些测试。
+## English localization verification — September 15, 2026
 
-## 自动化业务验收
+- All 29 existing business acceptance tests passed in 24.278 seconds using a separate file-backed SQLite test database.
+- Django system checks, migration consistency, JavaScript syntax, and `git diff --check` passed. The Python syntax-tree comparison confirmed that Python edits changed text literals only.
+- Scanned every tracked source/documentation file: no Chinese text or full-width Chinese punctuation remained.
+- Created a fresh isolated database, applied migrations, and ran both demo seeds. All LabOps model records, including generated notifications and audit snapshots, contained English text. Checked 23 authenticated API endpoints and an English pagination error. Fresh and existing databases both passed stock reconciliation.
+- Browser checks covered all navigation modules, translated demo labels, English dates, duplicate-code field errors with retained input, incorrect-password errors, and successful sign-in.
+- Inspected desktop layout at 1440×1000 and mobile layout at 390×844. After adjusting wrapping and table scrolling, document widths were 1425px and 375px respectively, with no page-level horizontal overflow.
+- Before translating the existing local demo database, created a verified SQLite backup. Updated 50 demo business records and 88 notifications with appended translation audit events. Compared original audit records, stock movements, movement lines, and balances before/after: all remained unchanged. Historical source text in immutable records remains verbatim; existing user-entered content is not automatically translated by the app.
 
-29 项测试全部通过，最后一次完整运行耗时 15.076 秒。测试文件：`labops/tests/test_acceptance.py`。
+## Original business acceptance — September 12, 2026
 
-| PRD 编号 | 验证内容 | 结果 |
+Environment: local macOS, Python 3.14, Django 5.2.17, and a file-backed SQLite database. These tests were not run against PostgreSQL or a production deployment.
+
+All 29 tests passed; the final original run took 15.076 seconds. Test file: `labops/tests/test_acceptance.py`.
+
+| PRD ID | Scenario | Result |
 | --- | --- | --- |
-| A01 | 编码 trim + 大写归一化，重复物料拒绝 | 通过 |
-| A02 | 管理员不能审批自己的申请 | 通过 |
-| A03 | 两个独立连接并发分配 70 和 50，已批数量 100 | 一成功，一 OVER_ORDERED |
-| A04 | 订单 100，已收 60，再收 50 | 拒绝，库存和成功审计不变 |
-| A05 | 同 key 与新 key 重试已过账收货 | 不重复入库 |
-| A06 | 库存 10，两线程各领 7 | 一成功，一失败，余额 3 |
-| A07 | 注入目标仓库写入异常 | 来源、目标和流水整笔回滚 |
-| A08 | 过期批次 / 已完成任务领料 | 拒绝，库存不变 |
-| A09 | 部分领用后冲销收货 | 余额不足，拒绝且不产生负库存 |
-| A10 | 成功冲销后再次冲销原单 | 拒绝，成本和余额仅恢复一次 |
-| A11 | 导入成功一行后模拟中断，再恢复执行 | 跳过成功行，无重复记录 |
-| A12 | 旧任务版本更新 | VERSION_CONFLICT，不覆盖新状态 |
-| A13 | 普通成员访问其他项目已知 ID | 查询与写入均拒绝 |
-| A14 | 重复消费通知事件 | 每用户一条通知 |
-| A15 | 收货 60 / 领料 10 / 调拨 5 / 冲销领料 | 45+5，成本 120；冲销后 60，成本 0；台账一致 |
-| A16 | 模拟样本跳过接收直接处理 | 拒绝，无成功状态事件 |
+| A01 | Trim and uppercase codes; reject duplicate items | Passed |
+| A02 | Administrator attempts to approve their own request | Rejected |
+| A03 | Independent connections concurrently allocate 70 and 50 against an approved quantity of 100 | One succeeds; one returns `OVER_ORDERED` |
+| A04 | Order quantity 100, received 60, attempt to receive another 50 | Rejected; stock and successful audit records unchanged |
+| A05 | Retry a posted receipt with the same and a new idempotency key | No duplicate stock receipt |
+| A06 | Stock 10; two threads each issue 7 | One succeeds; one fails; balance is 3 |
+| A07 | Inject a destination-warehouse write failure during transfer | Source, destination, and movement all roll back |
+| A08 | Issue an expired batch or issue to a completed task | Rejected; stock unchanged |
+| A09 | Reverse a receipt after some stock has been issued | Insufficient stock; rejected without negative balances |
+| A10 | Reverse the same original movement twice | Second reversal rejected; cost and stock restored only once |
+| A11 | Interrupt an import after one successful row, then resume | Successful row skipped; no duplicate record |
+| A12 | Update a task using an old version | `VERSION_CONFLICT`; newer state preserved |
+| A13 | Ordinary member accesses a known ID from another project | Reads and writes rejected |
+| A14 | Consume a notification event twice | One notification per recipient |
+| A15 | Receive 60, issue 10, transfer 5, reverse the issue | Balances 45+5, cost $120; after reversal total 60, cost $0; ledger reconciles |
+| A16 | Skip sample receipt and attempt processing directly | Rejected; no successful transition event |
 
-补充测试覆盖：订单收齐与冲销重开、多行领料原子性、六位小数精确计算、到期日当天可领、期初入口关闭、盘点版本冲突、过期批次正调整拒绝、主数据停用限制、交易后单位锁定、导入重复编码与执行时版本冲突、CSV 公式转义、CSRF、停用账号旧会话、审计员只读、列表和详情 API、分页和排序白名单、创建/领料草稿幂等、样本条码去重与项目权限、检测单完成/取消前提、异步导入 202 与后台执行、审计包含交易明细。
+Additional coverage includes order closure and reopening after reversal, atomic multi-line issues, exact six-decimal arithmetic, issue on the expiry date, closing the opening-stock entry point, count-version conflicts, rejecting positive adjustments to expired batches, master-data deactivation constraints, unit locking after transactions, duplicate import codes and execution-time version conflicts, CSV formula escaping, CSRF, inactive-account sessions, auditor read-only permissions, list/detail APIs, pagination and sort allowlists, creation/issue-draft idempotency, sample barcode uniqueness and project scope, lab-order completion/cancellation prerequisites, asynchronous imports returning 202, and transaction lines in audit snapshots.
 
-## 浏览器验证
+## Original browser validation
 
-在 Codex 内置浏览器访问实际本地 Django 服务，使用管理员演示账号操作：
+The real local Django service was exercised in the Codex browser using the administrator demo account:
 
-- 登录成功，工作台读取数据库统计：3 个待审批申请、3 个低库存物料、4 个临期内部批次、2 个逾期任务。
-- 创建 `QA-UI-001` 物料成功，列表立即出现记录，页面重载后保留。
-- 打开现有采购订单，显示已收 60、剩余 40。
-- 收货表单输入 50，返回 `OVER_RECEIVED`，表单内容保留，显示数量字段错误。
-- 将实收改为 40，创建收货草稿并点击过账，显示“已过账”。
-- 为这笔收货填写原因并冲销，显示“已冲销”，恢复原演示余额并保留流水。
-- 上传虚构的两行 UTF-8 CSV，预检均通过；确认执行返回“执行中”，后台处理结果自动刷新为“已完成”，成功 2 行、失败 0 行。
-- 将 `SIM-2609-0001` 从已登记变更为已接收，详情中出现带操作人和时间的状态事件。
-- 检查桌面工作台与 390×844 手机布局。手机工作台文档宽度 375px，小于 390px 视口，无页面横向溢出；导航可展开，操作按钮可用。宽表使用独立横向滚动区域。
+- Sign-in succeeded. Dashboard database metrics showed 3 pending requests, 3 low-stock items, 4 expiring internal batches, and 2 overdue tasks.
+- Created item `QA-UI-001`; it appeared immediately and persisted after reload.
+- Opened an existing purchase order showing 60 received and 40 remaining.
+- Entered receipt quantity 50; received `OVER_RECEIVED`, retained the form values, and saw a quantity-field error.
+- Changed the received quantity to 40, saved a receipt draft, and posted it successfully.
+- Reversed that receipt with a reason; the original demo balance was restored and movement history retained.
+- Uploaded a fictional two-row UTF-8 CSV. Preflight passed, confirmation returned Running, and the worker updated it to Completed with 2 successful rows and 0 failures.
+- Transitioned `SIM-2609-0001` from Registered to Received; its details showed an event with actor and timestamp.
+- Inspected the desktop dashboard and a 390×844 mobile viewport. Mobile document width was 375px, below the 390px viewport, with working expandable navigation and actions. Wide tables used their own horizontal scrolling regions.
 
-浏览器验证没有覆盖每个角色的全部按钮组合；跨项目权限、审计员写入限制和并发条件由服务端自动化测试验证。
+The browser checks did not cover every button combination for every role. Server-side tests cover cross-project access, auditor write restrictions, and concurrency conditions.
 
-## 备份恢复演练
+## Backup recovery exercise
 
-用 SQLite backup API 创建独立数据库快照，`PRAGMA integrity_check` 返回正常。通过 `LABOPS_DB` 将应用指向该快照重新打开，执行 `reconcile_stock`，返回所有库存余额与已过账流水一致。演练未覆盖 PostgreSQL 备份、远程备份介质或长期保留策略。
+Created a separate snapshot using the SQLite backup API. `PRAGMA integrity_check` returned `ok`. Reopened the snapshot through `LABOPS_DB` and ran `reconcile_stock`; all inventory balances matched posted movements. This exercise did not cover PostgreSQL backups, remote backup media, or long-term retention policies.
 
-## 未验证的目标
+## Unverified targets
 
-没有声称 PRD 的 1000 物料、10000 批次、100000 流水、20 并发会话下 p95 < 1 秒达标；没有进行正式可访问性审计、生产安全审计或公网部署。PostgreSQL 配置待在目标环境验证。实现边界和未配置功能见 README。
+No claim is made that the PRD target of p95 < 1 second with 1,000 items, 10,000 batches, 100,000 movements, and 20 concurrent sessions has been met. No formal accessibility audit, production security audit, or public deployment was performed. PostgreSQL needs validation in the target environment. See README for implementation boundaries and unconfigured features.

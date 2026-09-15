@@ -11,5 +11,5 @@ class Fixed6Field(models.BigIntegerField):
         number = Decimal(str(value))
         scaled = number * 1000000
         if not number.is_finite() or scaled != scaled.to_integral_value() or abs(scaled) >= 10**18:
-            raise ValueError('数量或成本超出 NUMERIC(18,6) 范围')
+            raise ValueError('Quantity or cost exceeds the NUMERIC(18,6) range')
         return int(scaled)

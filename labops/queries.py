@@ -8,18 +8,18 @@ def serialize(record,detail=False):
     if isinstance(record,dict): return jsonable(record)
     d=snapshot(record)
     if isinstance(record,User): return {'id':str(record.id),'name':record.name,'email':record.email,'roles':list(roles(record)),'is_active':record.is_active,'version':record.version}
-    if hasattr(record,'created_by'): d['created_by_name']=record.created_by.name if record.created_by else '系统'
+    if hasattr(record,'created_by'): d['created_by_name']=record.created_by.name if record.created_by else 'System'
     if isinstance(record,Project):
         ts=list(record.tasks.all()); active=[t for t in ts if t.status!='CANCELLED']; done=sum(t.status=='DONE' for t in active)
         d.update(owner_name=record.owner.name,task_count=len(ts),done_count=done,progress=round(done/len(active)*100) if active else 0)
         if detail: d['members']=[serialize(x) for x in record.members.all()]; d['tasks']=[serialize(x) for x in ts]
     if isinstance(record,Task):
-        d.update(project_name=record.project.name,project_code=record.project.code,assignee_name=record.assignee.name if record.assignee else '未分配')
+        d.update(project_name=record.project.name,project_code=record.project.code,assignee_name=record.assignee.name if record.assignee else 'Unassigned')
         if detail:
             d['comments']=[{**snapshot(x),'author_name':x.author.name} for x in record.comments.select_related('author').order_by('created_at','id')]
             d['usage']=[serialize(x) for x in record.movement_lines.filter(movement__status='POSTED')]
     if isinstance(record,PurchaseRequest):
-        d.update(project_name=record.project.name if record.project else '通用补货',approved_by_name=record.approved_by.name if record.approved_by else '',line_count=record.lines.count())
+        d.update(project_name=record.project.name if record.project else 'General replenishment',approved_by_name=record.approved_by.name if record.approved_by else '',line_count=record.lines.count())
         d['lines']=[{**snapshot(x),'item_name':x.item.name,'item_code':x.item.code,'base_uom':x.item.base_uom,'available_qty':str(request_available(x))} for x in record.lines.select_related('item')]
     if isinstance(record,PurchaseOrder):
         lines=list(record.lines.select_related('request_line__item','request_line__request'))
@@ -41,7 +41,7 @@ def serialize(record,detail=False):
         b=record.batch
         expired=bool(b.expires_on and b.expires_on<timezone.localdate())
         d.update(batch_no=b.batch_no,item_id=str(b.item_id),item_name=b.item.name,item_code=b.item.code,base_uom=b.item.base_uom,warehouse_name=record.warehouse.name,expires_on=str(b.expires_on or ''),unit_cost=str(b.unit_cost),supplier_lot=b.supplier_lot,expired=expired,available_qty=str(record.on_hand_qty if not expired and b.item.is_active and record.warehouse.is_active else 0))
-    if isinstance(record,AuditEvent): d['actor_name']=record.actor.name if record.actor else '系统'
+    if isinstance(record,AuditEvent): d['actor_name']=record.actor.name if record.actor else 'System'
     if isinstance(record,LabOrder):
         d.update(project_name=record.project.name,test_name=record.test.name,sample_type=record.test.sample_type,task_title=record.task.title if record.task else '',sample_count=record.samples.count())
         if detail: d['samples']=[serialize(x) for x in record.samples.all()]

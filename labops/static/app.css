@@ -6,3 +6,10 @@
 @media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
 
 svg{width:20px;height:20px;flex-shrink:0}.heading-pre svg{width:14px;height:14px}.sidebar{overflow-y:auto}.heading-pre{white-space:nowrap}
+
+/* Allow longer English labels without clipping actions or table columns. */
+.sidebar{overflow-y:auto}.nav-link svg{flex-shrink:0}.profile>div,.workspace-label>div{min-width:0}.profile small{overflow-wrap:anywhere}
+.page-heading{flex-wrap:wrap}.page-heading>div:first-child{flex:1 1 320px}.page-heading .button-group{flex:0 1 auto}
+.panel-header>.text-link{flex-shrink:0}.metric-top{gap:8px}.metric-icon{flex-shrink:0}
+.project-info strong{white-space:normal;overflow-wrap:anywhere}.form-actions{flex-wrap:wrap}.detail-meta dd{overflow-wrap:anywhere}
+@media(max-width:720px){.page-heading>div:first-child{flex-basis:100%}.page-heading .button-group{width:100%}.pagination{flex-wrap:wrap}.pagination>div{gap:10px}.metric-bottom{align-items:flex-start}.notification-row{flex-wrap:wrap}.tabs{gap:18px}.tab{white-space:nowrap}.breadcrumb{min-width:0}.breadcrumb strong{overflow-wrap:anywhere}.top-actions{flex-shrink:0}}
