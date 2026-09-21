@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
+export LABOPS_DB_MODE="${LABOPS_DB_MODE:-sqlite-demo}"
 if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv
   .venv/bin/python -m pip install -r requirements.txt

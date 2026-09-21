@@ -1,0 +1,9 @@
+[2026-09-21 01:08:31 -0400] [14157] [INFO] Starting gunicorn 23.0.0
+[2026-09-21 01:08:31 -0400] [14157] [INFO] Listening at: http://127.0.0.1:18766 (14157)
+[2026-09-21 01:08:31 -0400] [14157] [INFO] Using worker: gthread
+[2026-09-21 01:08:31 -0400] [14158] [INFO] Booting worker with pid: 14158
+[2026-09-21 01:08:31 -0400] [14159] [INFO] Booting worker with pid: 14159
+[2026-09-21 01:09:07 -0400] [14157] [INFO] Handling signal: term
+[2026-09-21 01:09:07 -0400] [14159] [INFO] Worker exiting (pid: 14159)
+[2026-09-21 01:09:07 -0400] [14158] [INFO] Worker exiting (pid: 14158)
+[2026-09-21 01:09:07 -0400] [14157] [INFO] Shutting down: Master

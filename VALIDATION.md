@@ -1,3 +1,51 @@
+# Backend upgrade validation — September 21, 2026
+
+## Automated verification
+
+- Original 29 acceptance tests first passed on PostgreSQL before refactoring (17.705 seconds).
+- Final PostgreSQL suite after Phase 8: **62 tests passed**, including migration of existing ledger data, independent-connection concurrency, real PostgreSQL connection termination, consumer duplicate races, deferred foreign-key retry progression, numeric precision, query budgets and Redis failure policies.
+- SQLite compatibility: **62 discovered, 46 passed, 16 PostgreSQL-only tests skipped**. A separate file-backed SQLite test database was used.
+- `makemigrations --check --dry-run`, Python compilation, JavaScript syntax, and whitespace checks passed.
+- The draft-edit race regression passes with the new lock selector and was independently observed failing when the previous selector was restored in memory.
+
+## Actual service and recovery exercises
+
+- PostgreSQL 17.11: created fresh and benchmark databases; migrated them; used independent connections for acceptance tests. A connection was terminated after ledger/balance writes but before event insertion; the complete command rolled back.
+- Redpanda v25.1.9: stopped the broker, committed an inventory issue, and observed a pending outbox event plus a failed publish attempt. Restarted the broker and verified publication.
+- Injected process death after real broker acknowledgement but before the database mark. Expired the lease to advance the test clock, republished the same event, consumed actual duplicates, and verified one effect per consumer plus projection-to-balance agreement.
+- Sent an unsupported-schema message through the real broker. Both consumers parked it durably, bounded retries reached DEAD, and two DLQ records were read back from the real DLQ topic.
+- Redis 7: confirmed cache hit/invalidation and an atomic 30-request bucket test (10 accepted, 20 rejected). Stopped Redis; catalog fell back to the database, protected login returned 503, and an inventory issue still committed and reconciled.
+- PostgreSQL custom-format dump restored into a separate database; restored inventory passed ledger reconciliation. Broker-offset recovery after restoring an older database remains an operator procedure, not a tested automatic feature.
+
+## Full-stack smoke test
+
+- Built and started all Compose profiles together: PostgreSQL, two-worker Gunicorn, local worker, Redpanda publisher and both consumers, Redis, Prometheus, Grafana, OpenTelemetry Collector and Jaeger. Application/database/broker/cache health checks passed.
+- Real browser sign-in and inventory rendering succeeded; the stock reconciliation dialog reported all balances match posted movements.
+- Prometheus reported all three configured targets up (LabOps, Redpanda, Kafka exporter); Grafana health returned database `ok`.
+- Posted a stock issue, observed its outbox status `PUBLISHED`, one processed record for each consumer, no unresolved consumer failures and complete projection-to-balance agreement. Jaeger returned one propagated trace containing `command.issue`, `inventory.post`, `outbox.publish`, `consumer.notification`, `consumer.analytics` and SQL spans.
+- Initial startup under host resource pressure produced transient trace-export timeouts; the subsequent business trace was received successfully. This does not establish lossless telemetry delivery.
+
+## Phase 8 completion — actual outages and process death
+
+- Stopped a dedicated PostgreSQL container completely while a two-worker Gunicorn server remained running with `DEBUG=False`. Authenticated inventory-command POST, catalog GET and application-page GET all returned HTTP 503 with stable `DATABASE_UNAVAILABLE`, `Retry-After: 5`, and no database connection details. Recovery was verified over real HTTP.
+- Compared hashes of all 35 application tables before the outage and after restart: failed requests changed none of them. Retried the same stock-issue idempotency key twice after recovery: exactly one movement and one outbox event were created; the second response returned the original result without additional audit or business effects. Ledger reconciliation passed.
+- Added a shared outage response and exception middleware because failures during lazy session/authentication loading were outside the API's previous database-error handler. Focused regressions cover these paths and a connection error injected after inventory writes, proving rollback and safe retry.
+- Sent real SIGKILL to the actual Kafka command process for both analytics and notification consumers, once before database commit and once after commit but before offset acknowledgement (four cases). Test-only wrappers pause at a deterministic boundary; the parent kills the process externally, so Python cleanup does not execute.
+- Every restarted consumer used the same group and received the identical topic/partition/offset. Before-commit effects rolled back; already committed effects were deduplicated. Each event ended with one processed record per consumer, the correct projection delta or recipient notifications, and offset acknowledgement only after successful recovery. Final stock ledger, balances and analytics projection agreed; no failed deliveries remained.
+- Both drills use isolated generated databases; consumer topics/groups are also generated and removed. The PostgreSQL outage targets a dedicated non-Compose container, leaving the local preview stack online. Reproducible scripts and raw [PostgreSQL](benchmarks/results/postgres-outage.json) / [consumer](benchmarks/results/consumer-crash.json) results are checked in.
+
+Together with the earlier real Kafka and Redis outage exercises, these complete the four Phase 8 scenarios for a local single-node deployment. Replicated failover, network partitions and sustained production availability remain outside this validation.
+
+## Performance
+
+See [benchmark report](benchmarks/README.md) for raw samples, plans and the exact execution environment. The fixed fixture contains 1,000 items, 10,000 batches, 100,000 ledger entries and 10,000 requests/orders. Real 20/50/100/200-VU mixed HTTP runs completed without HTTP/business errors and each reconciled its ledger. **The 20-VU mixed workload did not meet p95 < 1 second.** No sustained production capacity or high-availability claim is made.
+
+## Verification boundaries
+
+Local service shutdown, injected crash windows and individual connection loss were exercised. Production deployment, replicated failover, external email/API exactly-once effects, sustained stress/soak tests and an exhaustive browser regression were not performed. Historical records below describe the earlier SQLite application and do not supersede this upgrade record.
+
+---
+
 # LabOps Acceptance Record
 
 ## English localization verification — September 15, 2026

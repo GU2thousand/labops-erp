@@ -1,0 +1,84 @@
+{
+  "scenario": "full PostgreSQL service outage through real HTTP",
+  "database": "labops_outage_5f0fba28ade3",
+  "debug": false,
+  "gunicorn_workers": 2,
+  "checks": {
+    "all_business_tables_unchanged_after_failed_requests": true,
+    "business_table_count": 35,
+    "retry_same_key_exactly_one_movement": true,
+    "duplicate_retry_no_additional_side_effects": true,
+    "reconciliation_differences": 0,
+    "recovery_count_deltas": {
+      "StockMovement": 1,
+      "CommandResult": 0,
+      "OutboxEvent": 1,
+      "AuditEvent": 2
+    }
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/login/",
+      "status": 200,
+      "elapsed_ms": 100.14
+    },
+    {
+      "method": "POST",
+      "path": "/login/",
+      "status": 302,
+      "elapsed_ms": 129.15
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/items",
+      "status": 200,
+      "elapsed_ms": 32.17
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/items",
+      "status": 503,
+      "elapsed_ms": 6.08,
+      "code": "DATABASE_UNAVAILABLE"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stock/issues",
+      "status": 503,
+      "elapsed_ms": 3.02,
+      "code": "DATABASE_UNAVAILABLE"
+    },
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 503,
+      "elapsed_ms": 2.58,
+      "code": "DATABASE_UNAVAILABLE"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/items",
+      "status": 200,
+      "elapsed_ms": 18.75
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stock/issues",
+      "status": 200,
+      "elapsed_ms": 57.57
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stock/issues",
+      "status": 200,
+      "elapsed_ms": 29.61
+    }
+  ],
+  "passed": true,
+  "cleanup": {
+    "disposable_database_removed": true,
+    "initial_container_running": true,
+    "container_running_restored": true
+  }
+}

@@ -1,0 +1,9 @@
+[2026-09-21 01:07:21 -0400] [13951] [INFO] Starting gunicorn 23.0.0
+[2026-09-21 01:07:21 -0400] [13951] [INFO] Listening at: http://127.0.0.1:18766 (13951)
+[2026-09-21 01:07:21 -0400] [13951] [INFO] Using worker: gthread
+[2026-09-21 01:07:21 -0400] [13952] [INFO] Booting worker with pid: 13952
+[2026-09-21 01:07:21 -0400] [13953] [INFO] Booting worker with pid: 13953
+[2026-09-21 01:07:55 -0400] [13951] [INFO] Handling signal: term
+[2026-09-21 01:07:55 -0400] [13953] [INFO] Worker exiting (pid: 13953)
+[2026-09-21 01:07:55 -0400] [13952] [INFO] Worker exiting (pid: 13952)
+[2026-09-21 01:07:56 -0400] [13951] [INFO] Shutting down: Master

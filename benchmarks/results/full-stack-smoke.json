@@ -1,0 +1,42 @@
+{
+  "date": "2026-09-21",
+  "environment": "local Compose with all profiles",
+  "browser": [
+    "sign-in",
+    "inventory rendering",
+    "reconciliation passed"
+  ],
+  "prometheus_targets": {
+    "labops": "up",
+    "redpanda": "up",
+    "kafka-exporter": "up"
+  },
+  "grafana_database": "ok",
+  "event_status": "PUBLISHED",
+  "processed_consumers": [
+    "notification",
+    "analytics"
+  ],
+  "unresolved_failures": 0,
+  "projection_matches_balances": true,
+  "ledger_reconciles": true,
+  "trace_id": "35bf3d13d5bfcf1740f176499aad3f47",
+  "trace_operations": [
+    "INSERT",
+    "RELEASE",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "UPDATE",
+    "command.issue",
+    "consumer.analytics",
+    "consumer.notification",
+    "inventory.post",
+    "outbox.publish",
+    "upgrade.full_stack_smoke"
+  ],
+  "limits": [
+    "Startup trace-export timeouts under host resource pressure; subsequent business trace received",
+    "Not production failover or exhaustive browser regression"
+  ]
+}

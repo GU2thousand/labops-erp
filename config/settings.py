@@ -10,12 +10,25 @@ SECRET_KEY = os.environ.get('LABOPS_SECRET_KEY') or (secret_file.read_text() if 
 if not SECRET_KEY: raise RuntimeError('LABOPS_SECRET_KEY is required')
 ALLOWED_HOSTS = os.environ.get('LABOPS_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
 INSTALLED_APPS = ['django.contrib.auth','django.contrib.contenttypes','django.contrib.sessions','django.contrib.staticfiles','labops']
-MIDDLEWARE = ['django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.middleware.clickjacking.XFrameOptionsMiddleware']
+MIDDLEWARE = ['labops.telemetry.MetricsMiddleware','labops.database_errors.DatabaseUnavailableMiddleware','whitenoise.middleware.WhiteNoiseMiddleware','django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.middleware.clickjacking.XFrameOptionsMiddleware']
 ROOT_URLCONF = 'config.urls'
 TEMPLATES = [{'BACKEND':'django.template.backends.django.DjangoTemplates','DIRS':[BASE_DIR/'labops/templates'],'APP_DIRS':True,'OPTIONS':{'context_processors':['django.template.context_processors.request','django.contrib.auth.context_processors.auth','django.template.context_processors.csrf']}}]
-DATABASES = {'default': {'ENGINE':'django.db.backends.sqlite3','NAME':os.environ.get('LABOPS_DB', str(BASE_DIR/'labops.sqlite3')),'OPTIONS':{'timeout':30,'transaction_mode':'IMMEDIATE'}}}
-if os.environ.get('POSTGRES_DB'):
-    DATABASES = {'default': {'ENGINE':'django.db.backends.postgresql','NAME':os.environ['POSTGRES_DB'],'USER':os.environ.get('POSTGRES_USER','labops'),'PASSWORD':os.environ.get('POSTGRES_PASSWORD',''),'HOST':os.environ.get('POSTGRES_HOST','127.0.0.1'),'PORT':os.environ.get('POSTGRES_PORT','5432')}}
+from urllib.parse import urlparse, unquote, parse_qs
+DB_MODE = os.environ.get('LABOPS_DB_MODE', 'postgres')
+if DB_MODE == 'sqlite-demo':
+    DATABASES = {'default': {'ENGINE':'django.db.backends.sqlite3','NAME':os.environ.get('LABOPS_DB', str(BASE_DIR/'labops.sqlite3')),'OPTIONS':{'timeout':30,'transaction_mode':'IMMEDIATE'}}}
+elif DB_MODE == 'postgres':
+    parsed = urlparse(os.environ.get('DATABASE_URL', 'postgresql://labops:labops-local@127.0.0.1:55432/labops'))
+    if parsed.scheme not in {'postgres', 'postgresql'}: raise RuntimeError('DATABASE_URL must use PostgreSQL')
+    DATABASES = {'default': {'ENGINE':'django.db.backends.postgresql',
+        'NAME':os.environ.get('POSTGRES_DB', unquote(parsed.path.lstrip('/'))),
+        'USER':os.environ.get('POSTGRES_USER', unquote(parsed.username or 'labops')),
+        'PASSWORD':os.environ.get('POSTGRES_PASSWORD', unquote(parsed.password or '')),
+        'HOST':os.environ.get('POSTGRES_HOST', parsed.hostname or '127.0.0.1'),
+        'PORT':os.environ.get('POSTGRES_PORT', str(parsed.port or 5432)),
+        'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '0')),
+        'OPTIONS': {k:v[-1] for k,v in parse_qs(parsed.query).items() if k in {'sslmode', 'connect_timeout'}}}}
+else: raise RuntimeError('LABOPS_DB_MODE must be postgres or sqlite-demo')
 AUTH_USER_MODEL = 'labops.User'
 AUTH_PASSWORD_VALIDATORS = [{'NAME':'django.contrib.auth.password_validation.MinimumLengthValidator','OPTIONS':{'min_length':10}},{'NAME':'django.contrib.auth.password_validation.CommonPasswordValidator'}]
 LANGUAGE_CODE = 'en-us'
@@ -38,3 +51,9 @@ LOGGING = {'version':1,'disable_existing_loggers':False,'handlers':{'console':{'
 
 if os.environ.get("LABOPS_TEST_DB"):
     DATABASES["default"]["TEST"] = {"NAME": os.environ["LABOPS_TEST_DB"]}
+
+EVENT_TRANSPORT = os.environ.get('LABOPS_EVENT_TRANSPORT', 'local')
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:19092')
+KAFKA_TOPIC = os.environ.get('KAFKA_TOPIC', 'labops.inventory.v1')
+KAFKA_DLQ_TOPIC = os.environ.get('KAFKA_DLQ_TOPIC', 'labops.inventory.dlq.v1')
+EVENT_RETRY_SECONDS = [60, 300, 900, 3600]

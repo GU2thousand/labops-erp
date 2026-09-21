@@ -1,0 +1,55 @@
+name: LabOps validation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: labops_ci
+          POSTGRES_USER: labops
+          POSTGRES_PASSWORD: ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U labops -d labops_ci"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      LABOPS_DB_MODE: postgres
+      DATABASE_URL: postgresql://labops:ci-only@127.0.0.1:5432/labops_ci
+      LABOPS_SECRET_KEY: ci-only-test-secret
+      LABOPS_DEBUG: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python manage.py check
+      - run: python manage.py makemigrations --check --dry-run
+      - run: python manage.py migrate --noinput
+      - run: python manage.py test labops.tests --verbosity 2
+      - run: docker compose --env-file .env.example --profile events --profile redis --profile observability config --quiet
+  sqlite-demo:
+    runs-on: ubuntu-latest
+    env:
+      LABOPS_DB_MODE: sqlite-demo
+      LABOPS_TEST_DB: /tmp/labops-ci-test.sqlite3
+      LABOPS_SECRET_KEY: ci-only-test-secret
+      LABOPS_DEBUG: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python manage.py migrate --noinput
+      - run: python manage.py test labops.tests --verbosity 2
+      - run: python manage.py seed_demo
+      - run: python manage.py reconcile_stock
