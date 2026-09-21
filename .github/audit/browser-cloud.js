@@ -21,14 +21,16 @@ async (page) => {
     else await page.locator('#nav a').filter({hasText:link.name}).click();
     await (await response).finished();
     await page.waitForFunction(()=>!document.querySelector('#main').textContent.includes('Loading')&&!!document.querySelector('#main h1'));
-    if(await page.locator('#main').getByText('Try again',{exact:true}).count())throw Error('Page load failure');
+    if(await page.locator('#main .error-state').count())throw Error('Page load failure');
   });
   await check('session survives page reload',async()=>{await page.reload();await page.locator('#main h1').waitFor();});
   await check('mobile navigation and layout',async()=>{
     await page.setViewportSize({width:390,height:844});
     await page.getByRole('button',{name:'Open navigation'}).click();
     await page.locator('#nav a').filter({hasText:'Inventory'}).click();
-    await page.locator('#main h1').waitFor();
+    await page.waitForFunction(()=>location.hash==='#inventory' && !document.querySelector('#main').textContent.includes('Loading') && !!document.querySelector('#main h1') && document.querySelector('#sidebar').getBoundingClientRect().right<=1);
+    if(await page.locator('#main .error-state').count())throw Error('Mobile inventory failed to load');
+    await page.evaluate(()=>window.scrollTo(0,0));
     await page.screenshot({path:'output/playwright/lab-mobile.png',fullPage:true});
     if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1))throw Error('Horizontal overflow');
   });
