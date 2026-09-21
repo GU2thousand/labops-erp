@@ -1,6 +1,5 @@
 import os,json,time,sys
-from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0,os.getcwd())
 os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
 import django
 django.setup()

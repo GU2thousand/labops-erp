@@ -43,7 +43,7 @@ jobs:
       - name: Verify HTTP purchase, inventory, sample and access workflows
         run: python .github/audit/cloud-api.py | tee output/playwright/api.log
       - name: Verify Kafka consumers and ledger projection
-        run: docker compose exec -T web python .github/audit/check-events.py | tee output/playwright/events.log
+        run: docker compose exec -T web python - < .github/audit/check-events.py | tee output/playwright/events.log
       - name: Verify browser navigation and mobile layout
         run: |
           playwright-cli open http://localhost:8001/login/ --browser=chrome
