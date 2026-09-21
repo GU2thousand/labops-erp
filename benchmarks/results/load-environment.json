@@ -1,0 +1,33 @@
+{
+  "tiers": [
+    {
+      "vus": 20,
+      "k6_exit_code": 0,
+      "reconcile_exit_code": 0,
+      "reconcile": "OK: every stock balance matches the immutable ledger."
+    },
+    {
+      "vus": 50,
+      "k6_exit_code": 0,
+      "reconcile_exit_code": 0,
+      "reconcile": "OK: every stock balance matches the immutable ledger."
+    },
+    {
+      "vus": 100,
+      "k6_exit_code": 0,
+      "reconcile_exit_code": 0,
+      "reconcile": "OK: every stock balance matches the immutable ledger."
+    },
+    {
+      "vus": 200,
+      "k6_exit_code": 0,
+      "reconcile_exit_code": 0,
+      "reconcile": "OK: every stock balance matches the immutable ledger."
+    }
+  ],
+  "gunicorn_workers": 2,
+  "threads_per_worker": 4,
+  "duration": "30s",
+  "template": "labops_load_seed",
+  "k6": "k6 v2.2.0 (commit/devel, go1.26.5, darwin/arm64)"
+}

@@ -1,0 +1,32 @@
+{
+  "broker_unavailable": {
+    "business_committed": true,
+    "outbox_status": "PENDING",
+    "attempts": 1
+  },
+  "recovery_publish": "PUBLISHED",
+  "ack_before_mark_crash": {
+    "actual_broker_duplicate": true,
+    "processed_once_per_consumer": true,
+    "projection_matches_all_balances": true
+  },
+  "poison_dlq": {
+    "dead_deliveries": 2,
+    "confirmed_dlq_messages": 2
+  },
+  "redis": {
+    "cache_hit_and_invalidation": true,
+    "atomic_bucket_30_concurrent": {
+      "accepted": 10,
+      "rejected_429": 20
+    },
+    "unavailable_cache_fallback": true,
+    "unavailable_login_503": true,
+    "unavailable_inventory_write_commits": true
+  },
+  "postgres_backup_restore": {
+    "pg_dump_custom_format": true,
+    "pg_restore_into_separate_database": true,
+    "ledger_reconciliation": "OK"
+  }
+}

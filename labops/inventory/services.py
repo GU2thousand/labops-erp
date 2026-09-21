@@ -14,16 +14,22 @@ def existing(user,key,kind,data):
     key=text(key or '', 'Idempotency-Key',128)
     prior=StockMovement.objects.filter(idempotency_key=key).first()
     if prior:
+        REPLAYS.inc()
         require(prior.request_hash==movement_hash(user,kind,data),'IDEMPOTENCY_CONFLICT','This idempotency key was used for different content',409)
     return prior
 
+from labops.telemetry import tracer
+
+@tracer.start_as_current_span("inventory.post")
 def post(user,kind,lines,data,key,rid,receipt=None,reversal=None,draft=None):
     require(bool(lines),'EMPTY_LINES','A stock movement needs at least one valid line')
     changes=defaultdict(Decimal)
     for x in lines: changes[(x['batch'].id,x['warehouse'].id)]+=x['delta_qty']
     balances=[]
     for (bid,wid),delta in sorted(changes.items()):
+        advisory(f'balance:{bid}:{wid}')
         balance,_=StockBalance.objects.get_or_create(batch_id=bid,warehouse_id=wid)
+        balance=StockBalance.objects.select_for_update().get(pk=balance.pk)
         require(balance.on_hand_qty+delta>=0,'INSUFFICIENT_STOCK','Insufficient batch stock in the selected warehouse; no changes were made',422,'qty')
         balances.append((balance,delta))
     m=draft or new(StockMovement,user,rid,movement_no=number('STK'),type=kind)
@@ -34,7 +40,8 @@ def post(user,kind,lines,data,key,rid,receipt=None,reversal=None,draft=None):
     for balance,delta in balances:
         balance.on_hand_qty+=delta; balance.version+=1; balance.save()
     save_change(user,m,rid,before,'POST',m.reason)
-    if kind in ['RECEIPT','ISSUE']: RuntimeState.objects.filter(pk=1).update(opening_closed=True)
+    from labops.events import emit_inventory
+    emit_inventory(m)
     return m
 
 def line(batch,warehouse,delta,**other): return dict(batch=batch,warehouse=warehouse,delta_qty=delta,unit_cost=batch.unit_cost,**other)
@@ -61,8 +68,6 @@ def post_receipt(user,id,data,key,rid):
     m=post(user,'RECEIPT',lines,data,key,rid,receipt=receipt)
     before=snapshot(receipt); receipt.status='POSTED'; receipt.posted_at=timezone.now(); receipt.posted_by=user
     save_change(user,receipt,rid,before,'POST'); order_state(po)
-    from labops.operations.services import emit,stock_recipients
-    emit('RECEIPT_POSTED',receipt,'Receipt posted',receipt.receipt_no+' · '+po.order_no,stock_recipients())
     return m
 
 def issue_lines(user,data,member=False):
@@ -162,6 +167,24 @@ def reverse(user,id,data,key,rid):
     return m
 
 def reconcile():
+    from django.db import connection
+    if connection.vendor == 'postgresql':
+        # One statement means ledger and balances share the same MVCC snapshot.
+        with connection.cursor() as cursor:
+            cursor.execute("""WITH ledger AS (
+                SELECT l.batch_id,l.warehouse_id,SUM(l.delta_qty) AS qty
+                FROM labops_stockmovementline l JOIN labops_stockmovement m ON m.id=l.movement_id
+                WHERE m.status='POSTED' GROUP BY l.batch_id,l.warehouse_id
+            ) SELECT COALESCE(l.batch_id,b.batch_id),COALESCE(l.warehouse_id,b.warehouse_id),
+              COALESCE(b.on_hand_qty,0),COALESCE(l.qty,0)
+              FROM ledger l FULL OUTER JOIN labops_stockbalance b
+                ON l.batch_id=b.batch_id AND l.warehouse_id=b.warehouse_id
+              WHERE COALESCE(l.qty,0)<>COALESCE(b.on_hand_qty,0)""")
+            return [dict(batch_id=str(b),warehouse_id=str(w),balance=str(Decimal(q)/1000000),ledger=str(Decimal(l)/1000000)) for b,w,q,l in cursor]
+    with transaction.atomic():
+        return _reconcile_sqlite()
+
+def _reconcile_sqlite():
     sums=defaultdict(Decimal)
     for x in StockMovementLine.objects.filter(movement__status='POSTED'): sums[(x.batch_id,x.warehouse_id)]+=x.delta_qty
     problems=[]

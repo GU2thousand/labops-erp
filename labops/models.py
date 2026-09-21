@@ -183,6 +183,11 @@ class ImportRow(Base):
     class Meta: constraints = [models.UniqueConstraint(fields=['job','row_no'],name='import_row_unique')]
 class OutboxEvent(Base):
     event_type = models.CharField(max_length=64)
+    transport = models.CharField(max_length=16, default='local')
+    schema_version = models.PositiveIntegerField(default=1)
+    aggregate_version = models.PositiveIntegerField(default=1)
+    published_at = models.DateTimeField(null=True)
+    lease_token = models.UUIDField(null=True)
     aggregate_type = models.CharField(max_length=64)
     aggregate_id = models.UUIDField()
     payload_json = models.JSONField(default=dict)
@@ -244,3 +249,32 @@ class SampleEvent(Base):
     to_status = models.CharField(max_length=32)
     reason = models.TextField(blank=True)
     occurred_at = models.DateTimeField(default=timezone.now)
+
+
+class ProcessedEvent(Base):
+    consumer_name = models.CharField(max_length=64)
+    event_id = models.UUIDField()
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['consumer_name', 'event_id'], name='consumer_event_unique')]
+
+class InventoryProjection(models.Model):
+    batch = fk(Batch)
+    warehouse = fk(Warehouse)
+    quantity = Fixed6Field(default=0)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['batch', 'warehouse'], name='projection_balance_unique')]
+
+class FailedDelivery(Base):
+    consumer_name = models.CharField(max_length=64)
+    delivery_key = models.CharField(max_length=255)
+    envelope = models.JSONField(default=dict)
+    attempts = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=16, default='RETRY')
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    last_error = models.TextField(blank=True)
+    dlq_published_at = models.DateTimeField(null=True)
+    resolved_at = models.DateTimeField(null=True)
+    resolution_note = models.TextField(blank=True)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['consumer_name', 'delivery_key'], name='consumer_delivery_unique')]
+        indexes = [models.Index(fields=['status', 'next_attempt_at'])]

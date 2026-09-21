@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+.env
+.env.*
+!.env.example
+.local-secret
+__pycache__
+*.pyc
+*.sqlite3*
+backups
+staticfiles
+work
+benchmark-results

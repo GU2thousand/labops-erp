@@ -13,7 +13,7 @@ def check_alerts():
     from labops.queries import inventory_overview
     today=timezone.localdate()
     with transaction.atomic():
-        RuntimeState.objects.select_for_update().get(pk=1)
+        advisory('daily-alerts')
         recipients=stock_recipients()
         for row in inventory_overview():
             if row['low_stock']: emit('LOW_STOCK',Item.objects.get(pk=row['id']),'Low item stock',f"{row['name']} · Available {row['available']} {row['base_uom']} / Threshold {row['reorder_qty']}",recipients,str(today))
@@ -27,8 +27,7 @@ def consume_events(limit=100):
     for _ in range(limit):
         now=timezone.now()
         with transaction.atomic():
-            RuntimeState.objects.select_for_update().get(pk=1)
-            e=OutboxEvent.objects.filter(Q(status='PENDING',next_attempt_at__lte=now)|Q(status='PROCESSING',locked_until__lt=now)).order_by('next_attempt_at','id').first()
+            e=OutboxEvent.objects.select_for_update(skip_locked=True).filter(transport='local').filter(Q(status='PENDING',next_attempt_at__lte=now)|Q(status='PROCESSING',locked_until__lt=now)).order_by('next_attempt_at','id').first()
             if not e: break
             e.status='PROCESSING'; e.locked_until=now+timedelta(minutes=2); e.save()
             eid=e.id
@@ -36,8 +35,12 @@ def consume_events(limit=100):
             with transaction.atomic():
                 e=OutboxEvent.objects.select_for_update().get(pk=eid)
                 if e.status!='PROCESSING': continue
-                for uid in e.payload_json['recipients']:
-                    if User.objects.filter(pk=uid,is_active=True).exists(): Notification.objects.get_or_create(event=e,user_id=uid,defaults={'title':e.payload_json['title'],'body':e.payload_json['body']})
+                if e.event_type.startswith('inventory.'):
+                    from labops.events import envelope, process_envelope
+                    for consumer in ['notification', 'analytics']: process_envelope(consumer, envelope(e))
+                else:
+                    for uid in e.payload_json['recipients']:
+                        if User.objects.filter(pk=uid,is_active=True).exists(): Notification.objects.get_or_create(event=e,user_id=uid,defaults={'title':e.payload_json['title'],'body':e.payload_json['body']})
                 e.status='PROCESSED'; e.processed_at=timezone.now(); e.locked_until=None; e.last_error=''; e.save(); processed+=1
         except Exception:
             logging.getLogger('labops').exception('outbox_delivery_failed event=%s',eid)
@@ -100,12 +103,12 @@ def execute_import(user,id,rid):
     require(job.status in ['READY','RUNNING','COMPLETED','PARTIAL_FAILED','FAILED'],'IMPORT_NOT_READY','Only jobs with all rows passing preflight can run')
     if job.status=='COMPLETED': return job
     with transaction.atomic():
-        RuntimeState.objects.select_for_update().get(pk=1)
+        ImportJob.objects.select_for_update().get(pk=id)
         job=ImportJob.objects.get(pk=id); job.status='RUNNING'; job.started_at=job.started_at or timezone.now(); job.save()
     for row_id in job.rows.exclude(status='SUCCEEDED').order_by('row_no').values_list('id',flat=True):
         try:
             with transaction.atomic():
-                RuntimeState.objects.select_for_update().get(pk=1)
+                advisory('catalog-write-gate')
                 row=ImportRow.objects.select_for_update().get(pk=row_id)
                 if row.status=='SUCCEEDED': continue
                 data=row.normalized_json
@@ -119,12 +122,12 @@ def execute_import(user,id,rid):
                 audit(user,row,'IMPORT_ROW',rid)
         except (BusinessError,ValueError,ValidationError) as e:
             with transaction.atomic():
-                RuntimeState.objects.select_for_update().get(pk=1)
+                ImportRow.objects.select_for_update().get(pk=row_id)
                 row=ImportRow.objects.get(pk=row_id)
                 if row.status=='SUCCEEDED': continue
                 row.status='FAILED'; row.errors_json=[{'field':getattr(e,'field',''),'code':getattr(e,'code','INVALID_ROW'),'message':getattr(e,'message','Invalid row data')}]; row.save()
     with transaction.atomic():
-        RuntimeState.objects.select_for_update().get(pk=1)
+        ImportJob.objects.select_for_update().get(pk=id)
         job=ImportJob.objects.get(pk=id); before=snapshot(job)
         job.success_rows=job.rows.filter(status='SUCCEEDED').count(); job.failed_rows=job.total_rows-job.success_rows
         job.status='COMPLETED' if not job.failed_rows else ('PARTIAL_FAILED' if job.success_rows else 'FAILED')
@@ -148,7 +151,7 @@ def process_imports():
         try:execute_import(job.created_by,job.id,'import-worker-'+str(job.id))
         except BusinessError:
             with transaction.atomic():
-                RuntimeState.objects.select_for_update().get(pk=1)
+                ImportJob.objects.select_for_update().get(pk=job.pk)
                 job=ImportJob.objects.get(pk=job.pk)
                 job.status='FAILED';job.failed_rows=job.rows.exclude(status='SUCCEEDED').count();job.success_rows=job.total_rows-job.failed_rows;job.save()
                 for row in job.rows.exclude(status='SUCCEEDED'):

@@ -1,0 +1,207 @@
+x-app-environment: &app-environment
+  LABOPS_DB_MODE: postgres
+  DATABASE_URL: postgresql://labops@postgres:5432/labops
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: '5432'
+  POSTGRES_DB: ${POSTGRES_DB:-labops}
+  POSTGRES_USER: ${POSTGRES_USER:-labops}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-labops-local}
+  LABOPS_SECRET_KEY: ${LABOPS_SECRET_KEY:?Copy .env.example to .env and set LABOPS_SECRET_KEY}
+  LABOPS_DEBUG: ${LABOPS_DEBUG:-1}
+  LABOPS_ALLOWED_HOSTS: ${LABOPS_ALLOWED_HOSTS:-localhost,127.0.0.1,web,testserver}
+  LABOPS_EVENT_TRANSPORT: ${LABOPS_EVENT_TRANSPORT:-local}
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-redpanda:9092}
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-labops.inventory.v1}
+  KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-labops.inventory.dlq.v1}
+  REDIS_URL: ${REDIS_URL:-}
+  METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-change-me}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-labops}
+x-app: &app
+  build: .
+  image: labops-erp:local
+  environment: *app-environment
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-labops}
+      POSTGRES_USER: ${POSTGRES_USER:-labops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-labops-local}
+    ports: ['127.0.0.1:${POSTGRES_PORT:-55433}:5432']
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  migrate:
+    <<: *app
+    restart: 'no'
+    command: ['python', 'manage.py', 'migrate', '--noinput']
+    depends_on:
+      postgres:
+        condition: service_healthy
+  web:
+    <<: *app
+    environment:
+      <<: *app-environment
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+    ports: ['127.0.0.1:${WEB_PORT:-8001}:8000']
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/login/", timeout=3)']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  worker:
+    <<: *app
+    command: ['python', 'manage.py', 'process_events', '--loop']
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
+    profiles: [events]
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:${KAFKA_EXTERNAL_PORT:-19093}
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - '127.0.0.1:${KAFKA_EXTERNAL_PORT:-19093}:19092'
+      - '127.0.0.1:${REDPANDA_ADMIN_PORT:-19645}:9644'
+    volumes: [redpanda-data:/var/lib/redpanda/data]
+    healthcheck:
+      test: ['CMD', 'rpk', 'cluster', 'health', '--exit-when-healthy']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
+    profiles: [events]
+    entrypoint: ['/bin/sh', '-ec']
+    command:
+      - |
+        for topic in "$${KAFKA_TOPIC}" "$${KAFKA_DLQ_TOPIC}"; do
+          if ! rpk topic describe "$$topic" --brokers redpanda:9092 >/dev/null 2>&1; then
+            rpk topic create "$$topic" --partitions 3 --replicas 1 --brokers redpanda:9092
+          fi
+        done
+    environment:
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-labops.inventory.v1}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-labops.inventory.dlq.v1}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+  publisher:
+    <<: *app
+    profiles: [events]
+    command: ['python', 'manage.py', 'publish_events', '--loop']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+  notification-consumer:
+    <<: *app
+    profiles: [events]
+    command: ['python', 'manage.py', 'consume_kafka', 'notification']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+  analytics-consumer:
+    <<: *app
+    profiles: [events]
+    command: ['python', 'manage.py', 'consume_kafka', 'analytics']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    profiles: [events]
+    command:
+      - --kafka.server=redpanda:9092
+      - '--group.filter=^labops\..*'
+      - --topic.workers=2
+      - --refresh.metadata=15s
+    environment:
+      GOMAXPROCS: '1'
+      GOMEMLIMIT: 96MiB
+    mem_limit: 128m
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    profiles: [redis]
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction']
+    ports: ['127.0.0.1:${REDIS_PORT:-16380}:6379']
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:v3.3.0
+    profiles: [observability]
+    entrypoint: ['/bin/sh', '/etc/prometheus/start.sh']
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-change-me}
+    ports: ['127.0.0.1:${PROMETHEUS_PORT:-19090}:9090']
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./infra/prometheus/start.sh:/etc/prometheus/start.sh:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:11.6.0
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-grafana-change-me}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    ports: ['127.0.0.1:${GRAFANA_PORT:-13000}:3000']
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    profiles: [observability]
+    command: ['--config=/etc/otel/config.yml']
+    volumes: ['./infra/otel/config.yml:/etc/otel/config.yml:ro']
+    depends_on: [jaeger]
+    restart: unless-stopped
+  jaeger:
+    image: jaegertracing/all-in-one:1.67.0
+    profiles: [observability]
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports: ['127.0.0.1:${JAEGER_PORT:-16687}:16686']
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  redpanda-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

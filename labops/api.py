@@ -23,6 +23,9 @@ def login_page(request):
     error=''
     if request.method=='POST':
         email=request.POST.get('email','').strip().lower(); password=request.POST.get('password','')
+        from .cache import rate_limit
+        try: rate_limit('login',email,10,300)
+        except BusinessError as exc: return render(request,'login.html',{'error':exc.message},status=exc.status)
         key=hashlib.sha256(email.encode()).hexdigest(); now=timezone.now()
         attempt,_=LoginAttempt.objects.get_or_create(key=key)
         if attempt.blocked_until and attempt.blocked_until>now: error='Too many sign-in attempts. Wait 5  minutes before retrying'
@@ -116,7 +119,7 @@ def list_records(request,kind):
         sort=params.get('sort','-updated_at' if kind=='balances' else ('-date_joined' if kind=='users' else '-created_at'))
         allowed_sorts=['-updated_at','updated_at'] if kind=='balances' else (['-date_joined','date_joined'] if kind=='users' else ['-created_at','created_at'])
         require(sort in allowed_sorts,'INVALID_SORT','Unsupported sort field',400)
-        qs=qs.order_by(sort,'-id' if sort.startswith('-') else 'id'); total=qs.count(); rows=[queries.serialize(x) for x in qs[(page-1)*size:page*size]]
+        qs=queries.prepare_queryset(qs,kind).order_by(sort,'-id' if sort.startswith('-') else 'id'); total=qs.count(); rows=[queries.serialize(x) for x in qs[(page-1)*size:page*size]]
     return rows,{'page':page,'page_size':size,'total':total}
 
 def references(user,request):
@@ -125,6 +128,9 @@ def references(user,request):
         q=User.objects.filter(is_active=True)
         if qtext: q=q.filter(Q(name__icontains=qtext)|Q(email__icontains=qtext))
         return [{'id':str(x.id),'name':x.name} for x in q.order_by('name','id')[:100]]
+    if kind=='items' and not qtext:
+        from .cache import cached_catalog
+        return cached_catalog(lambda:[queries.serialize(x) for x in Item.objects.filter(is_active=True).select_related('created_by').order_by('code')[:100]])
     q=scoped(user,kind)
     if kind in ['items','suppliers','warehouses']: q=q.filter(is_active=True)
     if kind=='purchase-requests': q=q.filter(status='APPROVED')
@@ -145,6 +151,9 @@ def dispatch(request,route):
         require(request.user.is_authenticated and request.user.is_active,'UNAUTHORIZED','Please sign in',401)
         require(bool(roles(request.user)),'FORBIDDEN','No role has been assigned to this account',403)
         route=route.strip('/'); parts=route.split('/'); kind=parts[0]; uid=parts[1] if len(parts)>1 else None; action=parts[2] if len(parts)>2 else None
+        from .cache import rate_limit
+        if route=='reports': rate_limit('reports',request.user.pk,60,60)
+        if kind=='import-jobs' and request.method=='POST': rate_limit('imports',request.user.pk,10,60)
         if request.method=='GET':
             if route=='me': result=queries.serialize(request.user)
             elif route=='dashboard': result=queries.dashboard(request.user)
@@ -213,13 +222,16 @@ def dispatch(request,route):
                 elif route=='operations/check':
                     allow(user,'ADMIN'); operations.check_alerts(); result={'processed':operations.consume_events()}
                 else:
-                    with transaction.atomic():
-                        RuntimeState.objects.select_for_update().get(pk=1)
-                        user=User.objects.get(pk=user.pk); require(user.is_active,'UNAUTHORIZED','Account is inactive',401)
-                        create=request.method=='POST' and ((not uid and kind not in ['notifications']) or route=='stock/issues/drafts')
+                    create=request.method=='POST' and ((not uid and kind not in ['notifications']) or route=='stock/issues/drafts')
+                    def perform(actor):
+                        nonlocal user
+                        user=actor
                         if create:
-                            result=idempotent(user,key,route,data,lambda:queries.serialize(write(),True)); status=201
-                        else: result=write()
+                            return idempotent(user,key,route,data,lambda:queries.serialize(write(),True))
+                        return write()
+                    perform.catalog_write = kind in {*catalog.MODELS, 'users'}
+                    result=atomic_command(perform)(user)
+                    if create: status=201
             result=queries.serialize(result,True) if not isinstance(result,(dict,list)) else result
         return JsonResponse({'data':result,'request_id':rid},status=status)
     except BusinessError as e:

@@ -1,0 +1,28 @@
+groups:
+  - name: labops
+    rules:
+      - alert: LabOpsUnavailable
+        expr: up{job="labops"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: 'LabOps metrics endpoint is unavailable'}
+      - alert: InventoryReconciliationMismatch
+        expr: inventory_reconciliation_failures > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'Inventory ledger and balance disagree'}
+      - alert: OutboxPublishDelayed
+        expr: outbox_oldest_pending_seconds > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Oldest unpublished event exceeds five minutes'}
+      - alert: ConsumerDeliveryFailures
+        expr: consumer_failures > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Consumer delivery needs retry or inspection'}
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag{job="kafka-exporter"}) > 100
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'LabOps consumer group is more than 100 messages behind'}

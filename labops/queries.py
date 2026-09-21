@@ -1,4 +1,7 @@
 from collections import defaultdict
+from django.db import connection
+from django.db.models import F, Sum, DecimalField, ExpressionWrapper, Value, Prefetch, Exists, OuterRef
+from django.db.models.functions import Cast
 from datetime import timedelta
 from labops.common import *
 from labops.models import *
@@ -30,8 +33,9 @@ def serialize(record,detail=False):
         d['lines']=[{**snapshot(x),'item_name':x.batch.item.name,'batch_no':x.batch.batch_no,'warehouse_name':x.warehouse.name,'expires_on':str(x.batch.expires_on or ''),'supplier_lot':x.batch.supplier_lot} for x in record.lines.select_related('batch__item','warehouse')]
         if hasattr(record,'movement'): d['movement_id']=str(record.movement.id)
     if isinstance(record,StockMovement):
-        d['is_reversed']=StockMovement.objects.filter(reversal_of=record).exists()
-        d['lines']=[serialize(x) for x in record.lines.select_related('batch__item','warehouse','task')]
+        d['is_reversed']=record._is_reversed if hasattr(record,'_is_reversed') else StockMovement.objects.filter(reversal_of=record).exists()
+        lines=record.prefetched_lines if hasattr(record,'prefetched_lines') else record.lines.select_related('batch__item','warehouse','task')
+        d['lines']=[serialize(x) for x in lines]
         d['posted_by_name']=record.posted_by.name if record.posted_by else ''
         if record.receipt: d['receipt_no']=record.receipt.receipt_no
         if record.reversal_of: d['original_no']=record.reversal_of.movement_no
@@ -52,27 +56,48 @@ def serialize(record,detail=False):
     return d
 
 def inventory_overview():
-    today=timezone.localdate(); sums=defaultdict(lambda:{'on_hand':Decimal(0),'available':Decimal(0),'expired':Decimal(0),'value':Decimal(0)})
-    for b in StockBalance.objects.select_related('batch__item','warehouse'):
-        row=sums[b.batch.item_id]; row['on_hand']+=b.on_hand_qty; row['value']+=b.on_hand_qty*b.batch.unit_cost
-        if b.batch.expires_on and b.batch.expires_on<today: row['expired']+=b.on_hand_qty
-        elif b.warehouse.is_active and b.batch.item.is_active: row['available']+=b.on_hand_qty
+    today=timezone.localdate()
+    sums=defaultdict(lambda:{'on_hand':Decimal(0),'available':Decimal(0),'expired':Decimal(0),'value':Decimal(0)})
+    if connection.vendor == 'postgresql':
+        # Fixed6Field is an integer micro-unit. Cast BEFORE multiplication to
+        # avoid bigint overflow; divide quantity by 1e6 and value by 1e12.
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT b.item_id,
+                SUM(s.on_hand_qty::numeric)*0.000001,
+                SUM(CASE WHEN (b.expires_on IS NULL OR b.expires_on >= %s) AND i.is_active AND w.is_active THEN s.on_hand_qty::numeric ELSE 0 END)*0.000001,
+                SUM(CASE WHEN b.expires_on < %s THEN s.on_hand_qty::numeric ELSE 0 END)*0.000001,
+                SUM(s.on_hand_qty::numeric*b.unit_cost::numeric)*0.000000000001
+                FROM labops_stockbalance s JOIN labops_batch b ON b.id=s.batch_id
+                JOIN labops_item i ON i.id=b.item_id JOIN labops_warehouse w ON w.id=s.warehouse_id
+                GROUP BY b.item_id""", [today,today])
+            for item_id,on_hand,available,expired,value in cursor:
+                sums[item_id]=dict(on_hand=on_hand,available=available,expired=expired,value=value)
+    else:
+        for b in StockBalance.objects.select_related('batch__item','warehouse'):
+            row=sums[b.batch.item_id];row['on_hand']+=b.on_hand_qty;row['value']+=b.on_hand_qty*b.batch.unit_cost
+            if b.batch.expires_on and b.batch.expires_on<today:row['expired']+=b.on_hand_qty
+            elif b.warehouse.is_active and b.batch.item.is_active:row['available']+=b.on_hand_qty
     result=[]
-    for item in Item.objects.order_by('code'):
-        x=sums[item.id]; result.append({**serialize(item),**{k:str(v) for k,v in x.items()},'low_stock':item.is_active and x['available']<item.reorder_qty})
+    for item in Item.objects.select_related('created_by').order_by('code'):
+        x=sums[item.id];result.append({**serialize(item),**{k:str(v) for k,v in x.items()},'low_stock':item.is_active and x['available']<item.reorder_qty})
     return result
 
 def costs(user, filters=None):
     filters=filters or {}
     project_qs=visible_projects(user)
     if filters.get('project_id'): project_qs=project_qs.filter(pk=filters['project_id'])
-    projects=list(project_qs); totals=defaultdict(Decimal)
+    projects=list(project_qs.select_related('owner','created_by').prefetch_related('tasks')); totals=defaultdict(Decimal)
     lines=StockMovementLine.objects.filter(movement__status='POSTED',task__project__in=projects).select_related('task')
     if filters.get('item_id'): lines=lines.filter(batch__item_id=filters['item_id'])
     if filters.get('from_date'): lines=lines.filter(movement__posted_at__date__gte=day(filters['from_date']))
     if filters.get('to_date'): lines=lines.filter(movement__posted_at__date__lte=day(filters['to_date']))
-    for l in lines:
-        totals[l.task.project_id]-=l.delta_qty*l.unit_cost
+    if connection.vendor == 'postgresql':
+        numeric=DecimalField(max_digits=38,decimal_places=0)
+        amount=ExpressionWrapper(-Cast(F('delta_qty'),numeric)*Cast(F('unit_cost'),numeric)*Value(Decimal('0.000000000001')),output_field=DecimalField(max_digits=38,decimal_places=12))
+        for row in lines.values('task__project_id').annotate(total=Sum(amount)):
+            totals[row['task__project_id']]=row['total']
+    else:
+        for l in lines: totals[l.task.project_id]-=l.delta_qty*l.unit_cost
     return [{**serialize(p),'material_cost':str(totals[p.id]),'budget_remaining':str(p.budget_amount-totals[p.id]) if p.budget_amount is not None else None} for p in projects]
 
 def dashboard(user):
@@ -83,3 +108,15 @@ def dashboard(user):
     else: prs=PurchaseRequest.objects.filter(project__in=visible_projects(user))
     pending=prs.filter(status='SUBMITTED')
     return {'metrics':{'pending_requests':pending.count(),'low_stock':sum(x['low_stock'] for x in overview),'expiring_batches':due_batches.values('batch_id').distinct().count(),'overdue_tasks':overdue.count(),'inventory_value':str(sum((Decimal(x['value']) for x in overview),Decimal(0)))},'projects':[serialize(p) for p in visible_projects(user).order_by('-created_at','-id')[:4]],'pending':[serialize(x) for x in pending.order_by('-created_at','-id')[:4]],'alerts':[x for x in overview if x['low_stock']][:4],'tasks':[serialize(x) for x in overdue.select_related('project','assignee').order_by('due_date','id')[:4]],'refreshed_at':timezone.now().isoformat()}
+
+
+def prepare_queryset(qs, kind):
+    fields={f.name for f in qs.model._meta.fields}
+    if 'created_by' in fields:qs=qs.select_related('created_by')
+    if kind=='movements':
+        lines=StockMovementLine.objects.select_related('batch__item','warehouse','task','movement')
+        qs=qs.select_related('posted_by','receipt','reversal_of').prefetch_related(Prefetch('lines',queryset=lines,to_attr='prefetched_lines')).annotate(_is_reversed=Exists(StockMovement.objects.filter(reversal_of_id=OuterRef('pk'))))
+    if kind=='balances':qs=qs.select_related('batch__item','warehouse')
+    if kind=='tasks':qs=qs.select_related('project','assignee')
+    if kind=='projects':qs=qs.select_related('owner').prefetch_related('tasks')
+    return qs
