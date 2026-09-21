@@ -57,6 +57,6 @@ order=api(a,'lab-orders/'+order['id']+'/transition',{'expected_version':order['v
 check('lab order completion',order['status']=='COMPLETED')
 check('metrics auth',requests.get(BASE+'/metrics',timeout=10).status_code==403)
 r=requests.get(BASE+'/metrics',headers={'Authorization':'Bearer cloud-runtime-metrics'},timeout=10)
-check('metrics readable with token',r.ok and 'labops_' in r.text)
+check('metrics readable with token',r.ok and 'http_request_duration_seconds' in r.text and 'inventory_reconciliation_failures' in r.text)
 Path('output/playwright/persistence.json').write_text(json.dumps({'sample_id':sample['id'],'order_id':order['id'],'batch_id':batch}))
 print(json.dumps(results,indent=2))

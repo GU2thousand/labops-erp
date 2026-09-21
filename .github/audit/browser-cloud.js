@@ -16,7 +16,10 @@ async (page) => {
   const links=await page.locator('#nav a').evaluateAll(nodes=>nodes.map(n=>({href:n.getAttribute('href'),name:n.textContent.trim()})));
   if(links.length!==11)results.push({name:'eleven administrator navigation pages',passed:false,error:'actual='+links.length});
   for(const link of links) await check('navigation '+link.name,async()=>{
-    await page.locator('#nav a').filter({hasText:link.name}).click();
+    const response=page.waitForResponse(r=>r.url().includes('/api/v1/') && r.request().method()==='GET');
+    if((new URL(page.url()).hash||'#dashboard')===link.href)await page.reload();
+    else await page.locator('#nav a').filter({hasText:link.name}).click();
+    await (await response).finished();
     await page.waitForFunction(()=>!document.querySelector('#main').textContent.includes('Loading')&&!!document.querySelector('#main h1'));
     if(await page.locator('#main').getByText('Try again',{exact:true}).count())throw Error('Page load failure');
   });
