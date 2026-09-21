@@ -1,0 +1,91 @@
+name: Cloud full-stack runtime
+on:
+  push:
+    branches: [codex/cloud-runtime-check-20260921]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: labops-cloud-runtime
+      LABOPS_SECRET_KEY: disposable-cloud-runtime-check-secret
+      LABOPS_DEBUG: '1'
+      LABOPS_EVENT_TRANSPORT: kafka
+      REDIS_URL: redis://redis:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      METRICS_TOKEN: cloud-runtime-metrics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install probes
+        run: |
+          pip install requests
+          npm install --prefix /tmp/audit-tools --no-save @playwright/cli@0.1.21
+          echo /tmp/audit-tools/node_modules/.bin >> "$GITHUB_PATH"
+          mkdir -p output/playwright
+      - name: Start PostgreSQL, Kafka, Redis, web, workers and observability
+        run: docker compose --profile events --profile redis --profile observability up --build --detach --wait --wait-timeout 300
+      - name: Seed fictional data
+        run: |
+          docker compose exec -T web python manage.py seed_demo
+          docker compose exec -T web python manage.py seed_samples
+      - name: Verify HTTP purchase, inventory, sample and access workflows
+        run: python .github/audit/cloud-api.py | tee output/playwright/api.log
+      - name: Verify Kafka consumers and ledger projection
+        run: docker compose exec -T web python .github/audit/check-events.py | tee output/playwright/events.log
+      - name: Verify browser navigation and mobile layout
+        run: |
+          playwright-cli open http://localhost:8001/login/ --browser=chrome
+          playwright-cli snapshot > output/playwright/initial-snapshot.log
+          playwright-cli run-code "$(cat .github/audit/browser-cloud.js)" | tee output/playwright/browser.log
+          python .github/audit/verify-browser.py
+      - name: Verify restart persistence and service health
+        run: |
+          docker compose restart web
+          python - <<'PY'
+          import json,time,requests
+          from pathlib import Path
+          for i in range(30):
+              try:
+                  if requests.get('http://localhost:8001/login/',timeout=5).ok:break
+              except requests.RequestException:pass
+              time.sleep(2)
+          s=requests.Session();s.get('http://localhost:8001/login/').raise_for_status()
+          s.post('http://localhost:8001/login/',data={'email':'admin@labops.local','password':'LabOpsDemo!2026','csrfmiddlewaretoken':s.cookies['csrftoken']}).raise_for_status()
+          saved=json.loads(Path('output/playwright/persistence.json').read_text())
+          for kind,key in [('samples','sample_id'),('lab-orders','order_id')]:
+              r=s.get('http://localhost:8001/api/v1/'+kind+'/'+saved[key]);r.raise_for_status();assert r.json()['data']['status']=='COMPLETED'
+          for url in ['http://localhost:19090/-/ready','http://localhost:13000/api/health','http://localhost:16687/api/services']:
+              requests.get(url,timeout=10).raise_for_status()
+          result=requests.get('http://localhost:19090/api/v1/targets').json()
+          targets=result['data']['activeTargets'];assert targets and all(t['health']=='up' for t in targets),targets
+          services=requests.get('http://localhost:16687/api/services').json()['data'];assert 'labops' in services,services
+          Path('output/playwright/restart-observability.json').write_text(json.dumps({'persistent_samples':True,'persistent_lab_orders':True,'prometheus_targets':targets,'traced_services':services},indent=2))
+          PY
+          docker compose exec -T redis redis-cli ping
+          docker compose exec -T web python manage.py reconcile_stock
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          git rev-parse HEAD > output/playwright/source-sha.txt
+          docker compose --profile events --profile redis --profile observability ps --all > output/playwright/containers.txt
+          docker compose --profile events --profile redis --profile observability logs --no-color > output/playwright/containers.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: labops-cloud-runtime
+          path: output/playwright/
+          retention-days: 7
+      - if: always()
+        run: docker compose --profile events --profile redis --profile observability down --volumes --remove-orphans
