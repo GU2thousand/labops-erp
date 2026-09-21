@@ -1,0 +1,98 @@
+{
+  "test": "actual_consumer_sigkill",
+  "database": "labops_phase8_2f5adde10680",
+  "isolation": "new disposable database and one topic/group per case",
+  "cases": [
+    {
+      "consumer": "analytics",
+      "kill_boundary": "before_commit",
+      "signal": "SIGKILL",
+      "exit_code": -9,
+      "event_id": "61d17c38-600b-41be-bc27-4fe255a735a8",
+      "broker_offset_replayed": 0,
+      "offset_committed_after_recovery": 1,
+      "before": {
+        "processed_records": 0,
+        "effect": "750"
+      },
+      "visible_at_kill": {
+        "processed_records": 0,
+        "effect": "750"
+      },
+      "after_recovery": {
+        "processed_records": 1,
+        "effect": "749"
+      },
+      "exactly_one_database_effect": true
+    },
+    {
+      "consumer": "analytics",
+      "kill_boundary": "after_commit",
+      "signal": "SIGKILL",
+      "exit_code": -9,
+      "event_id": "f0149480-2875-4649-9167-8ea1a1c2efa6",
+      "broker_offset_replayed": 0,
+      "offset_committed_after_recovery": 1,
+      "before": {
+        "processed_records": 0,
+        "effect": "749"
+      },
+      "visible_at_kill": {
+        "processed_records": 1,
+        "effect": "748"
+      },
+      "after_recovery": {
+        "processed_records": 1,
+        "effect": "748"
+      },
+      "exactly_one_database_effect": true
+    },
+    {
+      "consumer": "notification",
+      "kill_boundary": "before_commit",
+      "signal": "SIGKILL",
+      "exit_code": -9,
+      "event_id": "fbba8cba-b464-4ce3-9c80-0d5744360c17",
+      "broker_offset_replayed": 0,
+      "offset_committed_after_recovery": 1,
+      "before": {
+        "processed_records": 0,
+        "effect": 0
+      },
+      "visible_at_kill": {
+        "processed_records": 0,
+        "effect": 0
+      },
+      "after_recovery": {
+        "processed_records": 1,
+        "effect": 3
+      },
+      "exactly_one_database_effect": true
+    },
+    {
+      "consumer": "notification",
+      "kill_boundary": "after_commit",
+      "signal": "SIGKILL",
+      "exit_code": -9,
+      "event_id": "28d67563-36e7-4f54-a3fb-42d24e0c2916",
+      "broker_offset_replayed": 0,
+      "offset_committed_after_recovery": 1,
+      "before": {
+        "processed_records": 0,
+        "effect": 0
+      },
+      "visible_at_kill": {
+        "processed_records": 1,
+        "effect": 3
+      },
+      "after_recovery": {
+        "processed_records": 1,
+        "effect": 3
+      },
+      "exactly_one_database_effect": true
+    }
+  ],
+  "ledger_reconciles": true,
+  "projection_matches_all_balances": true,
+  "failed_deliveries": 0
+}

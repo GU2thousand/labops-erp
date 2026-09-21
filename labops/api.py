@@ -4,7 +4,7 @@ from django.http import JsonResponse,HttpResponse
 from django.shortcuts import render,redirect
 from django.contrib.auth import authenticate,login,logout
 from django.views.decorators.csrf import ensure_csrf_cookie
-from django.db import IntegrityError,OperationalError
+from django.db import IntegrityError,OperationalError,InterfaceError
 from django.db.models import Q
 from django.core.exceptions import ObjectDoesNotExist,ValidationError
 from labops.common import *
@@ -242,9 +242,9 @@ def dispatch(request,route):
         return error_response('INVALID_INPUT','Invalid input format. Check the fields',400,rid)
     except ObjectDoesNotExist: return error_response('NOT_FOUND','Record not found',404,rid)
     except IntegrityError: return error_response('CONFLICT','Duplicate record or relationship constraint conflict. Refresh and review',409,rid)
-    except OperationalError:
-        logging.getLogger('labops').exception('database_unavailable request_id=%s',rid)
-        return error_response('DATABASE_BUSY','Database is busy. Please try again shortly',503,rid)
+    except (OperationalError,InterfaceError):
+        from .database_errors import database_unavailable
+        return database_unavailable(rid)
     except Exception:
         logging.getLogger('labops').exception('request_error request_id=%s',rid)
         return error_response('INTERNAL_ERROR','Operation failed. Contact an administrator with the request ID',500,rid)

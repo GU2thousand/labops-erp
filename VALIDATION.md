@@ -3,8 +3,8 @@
 ## Automated verification
 
 - Original 29 acceptance tests first passed on PostgreSQL before refactoring (17.705 seconds).
-- Final PostgreSQL suite: **60 tests passed**, including migration of existing ledger data, independent-connection concurrency, real PostgreSQL connection termination, consumer duplicate races, deferred foreign-key retry progression, numeric precision, query budgets and Redis failure policies.
-- SQLite compatibility: **60 discovered, 44 passed, 16 PostgreSQL-only tests skipped**. A separate file-backed SQLite test database was used.
+- Final PostgreSQL suite after Phase 8: **62 tests passed**, including migration of existing ledger data, independent-connection concurrency, real PostgreSQL connection termination, consumer duplicate races, deferred foreign-key retry progression, numeric precision, query budgets and Redis failure policies.
+- SQLite compatibility: **62 discovered, 46 passed, 16 PostgreSQL-only tests skipped**. A separate file-backed SQLite test database was used.
 - `makemigrations --check --dry-run`, Python compilation, JavaScript syntax, and whitespace checks passed.
 - The draft-edit race regression passes with the new lock selector and was independently observed failing when the previous selector was restored in memory.
 
@@ -24,6 +24,17 @@
 - Prometheus reported all three configured targets up (LabOps, Redpanda, Kafka exporter); Grafana health returned database `ok`.
 - Posted a stock issue, observed its outbox status `PUBLISHED`, one processed record for each consumer, no unresolved consumer failures and complete projection-to-balance agreement. Jaeger returned one propagated trace containing `command.issue`, `inventory.post`, `outbox.publish`, `consumer.notification`, `consumer.analytics` and SQL spans.
 - Initial startup under host resource pressure produced transient trace-export timeouts; the subsequent business trace was received successfully. This does not establish lossless telemetry delivery.
+
+## Phase 8 completion — actual outages and process death
+
+- Stopped a dedicated PostgreSQL container completely while a two-worker Gunicorn server remained running with `DEBUG=False`. Authenticated inventory-command POST, catalog GET and application-page GET all returned HTTP 503 with stable `DATABASE_UNAVAILABLE`, `Retry-After: 5`, and no database connection details. Recovery was verified over real HTTP.
+- Compared hashes of all 35 application tables before the outage and after restart: failed requests changed none of them. Retried the same stock-issue idempotency key twice after recovery: exactly one movement and one outbox event were created; the second response returned the original result without additional audit or business effects. Ledger reconciliation passed.
+- Added a shared outage response and exception middleware because failures during lazy session/authentication loading were outside the API's previous database-error handler. Focused regressions cover these paths and a connection error injected after inventory writes, proving rollback and safe retry.
+- Sent real SIGKILL to the actual Kafka command process for both analytics and notification consumers, once before database commit and once after commit but before offset acknowledgement (four cases). Test-only wrappers pause at a deterministic boundary; the parent kills the process externally, so Python cleanup does not execute.
+- Every restarted consumer used the same group and received the identical topic/partition/offset. Before-commit effects rolled back; already committed effects were deduplicated. Each event ended with one processed record per consumer, the correct projection delta or recipient notifications, and offset acknowledgement only after successful recovery. Final stock ledger, balances and analytics projection agreed; no failed deliveries remained.
+- Both drills use isolated generated databases; consumer topics/groups are also generated and removed. The PostgreSQL outage targets a dedicated non-Compose container, leaving the local preview stack online. Reproducible scripts and raw [PostgreSQL](benchmarks/results/postgres-outage.json) / [consumer](benchmarks/results/consumer-crash.json) results are checked in.
+
+Together with the earlier real Kafka and Redis outage exercises, these complete the four Phase 8 scenarios for a local single-node deployment. Replicated failover, network partitions and sustained production availability remain outside this validation.
 
 ## Performance
 

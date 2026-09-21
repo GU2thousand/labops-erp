@@ -10,7 +10,7 @@ SECRET_KEY = os.environ.get('LABOPS_SECRET_KEY') or (secret_file.read_text() if 
 if not SECRET_KEY: raise RuntimeError('LABOPS_SECRET_KEY is required')
 ALLOWED_HOSTS = os.environ.get('LABOPS_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
 INSTALLED_APPS = ['django.contrib.auth','django.contrib.contenttypes','django.contrib.sessions','django.contrib.staticfiles','labops']
-MIDDLEWARE = ['labops.telemetry.MetricsMiddleware','whitenoise.middleware.WhiteNoiseMiddleware','django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.middleware.clickjacking.XFrameOptionsMiddleware']
+MIDDLEWARE = ['labops.telemetry.MetricsMiddleware','labops.database_errors.DatabaseUnavailableMiddleware','whitenoise.middleware.WhiteNoiseMiddleware','django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.middleware.clickjacking.XFrameOptionsMiddleware']
 ROOT_URLCONF = 'config.urls'
 TEMPLATES = [{'BACKEND':'django.template.backends.django.DjangoTemplates','DIRS':[BASE_DIR/'labops/templates'],'APP_DIRS':True,'OPTIONS':{'context_processors':['django.template.context_processors.request','django.contrib.auth.context_processors.auth','django.template.context_processors.csrf']}}]
 from urllib.parse import urlparse, unquote, parse_qs

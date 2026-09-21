@@ -117,6 +117,38 @@ Inspect restored application records before accepting the backup. Schedule backu
 
 ## Validation and fault drills
 
-CI runs migrations, migration-drift detection, system checks and the full suite against PostgreSQL 16. A separate SQLite demo job runs its supported regression suite and seeded reconciliation. PostgreSQL concurrency tests explicitly skip SQLite and should not be reported as SQLite concurrency validation.
+CI runs migrations, migration-drift detection, system checks and the full suite against PostgreSQL 17. A separate SQLite demo job runs its supported regression suite and seeded reconciliation. PostgreSQL concurrency tests explicitly skip SQLite and should not be reported as SQLite concurrency validation.
 
 Use a disposable database for fault drills: pause the broker and verify business transactions commit while the outbox grows; resume it and verify backlog drains. Stop a consumer, inspect group lag, restart it, then reconcile. Replay a duplicate and verify no extra effects. Stop Redis and verify catalog fallback plus the documented 503 behavior. Kill a publisher after acknowledgement and before its database update to exercise duplicate publication. Record actual results separately from the existence of configuration and test code.
+
+
+### Consumer process-death drill
+
+The checked-in harness kills the real `consume_kafka` process with SIGKILL after it reaches a controlled boundary. It covers both notification and analytics consumers, before the database commit and after commit but before broker offset acknowledgement. It runs the production command and delivery functions; test-only wrappers signal the boundary to the parent process. The parent kills the child externally, restarts the same consumer group and proves the identical topic/partition/offset is replayed without duplicate database effects.
+
+Run against local development services with a PostgreSQL role that can create databases:
+
+```sh
+export DRILL_DATABASE_URL=postgresql://labops:labops-local@127.0.0.1:55433/postgres
+.venv/bin/python benchmarks/consumer_crash_drill.py --bootstrap-servers 127.0.0.1:19093
+```
+
+The harness creates a uniquely named `labops_phase8_*` database and isolated broker topics/groups, then cleans up only those generated resources. It refuses non-loopback database/broker endpoints. It does not stop the main web service or its consumers. Results are written to `benchmarks/results/consumer-crash.json`. Check the exit status and all assertions; merely receiving the SIGKILL signal is not a successful recovery test. This is single-node process recovery, not replicated failover or an external email/API exactly-once guarantee.
+
+
+### Full PostgreSQL service-outage drill
+
+Use a dedicated disposable PostgreSQL container, not the Compose database used by the preview or another application. The script stops the entire server, so every database on that server is interrupted. It requires an exact container-name acknowledgement, rejects Compose services and non-loopback database URLs, verifies the mapped PostgreSQL port, and creates its own unique scratch database.
+
+For the dedicated local container used in this validation:
+
+```sh
+DATABASE_URL=postgresql://labops:labops-local@127.0.0.1:55432/postgres \
+  .venv/bin/python benchmarks/postgres_outage_drill.py \
+  --container labops-upgrade-postgres \
+  --confirm-stop-container labops-upgrade-postgres --port 8003
+```
+
+The named container must already exist; substitute your dedicated container and its mapped port. The harness starts an isolated two-worker Gunicorn instance, signs in with generated demo data, stops PostgreSQL, verifies stable HTTP 503 errors, then restarts it. It compares all application table hashes before retrying the same stock command twice and checking one mutation plus reconciliation. It removes its generated database and restores the container's initial running state. Results are written to `benchmarks/results/postgres-outage.json`; a local `.server.log` is diagnostic output, not a credential or response-body archive.
+
+Database connectivity failures return `DATABASE_UNAVAILABLE`, `Retry-After: 5`, and `Cache-Control: no-store`. The response covers API dispatch and database-backed authentication/session loading in views. Retry mutations with the same idempotency key: a connection loss around commit can leave the client uncertain whether its original command committed. Do not invent a new key merely because the first response was unavailable. The outage test above verifies an already-stopped server; the independent connection-termination test separately exercises rollback during posting.

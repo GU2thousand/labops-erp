@@ -55,3 +55,8 @@ Create the empty benchmark database first (`createdb` or an equivalent PostgreSQ
 ## Fault evidence
 
 [Failure drill results](results/failure-drills.json) record actual broker/Redis stop-and-restart tests, duplicate publication into a real broker after an injected acknowledgement/mark crash, observed DLQ messages, and pg_dump/pg_restore recovery. Tests also terminate an actual PostgreSQL command connection midway through posting and verify full rollback. These are local process/service drills, not replicated infrastructure failover.
+
+
+Additional Phase 8 evidence: [real consumer SIGKILL results](results/consumer-crash.json) cover four transaction/offset crash windows across both consumers. The [reproducible harness](consumer_crash_drill.py) runs against isolated, generated databases/topics/groups and verifies replay of the same broker offset, one committed database effect, and final ledger/projection reconciliation. See [operations](../docs/operations.md#consumer-process-death-drill) for execution and cleanup behavior.
+
+The [full PostgreSQL outage evidence](results/postgres-outage.json) records real authenticated HTTP requests while a dedicated database container is stopped, unchanged hashes for all 35 application tables, and successful same-key recovery without duplicate stock effects. Reproduce with [postgres_outage_drill.py](postgres_outage_drill.py) using the dedicated-server safeguards in the [operations guide](../docs/operations.md#full-postgresql-service-outage-drill).

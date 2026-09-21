@@ -81,7 +81,7 @@ export DATABASE_URL=postgresql://labops:labops-local@127.0.0.1:55433/labops
 
 Tests create/drop a separate test database. Never set `LABOPS_TEST_DB` to application data. PostgreSQL tests exercise independent connections, duplicate commands/receipts, competing approvals, reversals, project/task races, independent progress, connection loss, consumer replay, deferred FK failures, and migration of existing data. SQLite runs the compatibility suite and explicitly skips PostgreSQL-only tests.
 
-[Benchmark report](benchmarks/README.md) separates single-process handler timings from real Gunicorn/k6 load tests. It includes deterministic fixtures, query plans, counts, p50/p95/p99, throughput and error rate. [Validation evidence](VALIDATION.md) distinguishes live PostgreSQL/Redpanda/Redis drills from injected failures and historical SQLite checks. CI runs both database modes.
+[Benchmark report](benchmarks/README.md) separates single-process handler timings from real Gunicorn/k6 load tests. It includes deterministic fixtures, query plans, counts, p50/p95/p99, throughput and error rate. [Validation evidence](VALIDATION.md) distinguishes live PostgreSQL/Redpanda/Redis drills from injected failures and historical SQLite checks. Phase 8 includes full PostgreSQL shutdown with real HTTP recovery and four real consumer SIGKILL/replay cases; scripts and raw results are checked in. CI runs both database modes.
 
 ## Observability and recovery
 
