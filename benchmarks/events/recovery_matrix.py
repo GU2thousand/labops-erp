@@ -42,6 +42,23 @@ def _write_json(path, value):
     temporary.replace(path)
 
 
+def _kafka_diagnostics(exc):
+    """Keep native error identities without logging broker messages or secrets."""
+    error = exc.args[0] if exc.args else None
+    code = error.code() if callable(getattr(error, 'code', None)) else getattr(exc, 'kafka_error_code', None)
+    if type(code) is not int:
+        return {}
+    result = {'kafka_error_code': code}
+    name = error.name() if callable(getattr(error, 'name', None)) else None
+    if isinstance(name, str) and re.fullmatch(r'[_A-Z][_A-Z0-9]*', name):
+        result['kafka_error_name'] = name
+    for flag in ('retriable', 'fatal'):
+        method = getattr(error, flag, None)
+        if callable(method):
+            result['kafka_error_' + flag] = bool(method())
+    return result
+
+
 def _scope(run_id, case, generation='1'):
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', run_id):
         raise ValueError('Recovery run-id must be a disposable validation run identifier')
@@ -74,6 +91,7 @@ class _RecoveryMatrix:
         self.h = harness
         self.cases = []
         self.topics = set()
+        self.last_kafka_operation = None
         self.run_id = harness.args.run_id
         self.main_topic = harness.settings.KAFKA_TOPIC
         self._guard()
@@ -114,6 +132,7 @@ class _RecoveryMatrix:
             'required_cases': list(CASE_NAMES),
             'passed': len(self.cases) == len(CASE_NAMES) and all(row['passed'] for row in self.cases),
             'sacrificial_topics': sorted(self.topics),
+            'last_kafka_operation': self.last_kafka_operation,
             'production_topic_destructive_operations': 0,
             'limits': ['Same-host restart/recovery only; independent host/AZ faults are separate',
                        'Frozen snapshot with a deliberately future broker record; PITR is separate']})
@@ -149,11 +168,20 @@ class _RecoveryMatrix:
     def _create_topic(self, topic, *, retention_ms=600000, segment_bytes=None):
         self._assert_topic(topic)
         from confluent_kafka.admin import NewTopic
+        self.last_kafka_operation = {'step': 'metadata_before_create', 'topic': topic}
         assert topic not in self.admin.list_topics(timeout=15).topics, 'Sacrificial topic already exists'
         config = {'cleanup.policy': 'delete', 'retention.ms': str(retention_ms),
-                  'min.insync.replicas': '2', 'write.caching': 'disabled', 'compression.type': 'producer'}
+                  'write.caching': 'false', 'compression.type': 'producer'}
+        # Redpanda's allowlist_topic_noop_confs includes min.insync.replicas;
+        # do not declare or demand a DescribeConfigs value for an ignored key.
+        # Actual RF3 and all three ISR members remain mandatory below.
         if segment_bytes is not None:
             config['segment.bytes'] = str(segment_bytes)
+        # v26.2.2 rejects topic-level "disabled" although DescribeConfigs may
+        # report it when the cluster has write_caching_default=disabled.
+        # https://github.com/redpanda-data/redpanda/blob/v26.2.2/src/v/kafka/server/handlers/topics/validators.h#L380-L406
+        self.last_kafka_operation = {'step': 'create_topic', 'topic': topic,
+                                     'partitions': 1, 'replication_factor': 3, 'config': dict(config)}
         future = self.admin.create_topics([NewTopic(topic, num_partitions=1, replication_factor=3,
                                                      config=config)], request_timeout=20)[topic]
         future.result(timeout=25)
@@ -164,6 +192,7 @@ class _RecoveryMatrix:
 
     def _wait_topic(self, topic):
         self._assert_topic(topic)
+        self.last_kafka_operation = {'step': 'wait_topic_full_isr', 'topic': topic}
 
         def ready():
             metadata = self.admin.list_topics(timeout=5).topics.get(topic)
@@ -175,15 +204,18 @@ class _RecoveryMatrix:
     def _alter_topic(self, topic, config):
         self._assert_topic(topic)
         from confluent_kafka.admin import ConfigResource, ResourceType
+        from infra.events.admin import topic_value_matches
         # Set the complete known configuration of this freshly created topic;
         # no production or internal topic ever reaches this helper.
         resource = ConfigResource(ResourceType.TOPIC, topic, set_config=config)
+        self.last_kafka_operation = {'step': 'alter_topic_config', 'topic': topic, 'config': dict(config)}
         self.admin.alter_configs([resource], request_timeout=20)[resource].result(timeout=25)
+        self.last_kafka_operation = {'step': 'verify_topic_config', 'topic': topic, 'config': dict(config)}
         observed = self.admin.describe_configs([ConfigResource(ResourceType.TOPIC, topic)],
                                                request_timeout=20)
         values = next(iter(observed.values())).result(timeout=25)
         for name, expected in config.items():
-            assert values[name].value == str(expected), 'Sacrificial topic configuration did not apply: ' + name
+            assert topic_value_matches(name, expected, values[name].value), 'Sacrificial topic configuration did not apply: ' + name
 
     def _watermarks(self, topic):
         self._assert_topic(topic)
@@ -617,6 +649,8 @@ class _RecoveryMatrix:
                 except Exception as exc:
                     case = {'name': name, 'passed': False, 'error_type': type(exc).__name__,
                             'error_code': self.h.api.safe_error(exc),
+                            'last_kafka_operation': self.last_kafka_operation,
+                            **_kafka_diagnostics(exc),
                             'elapsed_seconds': time.monotonic() - began}
                     # Assertion text is authored by this validation module and
                     # contains no connection strings, client config or payload.
