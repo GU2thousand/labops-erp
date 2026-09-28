@@ -20,6 +20,9 @@ if DB_MODE == 'sqlite-demo':
 elif DB_MODE == 'postgres':
     parsed = urlparse(os.environ.get('DATABASE_URL', 'postgresql://labops:labops-local@127.0.0.1:55432/labops'))
     if parsed.scheme not in {'postgres', 'postgresql'}: raise RuntimeError('DATABASE_URL must use PostgreSQL')
+    postgres_binding = os.environ.get('DB_SERVER_SIDE_BINDING', '1')
+    if postgres_binding not in {'0', '1'}:
+        raise RuntimeError('DB_SERVER_SIDE_BINDING must be 0 or 1')
     DATABASES = {'default': {'ENGINE':'django.db.backends.postgresql',
         'NAME':os.environ.get('POSTGRES_DB', unquote(parsed.path.lstrip('/'))),
         'USER':os.environ.get('POSTGRES_USER', unquote(parsed.username or 'labops')),
@@ -28,6 +31,8 @@ elif DB_MODE == 'postgres':
         'PORT':os.environ.get('POSTGRES_PORT', str(parsed.port or 5432)),
         'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '0')),
         'OPTIONS': {'connect_timeout': int(os.environ.get('DB_CONNECT_TIMEOUT_SECONDS', '5')),
+                    'server_side_binding': postgres_binding == '1',
+                    'prepare_threshold': None,
                     **{k:v[-1] for k,v in parse_qs(parsed.query).items() if k in {'sslmode', 'connect_timeout'}}}}}
 else: raise RuntimeError('LABOPS_DB_MODE must be postgres or sqlite-demo')
 AUTH_USER_MODEL = 'labops.User'

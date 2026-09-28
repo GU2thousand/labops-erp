@@ -99,6 +99,27 @@ it cannot establish PostgreSQL row-lock behavior. The observed writer profile
 motivates removing model hydration, but does not predict CPU savings or 50/s
 capacity. A separate unprofiled acceptance run is still required.
 
+PostgreSQL uses Django's `server_side_binding=True` cursor option with psycopg 3.
+`prepare_threshold=None` remains explicit: this change does not enable automatic
+prepared-statement caching. `DB_SERVER_SIDE_BINDING` accepts only `1` (the
+default) or `0`; an invalid value fails PostgreSQL configuration before connection.
+For compatibility rollback, set `DB_SERVER_SIDE_BINDING=0` and restart every web,
+publisher and consumer process so new connections use client binding. SQLite demo
+options are unchanged. URL options do not override this selector. See the
+[Django parameter-binding option](https://docs.djangoproject.com/en/5.2/ref/databases/#server-side-parameters-binding)
+and [psycopg prepared-statement control](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html).
+
+The focused PostgreSQL proof must record actual application, named and dedicated
+ownership cursors; quote/percent, UUID-array, JSON, timezone, decimal and Fixed6
+round trips; transaction rollback and timeout restoration; and the tracing wrapper
+with an in-memory exporter. It captures the actual parameterized claim SQL and
+compares both binding modes under the normal planner after eight executions,
+including use of `outbox_active_created_id_idx`, selected IDs and empty named
+prepared-statement catalogs. Existing migration/concurrent-claim, ledger/report
+and recovery tests must also pass. These compatibility checks make no CPU-saving,
+latency or capacity claim; fresh hosted acceptance keeps the same workload and
+thresholds.
+
 Function profiling remains disabled by default. Own-thread diagnostic attribution
 requires the classic callback profiler engine to be observed on the actual host;
 the configured CPU timer is unchanged. An unsupported engine yields incomplete
