@@ -85,6 +85,39 @@ def _category(code, message):
     return "other"
 
 
+def _broker_authentication_rejection(line, window_start, window_end):
+    """Recognize an explicit rejection from this isolated probe's UTC window.
+
+    Redpanda 26.2 reports a Metadata request (Kafka API key 3) before the
+    required SASL handshake as a kafka_authentication_exception. Neither the
+    exception class alone nor a generic transport disconnect establishes this.
+    Broker process logs use UTC; Docker's scoped reader remains required too.
+    """
+    modern = (re.search(r"\bkafka::kafka_authentication_exception\b", line, re.IGNORECASE)
+              and re.search(r"\bUnexpected auth request\s+3\b\s+expected handshake\b", line, re.IGNORECASE))
+    legacy = re.search(
+        r"Unexpected request during authentication:\s*3\b|"
+        r"Failed authentication.*(?:METADATA|during SASL handshake)|"
+        r"illegal SASL state", line, re.IGNORECASE,
+    )
+    if not (modern or legacy):
+        return False
+    timestamp = re.search(r"\b(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?)\b", line)
+    if timestamp is None:
+        return False
+    try:
+        start = datetime.fromisoformat(window_start)
+        end = datetime.fromisoformat(window_end)
+        observed = datetime.fromisoformat(timestamp.group(1).replace(',', '.'))
+    except (TypeError, ValueError):
+        return False
+    if start.tzinfo is None or end.tzinfo is None or end < start:
+        return False
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return start <= observed <= end
+
+
 class _Observations:
     def __init__(self, secrets):
         self.secrets = sorted(set(secrets), key=len, reverse=True)
@@ -319,11 +352,7 @@ def run_security_probes(configs, topic, run_id, evidence_dir):
                 if not isinstance(logs, str):
                     raise TypeError("broker_log_reader must return scoped log text")
                 for line in logs.splitlines():
-                    if re.search(
-                        r"Unexpected request during authentication:\s*3\b|"
-                        r"Failed authentication.*(?:METADATA|during SASL handshake)|"
-                        r"illegal SASL state", line, re.IGNORECASE,
-                    ):
+                    if _broker_authentication_rejection(line, window_start, window_end):
                         observations.items.append({
                             "source": "broker_log", "error_code": None,
                             "error_name": "BROKER_AUTHENTICATION_REJECTION",
