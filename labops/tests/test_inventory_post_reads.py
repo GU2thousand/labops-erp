@@ -1,16 +1,19 @@
 """Posting reuses persisted lines without changing audit or event contracts."""
 from decimal import Decimal
+from datetime import timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.db import connection, transaction
 from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 
-from labops.common import snapshot
+from labops.common import BusinessError, obj, snapshot
 from labops.event_schema import canonical_payload_hash
 from labops import events
 from labops.inventory import services as inventory
-from labops.models import AuditEvent, OutboxEvent, StockBalance, StockMovement
+from labops.models import AuditEvent, Batch, Item, OutboxEvent, Receipt, StockBalance, StockMovement, StockMovementLine, Supplier, Task
 from labops.tests.test_acceptance import Fixture
 
 
@@ -201,4 +204,98 @@ class InventoryPostReadTests(Fixture, TestCase):
         self.assertEqual(AuditEvent.objects.count(), before_audits)
         self.assertEqual(OutboxEvent.objects.count(), before_events)
         self.assertEqual(StockBalance.objects.get(batch=batch, warehouse=self.wh).on_hand_qty, Decimal('10'))
+        self.assertEqual(inventory.reconcile(), [])
+
+    def assert_rejected_without_effects(self, call, code, status=422):
+        before = (StockMovement.objects.count(), StockMovementLine.objects.count(),
+            AuditEvent.objects.count(), OutboxEvent.objects.count(),
+            list(StockBalance.objects.order_by('pk').values_list('pk', 'on_hand_qty', 'version')))
+        with self.assertRaises(BusinessError) as caught:
+            call()
+        self.assertEqual((caught.exception.code, caught.exception.status), (code, status))
+        after = (StockMovement.objects.count(), StockMovementLine.objects.count(),
+            AuditEvent.objects.count(), OutboxEvent.objects.count(),
+            list(StockBalance.objects.order_by('pk').values_list('pk', 'on_hand_qty', 'version')))
+        self.assertEqual(after, before)
+        return caught.exception
+
+    def test_public_reads_join_only_required_relations_without_lazy_reads_or_extra_row_locks(self):
+        batch = self.precise_stock()
+        with CaptureQueriesContext(connection) as issue_queries:
+            inventory.issue(self.store, self.issue_data(batch, '1.000000'), 'joined-issue', self.rid)
+        task_reads = [sql for sql in table_reads(issue_queries, 'labops_task') if 'JOIN "labops_project"' in sql]
+        batch_reads = [sql for sql in table_reads(issue_queries, 'labops_batch') if 'JOIN "labops_item"' in sql]
+        self.assertEqual(len(task_reads), 1)
+        self.assertEqual(len(batch_reads), 1)
+        self.assertTrue(all('FOR UPDATE' not in sql for sql in task_reads + batch_reads))
+        # The original project lock remains; its former lazy FK read is absent.
+        project_reads = table_reads(issue_queries, 'labops_project')
+        self.assertEqual(len(project_reads), 1)
+        if connection.vendor == 'postgresql':
+            self.assertIn('FOR UPDATE', project_reads[0])
+        self.assertEqual(table_reads(issue_queries, 'labops_item'), [])
+
+        with CaptureQueriesContext(connection) as transfer_queries:
+            inventory.transfer(self.store, self.transfer_data(batch), 'joined-transfer', self.rid)
+        batch_reads = [sql for sql in table_reads(transfer_queries, 'labops_batch') if 'JOIN "labops_item"' in sql]
+        self.assertEqual(len(batch_reads), 1)
+        self.assertNotIn('FOR UPDATE', batch_reads[0])
+        self.assertEqual(table_reads(transfer_queries, 'labops_item'), [])
+
+        receipt = self.receipt(self.order(10), '1.000000')
+        with CaptureQueriesContext(connection) as receipt_queries:
+            inventory.post_receipt(self.store, receipt.pk, {'expected_version': receipt.version}, 'joined-receipt', self.rid)
+        receipt_reads = [sql for sql in table_reads(receipt_queries, 'labops_receipt')
+            if 'JOIN "labops_purchaseorder"' in sql and 'JOIN "labops_supplier"' in sql]
+        self.assertEqual(len(receipt_reads), 1)
+        self.assertNotIn('FOR UPDATE', receipt_reads[0])
+        # The original ancestor-order lock remains; neither parent has a lazy read.
+        order_reads = table_reads(receipt_queries, 'labops_purchaseorder')
+        self.assertEqual(len(order_reads), 1)
+        if connection.vendor == 'postgresql':
+            self.assertIn('FOR UPDATE', order_reads[0])
+        self.assertEqual(table_reads(receipt_queries, 'labops_supplier'), [])
+        self.assertEqual(inventory.reconcile(), [])
+
+    def test_related_lookup_retains_obj_errors_public_missing_records_and_authorization(self):
+        batch = self.precise_stock()
+        for model, relations in ((Task, ('project',)), (Batch, ('item',)), (Receipt, ('order__supplier',))):
+            for ident in (None, 'invalid-uuid', str(uuid4())):
+                with self.subTest(model=model.__name__, ident=ident):
+                    with self.assertRaises(BusinessError) as original:
+                        obj(model, ident)
+                    with self.assertRaises(BusinessError) as joined:
+                        inventory._related_obj(model, ident, *relations)
+                    self.assertEqual((joined.exception.code, joined.exception.status, joined.exception.message),
+                        (original.exception.code, original.exception.status, original.exception.message))
+        missing = str(uuid4())
+        # Malformed document/task UUIDs can be rejected earlier by the unchanged
+        # locking wrapper. Well-formed absent IDs reach the identical 404 boundary.
+        calls = [
+            lambda: inventory.issue(self.store, {**self.issue_data(batch, 1), 'task_id': missing}, 'missing-task', self.rid),
+            lambda: inventory.issue(self.store, self.issue_data(type('BatchId', (), {'id': missing})(), 1), 'missing-batch', self.rid),
+            lambda: inventory.transfer(self.store, {**self.transfer_data(batch), 'batch_id': missing}, 'missing-transfer-batch', self.rid),
+            lambda: inventory.post_receipt(self.store, missing, {'expected_version': 1}, 'missing-receipt', self.rid),
+        ]
+        for call in calls:
+            error = self.assert_rejected_without_effects(call, 'NOT_FOUND', 404)
+            self.assertEqual(error.message, 'Record not found or no longer available')
+        self.assert_rejected_without_effects(lambda: inventory.issue(self.audit, self.issue_data(batch, 1), 'forbidden', self.rid), 'FORBIDDEN', 403)
+        outsider = self.user('outside-project', 'TECH')
+        self.assert_rejected_without_effects(lambda: inventory.issue_draft(outsider, self.issue_data(batch, 1), self.rid), 'NOT_FOUND', 404)
+
+    def test_joined_relations_keep_closed_expired_and_inactive_rejections_without_effects(self):
+        batch = self.precise_stock()
+        receipt = self.receipt(self.order(10), '1.000000')
+        Task.objects.filter(pk=self.task.pk).update(status='DONE')
+        self.assert_rejected_without_effects(lambda: inventory.issue(self.store, self.issue_data(batch, 1), 'closed', self.rid), 'TASK_NOT_ACTIVE')
+        Task.objects.filter(pk=self.task.pk).update(status='IN_PROGRESS')
+        Item.objects.filter(pk=self.item.pk).update(is_active=False)
+        self.assert_rejected_without_effects(lambda: inventory.issue(self.store, self.issue_data(batch, 1), 'inactive-issue', self.rid), 'INACTIVE_ITEM')
+        self.assert_rejected_without_effects(lambda: inventory.transfer(self.store, self.transfer_data(batch), 'inactive-transfer', self.rid), 'INACTIVE_ITEM')
+        Item.objects.filter(pk=self.item.pk).update(is_active=True)
+        Batch.objects.filter(pk=batch.pk).update(expires_on=timezone.localdate() - timedelta(days=1))
+        self.assert_rejected_without_effects(lambda: inventory.issue(self.store, self.issue_data(batch, 1), 'expired', self.rid), 'BATCH_EXPIRED')
+        Supplier.objects.filter(pk=self.supplier.pk).update(is_active=False)
+        self.assert_rejected_without_effects(lambda: inventory.post_receipt(self.store, receipt.pk, {'expected_version': receipt.version}, 'inactive-supplier', self.rid), 'INACTIVE_SUPPLIER')
         self.assertEqual(inventory.reconcile(), [])

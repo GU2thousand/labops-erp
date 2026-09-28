@@ -6,6 +6,7 @@ broker records retain their event ID and are harmless to this database's effects
 import json
 import base64
 import logging
+import sqlite3
 import time
 import uuid
 from datetime import timedelta
@@ -107,6 +108,45 @@ def envelope(event):
     return value
 
 
+def _notification_unique_conflict(error):
+    """Only the event/user insertion race permits the existing-row fallback."""
+    cause = error.__cause__
+    if connection.vendor == 'postgresql':
+        return getattr(getattr(cause, 'diag', None), 'constraint_name', None) == 'notification_unique'
+    if connection.vendor == 'sqlite':
+        return (getattr(cause, 'sqlite_errorcode', None) == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+                and str(cause) == 'UNIQUE constraint failed: labops_notification.event_id, labops_notification.user_id')
+    return False
+
+
+def _notify_inventory(event_id, payload):
+    # Eligibility is one event-local active-user query snapshot. These rows are
+    # not user authorization for inventory commands, which retain their locks.
+    recipients = [uuid.UUID(value) for value in payload['recipients']]
+    active = set(User.objects.filter(pk__in=recipients, is_active=True).values_list('id', flat=True))
+    if not active:
+        return
+    existing = set(Notification.objects.filter(event_id=event_id, user_id__in=active)
+                   .values_list('user_id', flat=True))
+    missing = [uid for uid in recipients if uid in active and uid not in existing]
+    if missing:
+        try:
+            with transaction.atomic():
+                Notification.objects.bulk_create([
+                    Notification(event_id=event_id, user_id=uid, title=payload['title'], body=payload['body'])
+                    for uid in missing])
+        except IntegrityError as exc:
+            if not _notification_unique_conflict(exc):
+                raise
+            for uid in missing:
+                Notification.objects.get_or_create(event_id=event_id, user_id=uid,
+                    defaults={'title': payload['title'], 'body': payload['body']})
+    completed = set(Notification.objects.filter(event_id=event_id, user_id__in=active)
+                    .values_list('user_id', flat=True))
+    if completed != active:
+        raise IntegrityError('Notification recipients did not complete')
+
+
 @traced_consumer
 def process_envelope(consumer, event):
     """Only effects in this PostgreSQL database are atomic with deduplication."""
@@ -124,7 +164,8 @@ def process_envelope(consumer, event):
         original = OutboxEvent.objects.filter(pk=eid, event_type__startswith='inventory.').first()
         if original is None or not StockMovement.objects.filter(pk=event['aggregate_id'], status='POSTED').exists():
             raise EventValidationError('Original posted movement and inventory outbox are required', 'missing_business_event')
-        if canonical_payload_hash(envelope(original)) != digest:
+        envelope(original)  # verifies/backfills the immutable original checksum
+        if original.payload_hash != digest:
             raise PayloadConflict()
         marker, created = ProcessedEvent.objects.get_or_create(consumer_name=consumer, event_id=eid,
                                                                defaults={'payload_hash': digest})
@@ -135,10 +176,7 @@ def process_envelope(consumer, event):
             transaction.on_commit(lambda: EVENTS.labels(consumer, 'duplicate').inc())
             return False
         if consumer == 'notification':
-            for uid in payload['recipients']:
-                if User.objects.filter(pk=uid, is_active=True).exists():
-                    Notification.objects.get_or_create(event_id=eid, user_id=uid,
-                        defaults={'title': payload['title'], 'body': payload['body']})
+            _notify_inventory(eid, payload)
         else:
             # Deltas commute; retries may arrive after later events. Projection
             # is eventually consistent and never authorizes inventory writes.
@@ -149,8 +187,7 @@ def process_envelope(consumer, event):
                 deltas[key] = deltas.get(key, Decimal(0)) + delta
             for (bid, wid), delta in sorted(deltas.items()):
                 advisory(f'projection:{bid}:{wid}')
-                projection, _ = InventoryProjection.objects.get_or_create(batch_id=bid, warehouse_id=wid)
-                projection = InventoryProjection.objects.select_for_update().get(pk=projection.pk)
+                projection, _ = InventoryProjection.objects.select_for_update().get_or_create(batch_id=bid, warehouse_id=wid)
                 projection.quantity += delta
                 projection.save(update_fields=['quantity'])
         connection.check_constraints()

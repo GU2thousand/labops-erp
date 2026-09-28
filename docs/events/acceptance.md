@@ -72,6 +72,32 @@ native ARM identities. Keep those observer failures intact. The guarded optional
 label lookup leaves a missing version as null. Subsequent balance/line read and
 publisher pacing changes require a new run; none predicts 50/s capacity.
 
+Those bounded changes at `b10f8bc` were tested by ARM
+[run 36389116383](https://github.com/GU2thousand/labops-erp/actions/runs/36389116383),
+which also **failed**: 3,000 commands in 67.823740143 seconds (44.232299689/s),
+analytics p95/p99 6.059978/6.247530 seconds and notification p95/p99
+20.226638/20.515744 seconds. All original effects completed with exact counts,
+and all six selected-image observations established native ARM identities.
+The rate and latency gates remain unmet; those outcomes are preserved.
+
+Further query changes keep one business command and one consumed event per
+transaction. Inventory reads join only the already-required task/project,
+batch/item and receipt/order/supplier relations; the existing separate row locks,
+advisory locks, lookup errors and validations stay in place. Analytics obtains
+the projection with one locked `get_or_create` under its existing advisory lock.
+Original envelopes still validate and initialize or verify their immutable hash
+before comparing that checksum with the incoming hash.
+
+Notification eligibility is one event-local active-user query snapshot
+(PostgreSQL's configured default is READ COMMITTED). Missing and inactive users
+are excluded. Existing notifications retain their UUID, title, body and read
+timestamp. Missing rows use a plain bulk insert inside a savepoint; only the
+named event/user uniqueness race permits the existing `get_or_create` fallback.
+Other primary-key, foreign-key or constraint failures roll back the marker and
+effects. Exact eligible-recipient completion is checked in the same transaction.
+This groups rows within one event, and does not batch consumed events or offsets.
+These changes require another live probe and do not predict 50/s capacity.
+
 Runtime diagnostics are an explicit opt-in with `--runtime-diagnostics`.
 The default CLI and automatic 60-event smoke leave diagnostics disabled. The
 manual workflow's `runtime_diagnostics` boolean also defaults to `false`; the

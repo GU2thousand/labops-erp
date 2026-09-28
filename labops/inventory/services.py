@@ -3,6 +3,10 @@ from labops.common import *
 from labops.models import *
 from labops.purchasing.services import received_qty,order_state
 
+def _related_obj(model,id,*relations):
+    try: return model.objects.select_related(*relations).get(pk=id)
+    except (model.DoesNotExist,ValueError,ValidationError): fail('NOT_FOUND','Record not found or no longer available',404)
+
 def validate_active(batch,warehouse):
     require(batch.item.is_active,'INACTIVE_ITEM','Item is inactive')
     require(warehouse.is_active,'INACTIVE_WAREHOUSE','Warehouse is inactive')
@@ -58,7 +62,7 @@ def post_receipt(user,id,data,key,rid):
     allow(user,'ADMIN','STORE'); prior=existing(user,key,'RECEIPT',data)
     if prior:
         require(str(prior.receipt_id)==str(id),'IDEMPOTENCY_CONFLICT','This idempotency key refers to another receipt',409); return prior
-    receipt=obj(Receipt,id)
+    receipt=_related_obj(Receipt,id,'order__supplier')
     if receipt.status=='POSTED': return receipt.movement
     require(receipt.status=='DRAFT','INVALID_TRANSITION','A reversed receipt cannot be posted again')
     version(receipt,data)
@@ -78,12 +82,12 @@ def post_receipt(user,id,data,key,rid):
     return m
 
 def issue_lines(user,data,member=False):
-    task=obj(Task,data.get('task_id')); check_task(user,task,member)
+    task=_related_obj(Task,data.get('task_id'),'project'); check_task(user,task,member)
     inputs=data.get('lines',[])
     require(isinstance(inputs,list) and 0<len(inputs)<=100,'EMPTY_LINES','Stock issues require 1 to 100 lines')
     result=[]
     for x in inputs:
-        batch=obj(Batch,x.get('batch_id')); warehouse=obj(Warehouse,x.get('warehouse_id')); validate_active(batch,warehouse)
+        batch=_related_obj(Batch,x.get('batch_id'),'item'); warehouse=obj(Warehouse,x.get('warehouse_id')); validate_active(batch,warehouse)
         require(not batch.expires_on or batch.expires_on>=timezone.localdate(),'BATCH_EXPIRED','The selected batch has expired and cannot be issued',422,'batch_id')
         result.append(line(batch,warehouse,-qty(x.get('qty')),task=task))
     return result
@@ -126,7 +130,7 @@ def issue(user,data,key,rid):
 def transfer(user,data,key,rid):
     allow(user,'ADMIN','STORE'); prior=existing(user,key,'TRANSFER',data)
     if prior: return prior
-    batch=obj(Batch,data.get('batch_id')); source=obj(Warehouse,data.get('from_warehouse_id')); target=obj(Warehouse,data.get('to_warehouse_id')); q=qty(data.get('qty'))
+    batch=_related_obj(Batch,data.get('batch_id'),'item'); source=obj(Warehouse,data.get('from_warehouse_id')); target=obj(Warehouse,data.get('to_warehouse_id')); q=qty(data.get('qty'))
     require(source.id!=target.id,'SAME_WAREHOUSE','Source and destination warehouses must differ')
     validate_active(batch,source); validate_active(batch,target)
     return post(user,'TRANSFER',[line(batch,source,-q,transfer_pair_no=1),line(batch,target,q,transfer_pair_no=1)],data,key,rid)
