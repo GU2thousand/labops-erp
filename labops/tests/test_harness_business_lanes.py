@@ -53,6 +53,11 @@ class ObservedConnections:
 @skipUnless(connection.vendor == 'postgresql', 'Real PostgreSQL lane transactions required')
 @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'])
 class HarnessBusinessLaneTests(TransactionTestCase):
+    def setUp(self):
+        # TransactionTestCase flushes remove migration-created data between
+        # classes. Restore the same singleton required by legal opening stock.
+        models.RuntimeState.objects.get_or_create(pk=1)
+
     def make_harness(self, directory):
         harness = object.__new__(Harness)
         harness.args = SimpleNamespace(

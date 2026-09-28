@@ -22,6 +22,14 @@ def completed(value=None, error=None):
     return future
 
 
+def topic_metadata(topic, *, identity=None, partition_id=0, topic_error=None,
+                   partition_error=None, isrs=(0, 1, 2)):
+    part = SimpleNamespace(id=partition_id, error=partition_error, leader=2,
+                           replicas=[0, 1, 2], isrs=list(isrs))
+    return SimpleNamespace(topics={topic: SimpleNamespace(topic=identity or topic,
+        error=topic_error, partitions={0: part})})
+
+
 class RecoveryTopicContractTests(SimpleTestCase):
     def matrix(self):
         matrix = object.__new__(_RecoveryMatrix)
@@ -313,3 +321,420 @@ class RecoveryTopicContractTests(SimpleTestCase):
         self.assertEqual(persisted['kafka_error_code'], KafkaError._TIMED_OUT)
         self.assertNotIn(private, output)
         self.assertNotIn('private-password', output)
+
+    def readiness_matrix(self):
+        matrix = self.matrix()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        matrix.h.evidence = Path(directory.name)
+        matrix._consumer_config = Mock(return_value={})
+        topic = _scope(matrix.run_id, 'recreate')['topic']
+        clock = SimpleNamespace(now=0)
+        client = Mock()
+        client.list_topics.return_value = topic_metadata(topic)
+        matrix.admin.list_topics.return_value = topic_metadata(topic)
+        return matrix, topic, clock, client
+
+    def clock_context(self, clock):
+        return patch('benchmarks.events.recovery_matrix.time.monotonic', side_effect=lambda: clock.now)
+
+    def clock_sleep(self, clock):
+        return patch('benchmarks.events.recovery_matrix.time.sleep',
+                     side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds))
+
+    def test_watermark_leader_transition_refreshes_same_client_and_retains_native_code(self):
+        matrix, topic, clock, client = self.readiness_matrix()
+        private = 'sasl.password=private-password synthetic-original-payload'
+        transition = KafkaException(KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION, private))
+        replies = iter([transition, (0, 0)])
+
+        def query(_partition, **_):
+            clock.now += .2
+            result = next(replies)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        def metadata(**_):
+            clock.now += .1
+            return topic_metadata(topic)
+
+        client.get_watermark_offsets.side_effect = query
+        client.list_topics.side_effect = metadata
+        with self.clock_context(clock), self.clock_sleep(clock), patch(
+                'confluent_kafka.Consumer', return_value=client) as consumer:
+            self.assertEqual(matrix._watermarks(topic, timeout=3), {'low': 0, 'high': 0})
+        consumer.assert_called_once()
+        client.list_topics.assert_called_once()
+        self.assertEqual(client.list_topics.call_args.kwargs, {'timeout': 2.65})
+        self.assertEqual(client.get_watermark_offsets.call_count, 2)
+        self.assertEqual(client.get_watermark_offsets.call_args_list[0].kwargs,
+                         {'timeout': 3, 'cached': False})
+        self.assertAlmostEqual(client.get_watermark_offsets.call_args_list[1].kwargs['timeout'], 2.55)
+        for call in client.get_watermark_offsets.call_args_list:
+            self.assertEqual((call.args[0].topic, call.args[0].partition), (topic, 0))
+        client.close.assert_called_once()
+        output = (matrix.h.evidence / 'errors.jsonl').read_text()
+        evidence = json.loads(output)
+        self.assertEqual(evidence['kafka_error_code'], 6)
+        self.assertEqual(evidence['kafka_error_name'], 'NOT_LEADER_FOR_PARTITION')
+        self.assertFalse(evidence['kafka_error_retriable'])
+        self.assertFalse(evidence['kafka_error_fatal'])
+        self.assertEqual(evidence['step'], 'read_topic_watermarks')
+        self.assertNotIn('private-password', output)
+        self.assertNotIn('synthetic-original-payload', output)
+        self.assertEqual(matrix.last_kafka_operation['step'], 'read_topic_watermarks')
+        self.assertTrue(matrix.last_kafka_operation['within_deadline'])
+
+    def test_persistent_watermark_code_six_stops_on_original_budget_and_remains_native_failure(self):
+        matrix, topic, clock, client = self.readiness_matrix()
+        transition = KafkaException(KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION))
+
+        def query(_partition, **_):
+            clock.now += 1
+            raise transition
+
+        client.get_watermark_offsets.side_effect = query
+        with self.clock_context(clock), self.clock_sleep(clock), patch(
+                'confluent_kafka.Consumer', return_value=client), self.assertRaises(KafkaException) as raised:
+            matrix._watermarks(topic, timeout=3)
+        self.assertIs(raised.exception, transition)
+        self.assertEqual(_kafka_diagnostics(raised.exception)['kafka_error_code'], 6)
+        self.assertEqual(client.get_watermark_offsets.call_count, 3)
+        self.assertEqual(client.list_topics.call_count, 2)
+        self.assertLess(client.get_watermark_offsets.call_args.kwargs['timeout'], 1)
+        client.close.assert_called_once()
+        self.assertAlmostEqual(matrix.last_kafka_operation['elapsed_seconds'], 3.3)
+        self.assertEqual(matrix.last_kafka_operation['query_elapsed_seconds'], 1)
+        self.assertEqual(matrix.last_kafka_operation['cleanup_seconds'], 0)
+        self.assertFalse(matrix.last_kafka_operation['within_deadline'])
+        errors = [json.loads(line) for line in (matrix.h.evidence / 'errors.jsonl').read_text().splitlines()]
+        self.assertEqual([row['kafka_error_code'] for row in errors], [6, 6, 6])
+        self.assertEqual(errors[-1]['query_elapsed_seconds'], 1)
+        self.assertFalse(errors[-1]['within_deadline'])
+
+    def test_watermark_authentication_and_every_other_native_code_fail_without_retry(self):
+        for code in (KafkaError.TOPIC_AUTHORIZATION_FAILED, KafkaError.GROUP_AUTHORIZATION_FAILED,
+                     KafkaError._AUTHENTICATION, KafkaError.LEADER_NOT_AVAILABLE, KafkaError._TIMED_OUT):
+            with self.subTest(code=code):
+                matrix, topic, clock, client = self.readiness_matrix()
+                error = KafkaException(KafkaError(code))
+                client.get_watermark_offsets.side_effect = error
+                with self.clock_context(clock), self.clock_sleep(clock) as sleep, patch(
+                        'confluent_kafka.Consumer', return_value=client), self.assertRaises(KafkaException) as raised:
+                    matrix._watermarks(topic, timeout=3)
+                self.assertIs(raised.exception, error)
+                client.get_watermark_offsets.assert_called_once()
+                client.list_topics.assert_not_called()
+                client.close.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_fatal_code_six_is_terminal_even_though_its_numeric_code_matches(self):
+        for stage in ('query', 'metadata_refresh', 'metadata_wait'):
+            with self.subTest(stage=stage):
+                matrix, topic, clock, client = self.readiness_matrix()
+                fatal = KafkaException(KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION,
+                                                 'private-password', fatal=True))
+                if stage == 'metadata_wait':
+                    matrix.admin.list_topics.side_effect = fatal
+                    with self.clock_context(clock), self.clock_sleep(clock) as sleep, self.assertRaises(KafkaException) as raised:
+                        _RecoveryMatrix._wait_topic(matrix, topic, timeout=3)
+                    matrix.admin.list_topics.assert_called_once()
+                    sleep.assert_not_called()
+                else:
+                    client.get_watermark_offsets.side_effect = (
+                        fatal if stage == 'query' else KafkaException(
+                            KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION)))
+                    client.list_topics.side_effect = fatal
+                    with self.clock_context(clock), self.clock_sleep(clock), patch(
+                            'confluent_kafka.Consumer', return_value=client), self.assertRaises(KafkaException) as raised:
+                        matrix._watermarks(topic, timeout=3)
+                    client.get_watermark_offsets.assert_called_once()
+                    client.close.assert_called_once()
+                self.assertIs(raised.exception, fatal)
+                self.assertEqual(_kafka_diagnostics(raised.exception)['kafka_error_code'], 6)
+                self.assertTrue(_kafka_diagnostics(raised.exception)['kafka_error_fatal'])
+
+    def test_cleanup_error_preserves_primary_exception_and_also_fails_an_otherwise_successful_read(self):
+        for failed_query in (True, False):
+            with self.subTest(failed_query=failed_query):
+                matrix, topic, clock, client = self.readiness_matrix()
+                primary = KafkaException(KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED,
+                                                    'primary-private-password'))
+                cleanup = RuntimeError('cleanup-private-password')
+                if failed_query:
+                    client.get_watermark_offsets.side_effect = primary
+                else:
+                    client.get_watermark_offsets.return_value = (0, 0)
+                client.close.side_effect = cleanup
+                expected = KafkaException if failed_query else RuntimeError
+                with self.clock_context(clock), self.clock_sleep(clock), patch(
+                        'confluent_kafka.Consumer', return_value=client), self.assertRaises(expected) as raised:
+                    matrix._watermarks(topic, timeout=3)
+                self.assertIs(raised.exception, primary if failed_query else cleanup)
+                output = (matrix.h.evidence / 'errors.jsonl').read_text()
+                evidence = json.loads(output)
+                self.assertEqual(evidence['error_type'], 'RuntimeError')
+                self.assertEqual(evidence['primary_error_type'], 'KafkaException' if failed_query else None)
+                self.assertNotIn('primary-private-password', output)
+                self.assertNotIn('cleanup-private-password', output)
+                self.assertEqual(matrix.last_kafka_operation['step'],
+                                 'read_topic_watermarks' if failed_query else 'close_watermark_consumer')
+                client.get_watermark_offsets.assert_called_once()
+                client.close.assert_called_once()
+
+    def test_watermark_refresh_preserves_topic_partition_identity_auth_and_full_isr(self):
+        for bad, expected in (
+                ({'identity': 'different-topic'}, AssertionError),
+                ({'partition_id': 1}, AssertionError),
+                ({'topic_error': KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED)}, KafkaException),
+                ({'partition_error': KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED)}, KafkaException),
+                ({'isrs': (0, 1)}, KafkaException),
+                ({'isrs': (0, 1, 1)}, KafkaException)):
+            with self.subTest(bad=bad):
+                matrix, topic, clock, client = self.readiness_matrix()
+                client.get_watermark_offsets.side_effect = KafkaException(
+                    KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION))
+                client.list_topics.return_value = topic_metadata(topic, **bad)
+                with self.clock_context(clock), self.clock_sleep(clock), patch(
+                        'confluent_kafka.Consumer', return_value=client), self.assertRaises(expected):
+                    matrix._watermarks(topic, timeout=3)
+                client.get_watermark_offsets.assert_called_once()
+                client.close.assert_called_once()
+        matrix, _, _, _ = self.readiness_matrix()
+        with patch('confluent_kafka.Consumer') as consumer, self.assertRaises(ValueError):
+            matrix._watermarks(matrix.main_topic)
+        consumer.assert_not_called()
+
+    def test_watermark_late_success_refresh_or_cleanup_never_passes(self):
+        for stage in ('query', 'metadata_refresh', 'cleanup'):
+            with self.subTest(stage=stage):
+                matrix, topic, clock, client = self.readiness_matrix()
+
+                def query(_partition, **_):
+                    if stage == 'metadata_refresh':
+                        raise KafkaException(KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION))
+                    clock.now += 3.1 if stage == 'query' else 1
+                    return (0, 0)
+
+                client.get_watermark_offsets.side_effect = query
+                if stage == 'metadata_refresh':
+                    def metadata(**_):
+                        clock.now += 3
+                        return topic_metadata(topic)
+                    client.list_topics.side_effect = metadata
+                if stage == 'cleanup':
+                    client.close.side_effect = lambda: setattr(clock, 'now', clock.now + 3)
+                with self.clock_context(clock), self.clock_sleep(clock), patch(
+                        'confluent_kafka.Consumer', return_value=client), self.assertRaises(AssertionError):
+                    matrix._watermarks(topic, timeout=3)
+                client.close.assert_called_once()
+                client.get_watermark_offsets.assert_called_once()
+
+    def test_metadata_wait_retries_only_code_six_and_requires_full_ready_identity(self):
+        matrix, topic, clock, _ = self.readiness_matrix()
+        replies = iter([KafkaException(KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION)),
+                        topic_metadata(topic, isrs=(0, 1)), topic_metadata(topic)])
+
+        def metadata(**_):
+            clock.now += .2
+            response = next(replies)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        matrix.admin.list_topics.side_effect = metadata
+        with self.clock_context(clock), self.clock_sleep(clock):
+            _RecoveryMatrix._wait_topic(matrix, topic, timeout=3)
+        self.assertEqual(matrix.admin.list_topics.call_count, 3)
+        self.assertEqual(matrix.admin.list_topics.call_args_list[0].kwargs, {'timeout': 3})
+        self.assertTrue(matrix.last_kafka_operation['within_deadline'])
+        self.assertEqual(json.loads((matrix.h.evidence / 'errors.jsonl').read_text())['kafka_error_code'], 6)
+
+    def test_metadata_wait_auth_wrong_identity_and_persistent_transition_cannot_pass(self):
+        for bad, expected in (
+                (KafkaException(KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED)), KafkaException),
+                (topic_metadata('placeholder', identity='wrong-topic'), AssertionError),
+                (topic_metadata('placeholder', partition_id=1), AssertionError),
+                (topic_metadata('placeholder', topic_error=KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED)), KafkaException)):
+            with self.subTest(bad=bad):
+                matrix, topic, clock, _ = self.readiness_matrix()
+                if isinstance(bad, Exception):
+                    matrix.admin.list_topics.side_effect = bad
+                else:
+                    bad.topics[topic] = bad.topics.pop('placeholder')
+                    if bad.topics[topic].topic == 'placeholder':
+                        bad.topics[topic].topic = topic
+                    matrix.admin.list_topics.return_value = bad
+                with self.clock_context(clock), self.clock_sleep(clock), self.assertRaises(expected):
+                    _RecoveryMatrix._wait_topic(matrix, topic, timeout=3)
+                matrix.admin.list_topics.assert_called_once()
+        matrix, topic, clock, _ = self.readiness_matrix()
+        transition = KafkaException(KafkaError(KafkaError.NOT_LEADER_FOR_PARTITION))
+
+        def persistent(**_):
+            clock.now += 1
+            raise transition
+
+        matrix.admin.list_topics.side_effect = persistent
+        with self.clock_context(clock), self.clock_sleep(clock), self.assertRaises(KafkaException) as raised:
+            _RecoveryMatrix._wait_topic(matrix, topic, timeout=3)
+        self.assertIs(raised.exception, transition)
+        self.assertEqual(matrix.admin.list_topics.call_count, 3)
+        self.assertAlmostEqual(matrix.last_kafka_operation['elapsed_seconds'], 3.3)
+        self.assertEqual(matrix.last_kafka_operation['query_elapsed_seconds'], 1)
+        self.assertFalse(matrix.last_kafka_operation['within_deadline'])
+
+    def test_metadata_wait_late_full_isr_response_never_passes(self):
+        matrix, topic, clock, _ = self.readiness_matrix()
+
+        def late(**_):
+            clock.now += 3.1
+            return topic_metadata(topic)
+
+        matrix.admin.list_topics.side_effect = late
+        with self.clock_context(clock), self.clock_sleep(clock), self.assertRaises(AssertionError):
+            _RecoveryMatrix._wait_topic(matrix, topic, timeout=3)
+        self.assertFalse(matrix.last_kafka_operation['within_deadline'])
+        matrix.admin.list_topics.assert_called_once_with(timeout=3)
+
+    def test_terminal_watermark_errors_stamp_query_and_secondary_cleanup_durations(self):
+        for code, fatal in ((KafkaError.TOPIC_AUTHORIZATION_FAILED, False),
+                            (KafkaError.NOT_LEADER_FOR_PARTITION, True)):
+            with self.subTest(code=code, fatal=fatal):
+                matrix, topic, clock, client = self.readiness_matrix()
+                primary = KafkaException(KafkaError(code, 'primary-private-password', fatal=fatal))
+
+                def query(_partition, **_):
+                    clock.now += .4
+                    raise primary
+
+                def cleanup():
+                    clock.now += .3
+                    raise RuntimeError('cleanup-private-password')
+
+                client.get_watermark_offsets.side_effect = query
+                client.close.side_effect = cleanup
+                with self.clock_context(clock), self.clock_sleep(clock) as sleep, patch(
+                        'confluent_kafka.Consumer', return_value=client), self.assertRaises(KafkaException) as raised:
+                    matrix._watermarks(topic, timeout=.5)
+                self.assertIs(raised.exception, primary)
+                operation = matrix.last_kafka_operation
+                self.assertEqual(operation['step'], 'read_topic_watermarks')
+                self.assertEqual(operation['query_timeout_seconds'], .5)
+                self.assertAlmostEqual(operation['query_elapsed_seconds'], .4)
+                self.assertAlmostEqual(operation['cleanup_seconds'], .3)
+                self.assertAlmostEqual(operation['elapsed_seconds'], .7)
+                self.assertAlmostEqual(operation['cleanup_elapsed_seconds'], .7)
+                self.assertEqual(operation['construction_seconds'], 0)
+                self.assertFalse(operation['within_deadline'])
+                self.assertEqual(operation['secondary_cleanup_error_type'], 'RuntimeError')
+                output = (matrix.h.evidence / 'errors.jsonl').read_text()
+                evidence = json.loads(output)
+                self.assertAlmostEqual(evidence['cleanup_seconds'], .3)
+                self.assertAlmostEqual(evidence['elapsed_seconds'], .7)
+                self.assertFalse(evidence['within_deadline'])
+                self.assertNotIn('primary-private-password', output)
+                self.assertNotIn('cleanup-private-password', output)
+                client.get_watermark_offsets.assert_called_once()
+                client.list_topics.assert_not_called()
+                sleep.assert_not_called()
+
+    def test_terminal_metadata_errors_stamp_actual_request_time_and_deadline(self):
+        for code, fatal in ((KafkaError.TOPIC_AUTHORIZATION_FAILED, False),
+                            (KafkaError.NOT_LEADER_FOR_PARTITION, True)):
+            for delay in (.8, 1.2):
+                with self.subTest(code=code, fatal=fatal, delay=delay):
+                    matrix, topic, clock, _ = self.readiness_matrix()
+                    error = KafkaException(KafkaError(code, fatal=fatal))
+
+                    def query(**_):
+                        clock.now += delay
+                        raise error
+
+                    matrix.admin.list_topics.side_effect = query
+                    with self.clock_context(clock), self.clock_sleep(clock) as sleep, self.assertRaises(KafkaException) as raised:
+                        _RecoveryMatrix._wait_topic(matrix, topic, timeout=1)
+                    self.assertIs(raised.exception, error)
+                    operation = matrix.last_kafka_operation
+                    self.assertEqual(operation['step'], 'wait_topic_full_isr')
+                    self.assertEqual(operation['query_timeout_seconds'], 1)
+                    self.assertAlmostEqual(operation['query_elapsed_seconds'], delay)
+                    self.assertAlmostEqual(operation['elapsed_seconds'], delay)
+                    self.assertEqual(operation['within_deadline'], delay <= 1)
+                    matrix.admin.list_topics.assert_called_once_with(timeout=1)
+                    sleep.assert_not_called()
+
+    def test_watermark_constructor_failure_stamps_elapsed_without_inventing_query_or_cleanup(self):
+        matrix, topic, clock, _ = self.readiness_matrix()
+        error = KafkaException(KafkaError(KafkaError._AUTHENTICATION))
+
+        def construct(_config):
+            clock.now += .4
+            raise error
+
+        with self.clock_context(clock), patch('confluent_kafka.Consumer', side_effect=construct), self.assertRaises(KafkaException) as raised:
+            matrix._watermarks(topic, timeout=1)
+        self.assertIs(raised.exception, error)
+        operation = matrix.last_kafka_operation
+        self.assertEqual(operation['step'], 'construct_watermark_consumer')
+        self.assertAlmostEqual(operation['construction_seconds'], .4)
+        self.assertAlmostEqual(operation['elapsed_seconds'], .4)
+        self.assertEqual(operation['cleanup_seconds'], 0)
+        self.assertTrue(operation['within_deadline'])
+        self.assertNotIn('query_elapsed_seconds', operation)
+        self.assertNotIn('query_timeout_seconds', operation)
+
+    def test_constructor_failure_keeps_zero_cleanup_with_advancing_clock_reads(self):
+        matrix, topic, clock, _ = self.readiness_matrix()
+        error = KafkaException(KafkaError(KafkaError._AUTHENTICATION))
+
+        def read_clock():
+            clock.now += .001
+            return clock.now
+
+        def construct(_config):
+            clock.now += .4
+            raise error
+
+        with patch('benchmarks.events.recovery_matrix.time.monotonic', side_effect=read_clock), patch(
+                'confluent_kafka.Consumer', side_effect=construct) as constructor, self.assertRaises(KafkaException) as raised:
+            matrix._watermarks(topic, timeout=1)
+        self.assertIs(raised.exception, error)
+        constructor.assert_called_once()
+        operation = matrix.last_kafka_operation
+        self.assertAlmostEqual(operation['construction_seconds'], .401)
+        self.assertGreater(operation['elapsed_seconds'], operation['construction_seconds'])
+        self.assertEqual(operation['cleanup_seconds'], 0)
+        self.assertTrue(operation['within_deadline'])
+        self.assertNotIn('query_elapsed_seconds', operation)
+        self.assertNotIn('query_timeout_seconds', operation)
+
+    def test_watermark_success_and_late_cleanup_stamp_complete_separate_durations(self):
+        for close_delay, passed in ((.15, True), (.8, False)):
+            with self.subTest(close_delay=close_delay):
+                matrix, topic, clock, client = self.readiness_matrix()
+
+                def construct(_config):
+                    clock.now += .1
+                    return client
+
+                def query(_partition, **_):
+                    clock.now += .25
+                    return (0, 0)
+
+                client.get_watermark_offsets.side_effect = query
+                client.close.side_effect = lambda: setattr(clock, 'now', clock.now + close_delay)
+                with self.clock_context(clock), patch('confluent_kafka.Consumer', side_effect=construct):
+                    if passed:
+                        self.assertEqual(matrix._watermarks(topic, timeout=1), {'low': 0, 'high': 0})
+                    else:
+                        with self.assertRaises(AssertionError):
+                            matrix._watermarks(topic, timeout=1)
+                operation = matrix.last_kafka_operation
+                self.assertAlmostEqual(operation['construction_seconds'], .1)
+                self.assertAlmostEqual(operation['query_timeout_seconds'], .9)
+                self.assertAlmostEqual(operation['query_elapsed_seconds'], .25)
+                self.assertAlmostEqual(operation['cleanup_seconds'], close_delay)
+                self.assertAlmostEqual(operation['elapsed_seconds'], .35 + close_delay)
+                self.assertEqual(operation['within_deadline'], passed)

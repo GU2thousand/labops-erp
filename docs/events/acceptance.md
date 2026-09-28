@@ -166,11 +166,68 @@ Retained `report.json` SHA-256 is
 `74e375ba7b5453c69aecc3c6c93c6b21fdf9c1ba9b3a910b25562c09f3083375`;
 the failing report remains unchanged.
 
-The new four-lane profile has no claimed hosted/full 50/s pass in this document.
+The hosted four-lane probe [Actions run 36377715335](https://github.com/GU2thousand/labops-erp/actions/runs/36377715335),
+at commit `9e0d324e1e123f90501e6572cf5f8b162db2a0e1`, completed all 3,000 commands
+in **131.664182009s**, an actual **22.785240103/s**, with **71.664182009s** of
+schedule lateness. The unchanged 50/s generation gate **failed**. All 3,000
+outboxes published; both consumers completed 3,000 IDs, with exactly 6,000 dedupe
+markers and 9,000 notifications, no missing IDs or reconciliation mismatches.
+Analytics p99 was 1.06097s and notification p99 1.09924s. The retained failing
+`report.json` SHA-256 is
+`bc0fe1a1d7851ce34df03b55d0a881092530d46ed3e48e3499a5cd97ca615eb9`.
+These results establish correctness and latency at the measured workload;
+they do not meet the requested rate. CPU/GIL, SQL waits and host contention were
+not measured by that run, so no specific saturation cause is asserted.
+
+The four-lane profile has no claimed hosted/full 50/s pass in this document.
 A local SQL profile of 200 application-service commands is implementation
 profiling, not an RF3 workload or hosted/production acceptance result. Full RF3,
 independent-domain staging and production acceptance remain pending executed
 evidence at their frozen denominators and clock boundaries.
+
+### Measurement-only capacity diagnosis
+
+The next bounded diagnostic keeps the four lanes, queue capacity four, legal
+business services/locks, global 50/s target and 5% completion-window gate. A
+512-event request is a diagnostic input, not the 90,000-event acceptance target.
+It may fail the rate gate and still retain useful raw measurements. A diagnostic
+does not qualify a slower input rate as 50/s or establish long-run capacity.
+
+The frozen execution profile declares the one-second resource observer and its
+sample/request bounds before setup. `runtime-resource-profile.json` records
+actual isolated-container identities and effective CPU/memory limits without
+environment variables. Each concurrent batch retains
+`runtime-diagnostics-NNN.json`: process user/system CPU versus wall time, safe
+host/process resources, PostgreSQL state/wait/blocking-backend samples and
+container CPU/memory/I/O counters when the host exposes their Linux cgroups.
+Unavailable counters and failed samples are explicit unknowns. A final artifact
+does not substitute zero for an unavailable measurement or infer a cause from
+`cpu_count` alone.
+
+`command-diagnostics.jsonl` links every attempted command's global index, lane
+and kind to wall/thread/process CPU, SQL client-call count/wall time and physical
+commit count/wall time. SQL text, bind parameters, credentials and endpoint
+configuration are excluded. Client SQL wall time includes network/client
+decoding and Python scheduling; it is not pure PostgreSQL server execution time
+or a direct GIL-wait measurement. Per-command process CPU includes all concurrent
+threads and must not be summed as independent lane CPU.
+
+Observer startup, joined owning-thread connection cleanup, required raw artifact
+persistence and summary calculation consume the generation clock along with the business work. The
+final topology metadata rewrite reports the already measured completion boundary.
+Record
+observer overhead separately; it receives no extra capacity allowance. The
+observer uses its own bounded database connection and performs read-only
+statistics queries. Before each capacity batch, resource discovery freezes the
+current isolated process identities, including explicitly inspected stopped
+roles during broker fault batches. Steady diagnostic collection requires its
+applicable CPU/database/resource observations; an incomplete steady sample
+cannot support a passing measurement. Fault batches preserve optional missing
+resource observations and coverage limits without invalidating otherwise valid
+business/fault results. Observer startup, cleanup or persistence failure fails
+every scenario's topology and final report. Business failures retain their original exception and
+durable partial journal even if diagnostic collection also fails. Preserve the
+original failed probes unchanged when running a new diagnostic revision.
 
 ## Required scenarios and frozen targets
 

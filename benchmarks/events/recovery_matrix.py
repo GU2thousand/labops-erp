@@ -6,6 +6,7 @@ append its returned cases to the harness report. A false case is a required
 acceptance failure, including a retention simulation without observed cleanup.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -190,16 +191,80 @@ class _RecoveryMatrix:
         self._wait_topic(topic)
         return config
 
-    def _wait_topic(self, topic):
-        self._assert_topic(topic)
-        self.last_kafka_operation = {'step': 'wait_topic_full_isr', 'topic': topic}
+    def _topic_metadata_ready(self, topic, cluster):
+        from confluent_kafka import KafkaException
+        metadata = cluster.topics.get(topic)
+        if metadata is None:
+            return False
+        assert metadata.topic == topic, 'Sacrificial topic metadata identity changed'
+        if metadata.error is not None:
+            raise KafkaException(metadata.error)
+        if set(metadata.partitions) != {0}:
+            return False
+        part = metadata.partitions[0]
+        assert part.id == 0, 'Sacrificial partition metadata identity changed'
+        if part.error is not None:
+            raise KafkaException(part.error)
+        return (part.leader >= 0 and len(part.replicas) == len(part.isrs) == 3
+                and len(set(part.replicas)) == 3 and set(part.replicas) == set(part.isrs)
+                and part.leader in part.replicas)
 
-        def ready():
-            metadata = self.admin.list_topics(timeout=5).topics.get(topic)
-            return (metadata is not None and metadata.error is None and len(metadata.partitions) == 1
-                    and all(part.leader >= 0 and len(part.replicas) == len(part.isrs) == 3
-                            for part in metadata.partitions.values()))
-        self.h.wait(ready, 'Sacrificial RF3 topic did not become ready', timeout=90)
+    def _stamp_readiness(self, started, timeout, *, query_started=None, **fields):
+        now = time.monotonic()
+        elapsed = now - started
+        self.last_kafka_operation.update(elapsed_seconds=elapsed,
+                                         within_deadline=elapsed <= timeout, **fields)
+        if query_started is not None:
+            self.last_kafka_operation['query_elapsed_seconds'] = now - query_started
+
+    @contextmanager
+    def _timed_readiness_request(self, started, timeout):
+        query_started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._stamp_readiness(started, timeout, query_started=query_started)
+
+    def _wait_topic(self, topic, *, timeout=90):
+        self._assert_topic(topic)
+        from confluent_kafka import KafkaError, KafkaException
+        started = time.monotonic()
+        deadline = started + timeout
+        last_transition = None
+        self.last_kafka_operation = {'step': 'wait_topic_full_isr', 'topic': topic,
+                                     'timeout_seconds': timeout}
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if last_transition is not None:
+                        raise last_transition
+                    raise AssertionError('Sacrificial RF3 topic did not become ready within its deadline')
+                self.last_kafka_operation = {'step': 'wait_topic_full_isr', 'topic': topic,
+                                             'timeout_seconds': timeout,
+                                             'query_timeout_seconds': min(5, remaining)}
+                try:
+                    with self._timed_readiness_request(started, timeout):
+                        metadata = self.admin.list_topics(timeout=min(5, remaining))
+                    ready = self._topic_metadata_ready(topic, metadata)
+                except KafkaException as exc:
+                    diagnostics = _kafka_diagnostics(exc)
+                    if (diagnostics.get('kafka_error_code') != KafkaError.NOT_LEADER_FOR_PARTITION
+                            or diagnostics.get('kafka_error_fatal') is not False):
+                        raise
+                    last_transition = exc
+                    self._error('recovery_topic_leader_transition',
+                                **self.last_kafka_operation, **diagnostics)
+                    ready = False
+                elapsed = time.monotonic() - started
+                if not ready and last_transition is not None and elapsed >= timeout:
+                    raise last_transition
+                assert elapsed <= timeout, 'Sacrificial topic metadata returned after its deadline'
+                if ready:
+                    return
+                time.sleep(min(.15, max(0, deadline - time.monotonic())))
+        finally:
+            self._stamp_readiness(started, timeout)
 
     def _alter_topic(self, topic, config):
         self._assert_topic(topic)
@@ -251,16 +316,121 @@ class _RecoveryMatrix:
 
     def _watermarks(self, topic, *, timeout=10):
         self._assert_topic(topic)
-        from confluent_kafka import Consumer, TopicPartition
-        deadline = time.monotonic() + timeout
-        client = Consumer(self._consumer_config(f'labops.{self.run_id}.recovery.inspect'))
+        from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
+        started = time.monotonic()
+        deadline = started + timeout
+        self.last_kafka_operation = {'step': 'construct_watermark_consumer', 'topic': topic,
+                                     'partition': 0, 'timeout_seconds': timeout}
+        client = None
+        construction_seconds = 0
+        refresh_metadata = False
+        last_transition = None
+        primary_error = None
+        attempt = 0
         try:
-            remaining = deadline - time.monotonic()
-            assert remaining > 0, 'Sacrificial watermark query budget expired before request'
-            low, high = client.get_watermark_offsets(TopicPartition(topic, 0), timeout=remaining, cached=False)
-            return {'low': low, 'high': high}
+            construction_started = time.monotonic()
+            try:
+                client = Consumer(self._consumer_config(f'labops.{self.run_id}.recovery.inspect'))
+            finally:
+                construction_seconds = time.monotonic() - construction_started
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 and last_transition is not None:
+                    raise last_transition
+                assert remaining > 0, 'Sacrificial watermark query budget expired before request'
+                attempt += 1
+                try:
+                    if refresh_metadata:
+                        self.last_kafka_operation = {
+                            'step': 'refresh_watermark_topic_metadata', 'topic': topic,
+                            'partition': 0, 'attempt': attempt,
+                            'timeout_seconds': timeout,
+                            'query_timeout_seconds': min(5, remaining)}
+                        # Request all-topic metadata: specifying an unknown topic
+                        # can auto-create it. Refresh this same offset-query
+                        # client after the observed leader mismatch instead.
+                        with self._timed_readiness_request(started, timeout):
+                            metadata = client.list_topics(timeout=min(5, remaining))
+                        assert time.monotonic() <= deadline, 'Sacrificial watermark metadata returned after its deadline'
+                        if not self._topic_metadata_ready(topic, metadata):
+                            time.sleep(min(.15, max(0, deadline - time.monotonic())))
+                            continue
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0, 'Sacrificial watermark query budget expired after metadata refresh'
+                    self.last_kafka_operation = {
+                        'step': 'read_topic_watermarks', 'topic': topic, 'partition': 0,
+                        'attempt': attempt, 'timeout_seconds': timeout,
+                        'query_timeout_seconds': remaining}
+                    with self._timed_readiness_request(started, timeout):
+                        low, high = client.get_watermark_offsets(
+                            TopicPartition(topic, 0), timeout=remaining, cached=False)
+                except KafkaException as exc:
+                    diagnostics = _kafka_diagnostics(exc)
+                    # Kafka protocol code 6 denotes a broker/leader mismatch;
+                    # the one-shot Python watermark API may mark retriable=False.
+                    # Only this observed readiness transition is retried.
+                    # https://kafka.apache.org/39/design/protocol/#protocol_error_codes
+                    if (diagnostics.get('kafka_error_code') != KafkaError.NOT_LEADER_FOR_PARTITION
+                            or diagnostics.get('kafka_error_fatal') is not False):
+                        raise
+                    last_transition = exc
+                    self._error('recovery_watermark_leader_transition',
+                                **self.last_kafka_operation, **diagnostics)
+                    refresh_metadata = True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(.15, remaining))
+                    continue
+                elapsed = time.monotonic() - started
+                assert elapsed <= timeout, 'Sacrificial watermark query returned after its deadline'
+                assert type(low) is int and type(high) is int and 0 <= low <= high, 'Invalid sacrificial watermarks'
+                result = {'low': low, 'high': high}
+                break
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            client.close()
+            cleanup_seconds = 0
+            try:
+                if client is not None:
+                    cleanup_started = time.monotonic()
+                    try:
+                        client.close()
+                    finally:
+                        cleanup_seconds = time.monotonic() - cleanup_started
+            except BaseException as close_error:
+                self._stamp_readiness(started, timeout, cleanup_seconds=cleanup_seconds,
+                                      construction_seconds=construction_seconds)
+                cleanup = {'error_type': type(close_error).__name__,
+                           'primary_error_type': type(primary_error).__name__ if primary_error else None,
+                           'elapsed_seconds': self.last_kafka_operation['elapsed_seconds'],
+                           'within_deadline': self.last_kafka_operation['within_deadline'],
+                           'cleanup_seconds': cleanup_seconds,
+                           **_kafka_diagnostics(close_error)}
+                if primary_error is None:
+                    self.last_kafka_operation = {'step': 'close_watermark_consumer',
+                                                 'topic': topic, 'partition': 0,
+                                                 'timeout_seconds': timeout,
+                                                 'prior_query_operation': dict(self.last_kafka_operation),
+                                                 **cleanup}
+                else:
+                    self.last_kafka_operation['secondary_cleanup_error_type'] = type(close_error).__name__
+                try:
+                    self._error('recovery_watermark_cleanup_failure', topic=topic, partition=0, **cleanup)
+                except Exception:
+                    # Evidence I/O must not replace the native failure or the
+                    # cleanup failure that made an otherwise successful read fail.
+                    pass
+                if primary_error is None:
+                    raise
+            finally:
+                self._stamp_readiness(started, timeout, cleanup_seconds=cleanup_seconds,
+                                      construction_seconds=construction_seconds,
+                                      cleanup_elapsed_seconds=time.monotonic() - started)
+        elapsed = self.last_kafka_operation['elapsed_seconds']
+        assert elapsed <= timeout, 'Sacrificial watermark cleanup exceeded its deadline'
+        return result
 
     def _wait_retention_cleanup(self, topic, last_original_offset):
         """Require an observed policy cleanup within the frozen 75-second gate."""

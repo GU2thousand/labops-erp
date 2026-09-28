@@ -54,9 +54,15 @@ def load_environment(path):
 
 def freeze_generation_execution_profile(evidence, run_id):
     from benchmarks.events.concurrent_generation import frozen_generation_profile
+    from benchmarks.events.runtime_diagnostics import diagnostics_profile
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
         json.dump({'run_id': run_id, **frozen_generation_profile(),
+            'runtime_diagnostics': {**diagnostics_profile(),
+                'lifecycle_required_scenarios': 'every concurrent capacity batch',
+                'complete_collection_required_scenarios': ['steady'],
+                'fault_resource_scope': 'explicit optional missing resource coverage; existing business/count/rate/recovery gates unchanged',
+                'elapsed_scope': 'discovery/startup, business commands, joined lane/sampler cleanup, required raw persistence and summary'},
             'capacity_scenarios': ['steady', 'analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'],
             'small_fault_drills': 'serial execution using the same global cycle/lane mapping; topology reported per batch'}, out, sort_keys=True)
         out.write('\n')
@@ -179,6 +185,17 @@ class Harness:
             'logs', '--no-color', '--since', start, '--until', end,
             'redpanda-0', 'redpanda-1', 'redpanda-2')
         self.started_at = time.time()
+        # Read-only resource discovery happens before any business workload.
+        # The sampler itself, including its joined cleanup, belongs to each
+        # capacity batch's elapsed clock below.
+        from benchmarks.events.container_diagnostics import ContainerResources
+        self.runtime_resource_factory = lambda: ContainerResources.from_compose(self.compose,
+            command_callback=self.command, expected_project=self.env['LABOPS_VALIDATION_PROJECT'])
+        self.container_resources = self.runtime_resource_factory()
+        write_json(self.evidence / 'runtime-resource-profile.json', self.container_resources.profile())
+        self.runtime_diagnostics_enabled = True
+        self.runtime_diagnostics = []
+        self.runtime_diagnostic_errors = []
 
     def command(self, argv, *, timeout=60, binary=False, input=None):
         result = subprocess.run(argv, cwd=ROOT, env=self.env, input=input,
@@ -493,6 +510,8 @@ class Harness:
         rate = rate or self.args.rate
         if hasattr(self, 'business_lanes') and label in {
                 'steady', 'analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'}:
+            if getattr(self, 'runtime_diagnostics_enabled', False):
+                return self._generate_measured(count, label, rate=rate)
             return self._generate_concurrent(count, label, rate=rate)
         batch = self.generation.begin_batch(count, rate, label)
         self._generation_attempt = None
@@ -510,6 +529,134 @@ class Harness:
             raise
         self.generation.finish_success(batch)
         return ids, workload
+
+    def _generate_measured(self, count, label, *, rate):
+        from benchmarks.events.runtime_diagnostics import RuntimeDiagnostics
+        from benchmarks.events.container_diagnostics import DEFAULT_SERVICES
+        began = time.monotonic()
+        planned_start_index = self._next_command_index
+        number = len(self.runtime_diagnostics) + 1
+        path = self.evidence / f'runtime-diagnostics-{number:03d}.json'
+        process_cpu_began = time.process_time()
+        # A prior fault may have restarted the same isolated container. Freeze
+        # its current identity before this batch; never attribute a reused PID
+        # or old process's counters to a replacement instance.
+        try:
+            resources = (self.runtime_resource_factory() if hasattr(self, 'runtime_resource_factory')
+                         else self.container_resources)
+            resource_profile = resources.profile()
+            write_json(self.evidence / f'runtime-resource-profile-{number:03d}.json', resource_profile)
+            frozen_resources = resource_profile['containers']
+            stopped_roles = tuple(role for role, row in frozen_resources.items()
+                                  if role in DEFAULT_SERVICES and row.get('status') == 'known_stopped')
+            observer = RuntimeDiagnostics(path, scenario=label,
+                resource_sampler=resources.snapshot,
+                known_stopped_roles=stopped_roles,
+                expected_resource_roles=tuple(role for role in DEFAULT_SERVICES if role not in stopped_roles))
+        except BaseException as startup_error:
+            self.runtime_diagnostic_errors.append(type(startup_error).__name__)
+            self.runtime_diagnostics.append({'scenario': label, 'artifact': path.name,
+                'summary': {'collection_complete': False, 'observed': False,
+                            'error_type': type(startup_error).__name__}})
+            self._record_failed_generation_start(count, label, rate,
+                planned_start_index, startup_error)
+            raise
+        discovery_elapsed = time.monotonic() - began
+        topology_count = len(self.generation_topologies)
+        original = None
+        try:
+            with observer:
+                try:
+                    result = self._generate_concurrent(count, label, rate=rate)
+                except BaseException as exc:
+                    original = exc
+                    raise
+        except BaseException as exc:
+            if original is None:
+                original = exc
+            elif exc is not original:
+                self.runtime_diagnostic_errors.append(type(exc).__name__)
+            if self._next_command_index == planned_start_index:
+                self._record_failed_generation_start(count, label, rate,
+                    planned_start_index, original)
+            raise original
+        finally:
+            # Stop/join, snapshot persistence and all instrumentation overhead
+            # consume the same generation clock, including on partial failure.
+            diagnostic_failure = None
+            try:
+                summary = observer.summary()
+            except BaseException as diagnostic_error:
+                diagnostic_failure = diagnostic_error
+                self.runtime_diagnostic_errors.append(type(diagnostic_error).__name__)
+                summary = {'observed': False, 'error_type': type(diagnostic_error).__name__}
+            elapsed, process_cpu_elapsed = None, None
+            try:
+                elapsed = time.monotonic() - began
+                process_cpu_elapsed = time.process_time() - process_cpu_began
+            except BaseException as diagnostic_error:
+                diagnostic_failure = diagnostic_failure or diagnostic_error
+                self.runtime_diagnostic_errors.append(type(diagnostic_error).__name__)
+            self.runtime_diagnostics.append({'scenario': label,
+                'artifact': path.name, 'elapsed_seconds': elapsed,
+                'resource_discovery_seconds': discovery_elapsed,
+                'whole_generation_process_cpu_seconds': process_cpu_elapsed,
+                'summary': summary})
+            if len(self.generation_topologies) > topology_count:
+                topology = self.generation_topologies[-1]
+                if topology['scenario'] == label:
+                    topology.update(elapsed_seconds=elapsed,
+                        runtime_diagnostics_artifact=path.name,
+                        elapsed_includes_diagnostics_cleanup=True,
+                        elapsed_includes_diagnostics_artifact_persistence=True,
+                        final_topology_metadata_rewrite='after the measured diagnostic completion boundary')
+                    measurement_failed = (summary.get('lifecycle_complete') is not True
+                        or label == 'steady' and summary.get('collection_complete') is not True)
+                    if original is not None or diagnostic_failure is not None or measurement_failed:
+                        topology.update(passed=False,
+                            error_type=type(original or diagnostic_failure).__name__
+                                if original is not None or diagnostic_failure is not None else 'IncompleteRuntimeDiagnostics')
+                    try:
+                        write_json(self.evidence / f'generation-topology-{len(self.generation_topologies):03d}.json', topology)
+                    except BaseException as diagnostic_error:
+                        self.runtime_diagnostic_errors.append(type(diagnostic_error).__name__)
+                        diagnostic_failure = diagnostic_failure or diagnostic_error
+                        topology.update(passed=False, error_type=type(original or diagnostic_failure).__name__)
+            if original is None and diagnostic_failure is not None:
+                raise diagnostic_failure
+        ids, workload = result
+        workload.update(elapsed_seconds=elapsed,
+            actual_command_rate=count / elapsed if elapsed else None,
+            schedule_lateness_seconds=max(0, elapsed - count / rate),
+            runtime_diagnostics_artifact=path.name,
+            elapsed_boundary='before diagnostic startup/lane batch setup through all worker commits/observations, joined connection/sampler cleanup and diagnostic persistence')
+        return ids, workload
+
+    def _record_failed_generation_start(self, count, label, rate, start_index, error):
+        """Retain an observer-start failure's entire reserved input denominator."""
+        from benchmarks.events.concurrent_generation import allocate_lane_indices
+        allocation = allocate_lane_indices(count, start_index=start_index)
+        self._next_command_index = start_index + count
+        topology = {'scenario': label, 'generator_topology': 'parallel-lanes-v1',
+            'requested': count, 'attempted': 0, 'committed': 0, 'identified_events': 0,
+            'unattempted': count, 'start_global_index': start_index,
+            'global_target_rate': rate, 'nominal_per_lane_average_rate': rate / 4,
+            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'assignment': '(global_index//4)%4', 'position': 'global_index%4',
+            'passed': False, 'stage': 'runtime_diagnostics_startup',
+            'error_type': type(error).__name__, 'journal_batches': [], 'batches': []}
+        self.generation_topologies.append(topology)
+        try:
+            for lane, indices in enumerate(allocation):
+                batch = self.generation.begin_batch(len(indices), rate / 4, label)
+                topology['journal_batches'].append({'lane': lane, 'batch_id': batch,
+                    'requested': len(indices)})
+                self.generation.finish_failure(batch, 'runtime_diagnostics_startup', type(error).__name__)
+                topology['batches'].append(self.generation.batch_summary(batch))
+            write_json(self.evidence / f'generation-topology-{len(self.generation_topologies):03d}.json', topology)
+        except BaseException as accounting_error:
+            self._generation_accounting_error = type(accounting_error).__name__
+            self.runtime_diagnostic_errors.append(type(accounting_error).__name__)
 
     def _generate_commands(self, count, label, *, rate, batch):
         rate = rate or self.args.rate
@@ -622,6 +769,47 @@ class Harness:
             'elapsed_boundary': 'before lane batch setup through all worker commits/observations and joined connection cleanup'}
 
     def _execute_inventory_command(self, seq, label, batch, state, data, *, lane, scheduled_at):
+        if not getattr(self, 'runtime_diagnostics_enabled', False):
+            return self._execute_inventory_command_body(seq, label, batch, state, data,
+                lane=lane, scheduled_at=scheduled_at)
+        from benchmarks.events.runtime_diagnostics import CommandDiagnostics
+        observer = CommandDiagnostics(self.connection)
+        original = None
+        try:
+            with observer:
+                try:
+                    return self._execute_inventory_command_body(seq, label, batch, state, data,
+                        lane=lane, scheduled_at=scheduled_at)
+                except BaseException as exc:
+                    original = exc
+                    raise
+        except BaseException as exc:
+            if original is None:
+                original = exc
+            elif exc is not original:
+                self.runtime_diagnostic_errors.append(type(exc).__name__)
+            raise original
+        finally:
+            try:
+                summary = observer.summary()
+                row = {'global_index': seq, 'business_lane': lane, 'scenario': label,
+                    'kind': ('RECEIPT', 'ISSUE', 'TRANSFER', 'REVERSAL')[seq % 4],
+                    **summary}
+                with self._event_lock, (self.evidence / 'command-diagnostics.jsonl').open('a') as out:
+                    out.write(json.dumps(row, sort_keys=True) + '\n')
+                if summary.get('diagnostic_errors') or summary.get('collection_complete') is not True:
+                    self.runtime_diagnostic_errors.extend(error.get('error_type', 'CommandDiagnosticError')
+                        for error in summary.get('diagnostic_errors', []))
+                    if summary.get('collection_complete') is not True:
+                        self.runtime_diagnostic_errors.append('IncompleteCommandDiagnostics')
+                    if original is None:
+                        raise RuntimeError('Command diagnostic restoration or observation failed; inspect command-diagnostics.jsonl')
+            except BaseException as diagnostic_error:
+                self.runtime_diagnostic_errors.append(type(diagnostic_error).__name__)
+                if original is None:
+                    raise
+
+    def _execute_inventory_command_body(self, seq, label, batch, state, data, *, lane, scheduled_at):
         from django.utils import timezone
         from labops.purchasing.services import create_receipt
         from django.db import transaction
@@ -1948,9 +2136,14 @@ class Harness:
             and not getattr(self, '_generation_accounting_error', None))
         topologies_complete = all(topology.get('passed') is True
                                   for topology in getattr(self, 'generation_topologies', []))
+        diagnostics_complete = (not getattr(self, 'runtime_diagnostic_errors', [])
+            and all(row.get('summary', {}).get('lifecycle_complete') is True
+                    and (row.get('scenario') != 'steady'
+                         or row.get('summary', {}).get('collection_complete') is True)
+                    for row in getattr(self, 'runtime_diagnostics', [])))
         final_complete = (final_state['database_observed'] and final_state['offsets_observed']
             and not final_state['errors'] and not final_state['unpublished_count']
-            and reconciliation_complete and generation_complete and topologies_complete
+            and reconciliation_complete and generation_complete and topologies_complete and diagnostics_complete
             and not final_state['processed_hash_conflicts']
             and all(not consumer['incomplete_count'] for consumer in final_state['consumers'].values())
             and not final_state['event_log_ids_missing_from_database']
@@ -1970,6 +2163,9 @@ class Harness:
             'generation_accounting': generation, 'final_inventory_state': final_state,
             'generation_topologies': getattr(self, 'generation_topologies', []),
             'generation_topologies_complete': topologies_complete,
+            'runtime_diagnostics': getattr(self, 'runtime_diagnostics', []),
+            'runtime_diagnostic_error_types': getattr(self, 'runtime_diagnostic_errors', []),
+            'runtime_diagnostics_complete': diagnostics_complete,
             'generation_accounting_complete': generation_complete,
             'generation_accounting_error_type': getattr(self, '_generation_accounting_error', None),
             'final_reconciliation_complete': reconciliation_complete,
