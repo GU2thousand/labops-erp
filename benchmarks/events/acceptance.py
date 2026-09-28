@@ -231,15 +231,45 @@ class Harness:
         assert not any(child.poll() is None and self.child_groups.get(child.pid) == self.consumer_group(name)
                        for child in self.children), 'An old consumer group instance remains alive'
 
-    def group_assignment(self, name, *, client_id=None):
+    def group_assignment(self, name, *, client_id=None, timeout=10):
         from confluent_kafka import ConsumerGroupState
         from confluent_kafka.admin import AdminClient
         group = self.consumer_group(name)
-        description = AdminClient(self.configs['admin']).describe_consumer_groups([group])[group].result(timeout=10)
+        began = time.monotonic()
+        request_timeout = min(8, timeout * .8)
+        observation = {'observed_at': time.time(), 'group': group,
+                       'expected_client_id': client_id, 'request_timeout_seconds': request_timeout,
+                       'future_timeout_seconds': timeout}
+        try:
+            # The returned future does not retain the native AdminClient. A
+            # temporary client is destroyed before its asynchronous request
+            # completes, leaving an uncompleted Python future. Keep this local
+            # reference alive through result() and bound the native request too.
+            admin = AdminClient(self.configs['admin'])
+            pending = admin.describe_consumer_groups([group], request_timeout=request_timeout)[group]
+            description = pending.result(timeout=timeout)
+            observation['state'] = str(description.state)
+            observation['member_count'] = len(description.members)
+            observation['members'] = [
+                {'client_id': member.client_id, 'assignments': [
+                    {'topic': part.topic, 'partition': part.partition}
+                    for part in (getattr(member.assignment, 'topic_partitions', None) or [])]}
+                for member in description.members]
+        except Exception as exc:
+            observation['error_type'] = type(exc).__name__
+            error = exc.args[0] if exc.args else None
+            numeric = error.code() if hasattr(error, 'code') and callable(error.code) else None
+            if type(numeric) is int:
+                observation['kafka_error_code'] = numeric
+            raise
+        finally:
+            observation['elapsed_seconds'] = time.monotonic() - began
+            with (self.evidence / 'group-assignment-observations.jsonl').open('a') as out:
+                out.write(json.dumps(observation, sort_keys=True) + '\n')
         if description.state != ConsumerGroupState.STABLE or len(description.members) != 1:
             return False
         member = description.members[0]
-        parts = member.assignment.topic_partitions
+        parts = getattr(member.assignment, 'topic_partitions', None) or []
         expected = {(self.settings.KAFKA_TOPIC, partition) for partition in range(3)}
         if len(parts) != 3 or {(part.topic, part.partition) for part in parts} != expected:
             return False
@@ -250,6 +280,29 @@ class Harness:
                     {'topic': part.topic, 'partition': part.partition}
                     for part in member.assignment.topic_partitions]}
 
+    def wait_group_assignment(self, name, *, client_id, message, timeout=90):
+        """Share the original assignment deadline with every native request."""
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                result = self.group_assignment(name, client_id=client_id, timeout=min(10, remaining))
+            except Exception as exc:
+                last = type(exc).__name__
+                result = False
+            if time.monotonic() >= deadline:
+                with (self.evidence / 'group-assignment-observations.jsonl').open('a') as out:
+                    out.write(json.dumps({'kind': 'assignment_deadline_expired',
+                        'expected_client_id': client_id, 'consumer': name,
+                        'budget_seconds': timeout, 'late_ready_result': bool(result),
+                        'last_error_type': last}) + '\n')
+                break
+            if result:
+                return result
+            time.sleep(min(.15, max(0, deadline - time.monotonic())))
+        raise AssertionError(f'{message}; last_error_type={last}')
+
     def supervisor_after_postgres_restart(self, reason):
         before = {name: {'pid': process.pid, 'exit_code_before_restart': process.poll()}
                   for name, process in self.workers.items()}
@@ -259,9 +312,9 @@ class Harness:
         self.start_publisher()
         self.start_consumer('notification')
         self.start_consumer('analytics')
-        assignments = {name: self.wait(lambda name=name: self.group_assignment(name,
-            client_id='acceptance-' + str(self.workers[name].pid)),
-            'Supervised consumer did not regain all partitions: ' + name, timeout=90)
+        assignments = {name: self.wait_group_assignment(name,
+            client_id='acceptance-' + str(self.workers[name].pid),
+            message='Supervised consumer did not regain all partitions: ' + name, timeout=90)
             for name in ('notification', 'analytics')}
         evidence = {'reason': reason, 'previous_processes': before,
                     'restarted_processes': {name: {'pid': process.pid} for name, process in self.workers.items()},
@@ -918,8 +971,8 @@ class Harness:
                 child = self.spawn(label, [str(HERE / 'workers.py'), 'consumer', '--consumer', name,
                     '--stage', stage, '--event-file', str(target_file), '--marker', str(marker),
                     '--observations', str(self.evidence / 'logs' / (label + '-deliveries.jsonl'))], name)
-                assignment = self.wait(lambda: self.group_assignment(name, client_id='acceptance-' + str(child.pid)),
-                    'Fault process did not exclusively own all group partitions', timeout=90)
+                assignment = self.wait_group_assignment(name, client_id='acceptance-' + str(child.pid),
+                    message='Fault process did not exclusively own all group partitions', timeout=90)
                 if boundary == 'effect_commit':
                     ids, _ = self.generate(1, label)
                     eid = ids[0]
