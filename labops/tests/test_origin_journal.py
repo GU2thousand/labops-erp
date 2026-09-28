@@ -26,6 +26,7 @@ def requested_profile(**overrides):
         'poison_events': 100, 'broker_fault_seconds': 300.0, 'outage_seconds': 600.0,
         'consumer_outage_seconds': 600.0, 'drain_timeout': 900.0,
         'runtime_diagnostics_enabled': True,
+        'diagnostic_profile_enabled': False,
     }
     values.update(overrides)
     return values
@@ -122,8 +123,9 @@ class OriginJournalTests(unittest.TestCase):
         child, batch = self.origin(composite, indices=(0, 1, 2, 3))
         frozen = json.loads((child.directory / 'origin-plan.json').read_text())
         self.assertEqual(frozen['requested_numeric_profile'], numeric_profile(requested_profile()))
-        self.assertEqual(len(frozen['requested_numeric_profile']), 12)
+        self.assertEqual(len(frozen['requested_numeric_profile']), 13)
         self.assertIs(frozen['requested_numeric_profile']['runtime_diagnostics_enabled'], True)
+        self.assertIs(frozen['requested_numeric_profile']['diagnostic_profile_enabled'], False)
         self.assertEqual(frozen['commands'], [
             {'ordinal': index + 1, 'global_index': index, 'command_key': f'{RUN_ID}:{index}',
              'kind': kind}

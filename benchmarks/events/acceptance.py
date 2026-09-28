@@ -53,12 +53,15 @@ def load_environment(path):
         os.environ[key] = parsed[0] if len(parsed) == 1 else raw
 
 
-def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False):
+def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False, diagnostic_profile=False):
     from benchmarks.events.process_generation import frozen_process_profile
     from benchmarks.events.runtime_diagnostics import diagnostics_profile
+    from benchmarks.events.diagnostic_profile import request_profile
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
         json.dump({'run_id': run_id, **frozen_process_profile(),
+            'diagnostic_profile': request_profile(diagnostic_profile),
+            'qualification_admissible': not diagnostic_profile,
             'selection_policy': {'mode': 'automatic', 'spawn_minimum_batch_count': 512,
                 'smaller_capacity_batches': 'four FIFO thread lanes',
                 'capacity_batches_at_or_above_threshold': 'four fresh spawn clients',
@@ -151,7 +154,10 @@ class Harness:
         self.generation = generation or GenerationJournal(self.evidence, args.run_id, numeric_profile(args))
         if generation is None:
             freeze_generation_execution_profile(self.evidence, args.run_id,
-                runtime_diagnostics=getattr(args, 'runtime_diagnostics', False))
+                runtime_diagnostics=getattr(args, 'runtime_diagnostics', False),
+                diagnostic_profile=getattr(args, 'diagnostic_profile', False))
+        self.diagnostic_profile_enabled = getattr(args, 'diagnostic_profile', False)
+        self.publisher_profile_paths = []
         self.children = []
         self.child_metrics = {}
         self.child_groups = {}
@@ -418,8 +424,13 @@ class Harness:
         return process
 
     def start_publisher(self):
+        argv = ['manage.py', 'publish_events', '--loop', '--limit', '500']
+        if getattr(self, 'diagnostic_profile_enabled', False):
+            path = self.evidence / 'logs' / f'publisher-profile-{len(self.children):03d}.json'
+            self.publisher_profile_paths.append(path)
+            argv = [str(HERE / 'profile_publisher.py'), '--output', str(path)]
         self.workers['publisher'] = self.spawn('publisher-' + str(len(self.children)),
-            ['manage.py', 'publish_events', '--loop', '--limit', '500'], 'publisher', metrics_port=21000)
+            argv, 'publisher', metrics_port=21000)
         self.sync_metrics_targets()
 
     def setup(self):
@@ -894,7 +905,8 @@ class Harness:
                 'database_scope_digest': database_scope_digest, 'private_database_config_included': False})
             bootstrap = {'plans': plans, 'profile': self.generation.profile, 'rate': rate,
                 'database_config': database_config, 'runtime_settings': runtime_settings,
-                'runtime_diagnostics_enabled': getattr(self, 'runtime_diagnostics_enabled', False)}
+                'runtime_diagnostics_enabled': getattr(self, 'runtime_diagnostics_enabled', False),
+                'diagnostic_profile_enabled': getattr(self, 'diagnostic_profile_enabled', False)}
             catalog = getattr(self, '_active_process_catalog', None) if bootstrap['runtime_diagnostics_enabled'] else None
 
             def started(lane, pid):
@@ -2496,6 +2508,8 @@ class Harness:
                          or row.get('summary', {}).get('collection_complete') is True)
                     for row in getattr(self, 'runtime_diagnostics', [])))
         diagnostics_qualified = not diagnostics_enabled or diagnostics_complete
+        profile_evidence = self.diagnostic_profile_evidence()
+        qualification_admissible = not profile_evidence['enabled']
         final_complete = (final_state['database_observed'] and final_state['offsets_observed']
             and not final_state['errors'] and not final_state['unpublished_count']
             and reconciliation_complete and generation_complete and topologies_complete and diagnostics_qualified
@@ -2509,11 +2523,13 @@ class Harness:
         fault_targets_passed = all(any(case.get('name') == name and case.get('passed') and
             case.get('workload_qualification', {}).get('capacity_qualified') for case in self.cases)
             for name in ('analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'))
-        report = {'passed': error is None and all(case.get('passed') for case in self.cases) and final_complete,
+        report = {'passed': qualification_admissible and error is None and all(case.get('passed') for case in self.cases) and final_complete,
+            'qualification_admissible': qualification_admissible,
+            'diagnostic_profile': profile_evidence,
             'run_id': self.args.run_id, 'unique_generated_events': len(self.events),
             'acceptance_tier': self.args.tier, 'production_ready': False,
             'full_workload_requested': self.args.tier == 'full',
-            'full_workload_targets_passed': self.args.tier == 'full' and 'steady' in passing_cases and fault_targets_passed,
+            'full_workload_targets_passed': qualification_admissible and self.args.tier == 'full' and 'steady' in passing_cases and fault_targets_passed,
             'requested_numeric_profile': generation['requested_numeric_profile'],
             'generation_accounting': generation, 'final_inventory_state': final_state,
             'generation_topologies': getattr(self, 'generation_topologies', []),
@@ -2560,6 +2576,41 @@ class Harness:
                           'cases_completed': len(self.cases), 'error_type': report['error_type']}), flush=True)
         return report
 
+    def diagnostic_profile_evidence(self):
+        """Missing or interrupted outputs remain unknown; OFF performs no I/O."""
+        enabled = getattr(self, 'diagnostic_profile_enabled', False)
+        result = {'enabled': enabled, 'applicable': enabled, 'qualification_admissible': not enabled,
+            'status': 'NOT_REQUESTED', 'complete': None, 'rows': []}
+        if not enabled:
+            return result
+        paths = [(path, 'publisher', None, [None]) for path in getattr(self, 'publisher_profile_paths', [])]
+        for topology in getattr(self, 'process_batches', []):
+            paths += [(Path(plan['directory']) / 'diagnostic-profile.json', 'generator', plan['lane'],
+                       plan['indices']) for plan in topology.get('origin_plans', [])]
+        for path, role, lane, expected_indices in paths:
+            expected = len(expected_indices)
+            row = {'artifact': str(path.relative_to(self.evidence)), 'role': role,
+                   'lane': lane, 'expected_calls': expected, 'complete': False}
+            try:
+                value = json.loads(path.read_text())
+                coverage = value['coverage']
+                row.update(coverage=coverage, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                row['complete'] = (coverage['complete'] is True and coverage['role'] == role
+                    and coverage['lane'] == lane and coverage['requested_calls'] == expected
+                    and coverage['profiled_calls'] == expected
+                    and len(value['calls']) == expected
+                    and len({call['ordinal'] for call in value['calls']}) == expected
+                    and {call['ordinal'] for call in value['calls']} == set(expected_indices)
+                    and value['qualification_admissible'] is False)
+            except BaseException as exc:
+                row['error_type'] = type(exc).__name__
+            result['rows'].append(row)
+        writers = {row['lane'] for row in result['rows'] if row['role'] == 'generator'}
+        result['complete'] = (writers == set(range(4)) and any(row['role'] == 'publisher'
+            for row in result['rows']) and all(row['complete'] for row in result['rows']))
+        result['status'] = 'COMPLETE' if result['complete'] else 'INCOMPLETE'
+        return result
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -2567,6 +2618,8 @@ def main():
     p.add_argument('--tier', choices=['smoke', 'full'], default='smoke')
     p.add_argument('--runtime-diagnostics', action='store_true',
                    help='Opt in to timed CPU/SQL/PostgreSQL/container diagnostics; disabled by default')
+    p.add_argument('--diagnostic-profile', action='store_true',
+                   help='Opt in to own-thread CPU profiles; enabled runs are never acceptance-admissible')
     p.add_argument('--events', type=int, default=200)
     p.add_argument('--rate', type=float, default=10)
     p.add_argument('--duration', type=float, default=20)
@@ -2615,7 +2668,7 @@ def main():
     error = None
     try:
         freeze_generation_execution_profile(args.evidence_dir, args.run_id,
-            runtime_diagnostics=args.runtime_diagnostics)
+            runtime_diagnostics=args.runtime_diagnostics, diagnostic_profile=args.diagnostic_profile)
         load_environment(args.generated_dir / 'client.env')
         for key in list(os.environ):
             if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':
@@ -2630,12 +2683,18 @@ def main():
             if harness is not None:
                 report = harness.finish(error)
                 if error is None and not report['passed']:
+                    if not report.get('qualification_admissible', True):
+                        raise AssertionError('Profiled run is diagnostic only; acceptance qualification is inadmissible')
                     raise AssertionError('Final durable accounting or reconciliation did not qualify; inspect report.json')
             else:
                 generation.finalize()
                 write_json(args.evidence_dir / 'startup-failure.json', {
                     'passed': False, 'error_type': type(error).__name__ if error else None,
                     'stage': 'environment_or_harness_setup', 'requested_numeric_profile': generation.profile,
+                    'qualification_admissible': not args.diagnostic_profile,
+                    'steady_command_denominator': {'requested': args.events,
+                        'attempted': 0, 'committed': 0, 'unattempted': args.events,
+                        'scope': 'harness setup failed before generation'},
                     'generation': generation.summary(), 'database_state_observed': False})
         except BaseException as finalization_error:
             if error is None:

@@ -59,6 +59,11 @@ def numeric_profile(args) -> dict:
     if not isinstance(enabled, bool):
         raise ValueError('Runtime diagnostics request must be a boolean')
     profile['runtime_diagnostics_enabled'] = enabled
+    profiling = (args.get('diagnostic_profile_enabled', args.get('diagnostic_profile', False))
+        if isinstance(args, Mapping) else getattr(args, 'diagnostic_profile', False))
+    if type(profiling) is not bool:
+        raise ValueError('Diagnostic profile request must be a boolean')
+    profile['diagnostic_profile_enabled'] = profiling
     return profile
 
 

@@ -43,7 +43,7 @@ class GenerationJournalTests(SimpleTestCase):
         self.assertEqual(frozen['requested_numeric_profile'], numeric_profile(requested_args()))
         self.assertEqual(frozen['requested_numeric_profile']['events'], 90000)
         self.assertEqual(frozen['requested_numeric_profile']['drain_timeout'], 900.0)
-        self.assertEqual(len(frozen['requested_numeric_profile']), 12)
+        self.assertEqual(len(frozen['requested_numeric_profile']), 13)
         self.assertIs(frozen['requested_numeric_profile']['runtime_diagnostics_enabled'], False)
         self.assertNotIn('secret', frozen['requested_numeric_profile'])
         self.assertNotIn('private-password', journal.journal_path.read_text())

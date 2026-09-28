@@ -114,6 +114,8 @@ class InventoryProcessWorker:
         self._failure = None
         self.state = {'attempt': None, 'stage': 'initialization'}
         self.runtime_diagnostics_enabled = bootstrap['runtime_diagnostics_enabled']
+        self.diagnostic_profile_enabled = bootstrap.get('diagnostic_profile_enabled', False)
+        self.cpu_profile = None
         self.models, self.api, self.services = models, events, services
         self.connections = connections
         # This is the actual owning caller's wrapper configuration, including
@@ -171,6 +173,14 @@ class InventoryProcessWorker:
         self.batch = self.generation.begin_batch(len(self.plan['indices']), bootstrap['rate'] / 4,
                                                self.plan['label'])
         self._events = (self.directory / 'events.jsonl').open('x')
+        if self.diagnostic_profile_enabled:
+            from benchmarks.events.diagnostic_profile import CPUProfile
+            from labops.purchasing import services as purchasing
+            self.cpu_profile = CPUProfile('generator', lane=lane)
+            self.cpu_profile.hook(purchasing, 'create_receipt', 'receipt_create', expected=purchasing.create_receipt)
+            self.cpu_profile.hook(services, 'post_receipt', 'receipt_post', expected=services.post_receipt)
+            for name in ('commit_generated_movement', 'identify_generated_event', 'record_generated_event'):
+                self.cpu_profile.hook(self, name, 'provenance_journal', expected=getattr(self, name))
 
     def ready_metadata(self):
         from benchmarks.events.process_resources import own_process_snapshot
@@ -205,22 +215,24 @@ class InventoryProcessWorker:
         original = None
         observer = None
         item = None
+        from contextlib import nullcontext
+        profiled = self.cpu_profile.call('generator_command', global_index) if self.cpu_profile else nullcontext()
+        def invoke():
+            with profiled:
+                return execute_inventory_command(self, global_index, self.plan['label'],
+                    self.batch, self.state, self.data, lane=self.lane, scheduled_at=target_monotonic)
         try:
             if self.runtime_diagnostics_enabled:
                 from benchmarks.events.runtime_diagnostics import CommandDiagnostics
                 observer = CommandDiagnostics(self.connection)
                 with observer:
                     try:
-                        item = execute_inventory_command(self, global_index, self.plan['label'],
-                            self.batch, self.state, self.data, lane=self.lane,
-                            scheduled_at=target_monotonic)
+                        item = invoke()
                     except BaseException as exc:
                         original = exc
                         raise
             else:
-                item = execute_inventory_command(self, global_index, self.plan['label'],
-                    self.batch, self.state, self.data, lane=self.lane,
-                    scheduled_at=target_monotonic)
+                item = invoke()
         except BaseException as exc:
             original = original or exc
         finally:
@@ -270,6 +282,14 @@ class InventoryProcessWorker:
         except BaseException as exc:
             original = exc
         finally:
+            if self.cpu_profile is not None:
+                try:
+                    metadata['diagnostic_profile'] = self.cpu_profile.close(self.directory / 'diagnostic-profile.json')
+                except BaseException as error:
+                    # Profiling failure is secondary; normal journal and owning
+                    # DB cleanup must still complete, even after a body error.
+                    metadata['diagnostic_profile'] = {'complete': False,
+                        'errors': [{'stage': 'close', 'error_type': type(error).__name__}]}
             try:
                 self._events.close()
             except BaseException as exc:

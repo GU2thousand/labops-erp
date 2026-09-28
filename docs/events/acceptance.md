@@ -369,6 +369,28 @@ business services/locks, global 50/s target and 5% completion-window gate. A
 It may fail the rate gate and still retain useful raw measurements. A diagnostic
 does not qualify a slower input rate as 50/s or establish long-run capacity.
 
+The independent `--diagnostic-profile` opt-in and workflow `diagnostic_profile`
+input default to false; the existing runtime diagnostics policy is unchanged.
+A manual 512-command request at 50/s uses the normal four spawn lanes and queue
+capacity four. Enabling profiling always sets `qualification_admissible=false`,
+even if business/count/rate/latency gates pass or profiling errors trigger a
+fallback. Profile startup, export, cleanup and join consume the elapsed clock;
+each generator must persist its required profile before owning database cleanup
+and join, and publisher lifecycle output/shutdown consumes total elapsed time.
+Missing profile evidence after SIGKILL remains incomplete.
+
+The profiler accumulates cProfile own-thread CPU for each of the four generators
+and one real publisher lifecycle. It exports full sanitized function/caller JSON
+with hash-safe paths/callers, never raw pstats, SQL, arguments, locals or environment
+variables. Fixed phases report wall and thread CPU; nested CPU is not additive,
+and own-thread CPU excludes other threads, background work and librdkafka. The
+publisher send phase combines encode, produce, flush and callbacks; the inline
+conditional mark remains an unclassified residual. The business-code baseline
+remains `06c`: its actual 3,000-command run took **78.187971851s** at
+**38.369073004/s**, with notification p95 **6.843565941s**; rate and notification
+p95 were **FAIL**. Profiling supplies diagnosis, without a performance forecast
+or full-capacity qualification.
+
 When diagnostics are enabled, the frozen execution profile declares the
 one-second resource observer and its sample/request bounds before setup. The
 initial `runtime-resource-profile.json` records the requested/not-started scope;
