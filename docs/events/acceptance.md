@@ -104,6 +104,19 @@ requires the classic callback profiler engine to be observed on the actual host;
 the configured CPU timer is unchanged. An unsupported engine yields incomplete
 profiling evidence while business execution continues without profiling.
 
+The `1cea77d` publisher diagnostic
+[run 36459580248](https://github.com/GU2thousand/labops-erp/actions/runs/36459580248)
+records 518 `claim_event` calls at
+1.611524912 own-thread CPU seconds and 6.332475470 wall seconds. This is the
+composite claim transaction, including lookup, decoding, lease update and commit;
+it does not isolate the correlated SQL predicate's cost. Its unused `blocked`
+annotation is now an alias: the same earlier-version `EXISTS` still filters
+eligibility, while its value is no longer selected onto the returned model.
+Payload fields, shard annotation, due/lease boundaries, ordering and
+`FOR UPDATE SKIP LOCKED` remain unchanged. A focused PostgreSQL 17 proof must
+establish actual disjoint claims and outer commit/rollback behavior; this narrow
+query change makes no CPU-saving, latency or capacity claim.
+
 Notification eligibility is one event-local active-user query snapshot
 (PostgreSQL's configured default is READ COMMITTED). Missing and inactive users
 are excluded. Existing notifications retain their UUID, title, body and read

@@ -208,7 +208,7 @@ def claim_event(*, shard_index=0, shard_count=1):
     with transaction.atomic():
         events = (OutboxEvent.objects.select_for_update(skip_locked=True).filter(transport='kafka')
             .filter(Q(status='PENDING', next_attempt_at__lte=now) | Q(status='PROCESSING', locked_until__lt=now))
-            .annotate(blocked=Exists(earlier)).filter(blocked=False).order_by('created_at', 'id'))
+            .alias(blocked=Exists(earlier)).filter(blocked=False).order_by('created_at', 'id'))
         # Stable shard = first 32 UUID bits modulo count. PostgreSQL filters
         # before locking, so shards do not acquire one another's candidates.
         if shard_count > 1 and connection.vendor == 'postgresql':
