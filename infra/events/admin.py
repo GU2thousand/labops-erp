@@ -137,6 +137,17 @@ def snapshot_topics(admin: AdminClient, wanted: list[dict]) -> tuple[dict, list[
     return actual, missing
 
 
+def topic_value_matches(key: str, expected, actual) -> bool:
+    # Redpanda DescribeConfigs returns the effective "disabled" value when
+    # write_caching_default=disabled overrides topic write.caching=false.
+    # Both satisfy this topic's no-write-caching contract. The stronger explicit
+    # "disabled" declaration remains strict; all other properties stay exact.
+    # https://docs.redpanda.com/streaming/current/reference/properties/cluster-properties/#write_caching_default
+    if key == 'write.caching' and str(expected).lower() == 'false':
+        return str(actual).lower() in {'false', 'disabled'}
+    return str(actual) == str(expected)
+
+
 def mismatches(wanted: list[dict], actual: dict, *, full_isr: bool = False) -> list[str]:
     errors = []
     for spec in wanted:
@@ -152,7 +163,7 @@ def mismatches(wanted: list[dict], actual: dict, *, full_isr: bool = False) -> l
             if full_isr and (part["leader"] < 0 or part["isr"] != part["replicas"]):
                 errors.append(f"{name}/{part['partition']}: incomplete ISR or no leader")
         for key, expected in spec.get("config", {}).items():
-            if str(seen["config"].get(key, {}).get("value")) != str(expected):
+            if not topic_value_matches(key, expected, seen["config"].get(key, {}).get("value")):
                 errors.append(f"{name}: {key} differs from declared {expected}")
     return errors
 
