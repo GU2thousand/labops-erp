@@ -51,6 +51,66 @@ def load_environment(path):
         os.environ[key] = parsed[0] if len(parsed) == 1 else raw
 
 
+def stable_committed_offsets(configs, topic, *, timeout=30, consumer_factory=None,
+                             monotonic=time.monotonic, sleep=time.sleep, on_retry=None):
+    """Require two complete equal snapshots; refresh only coordinator errors.
+
+    A fresh unassigned client repeats FindCoordinator after startup/election.
+    Authentication, authorization, topic errors and malformed responses fail
+    immediately rather than becoming a successful empty offset snapshot.
+    """
+    from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition, OFFSET_INVALID
+    factory = consumer_factory or Consumer
+    coordinator_codes = {KafkaError.NOT_COORDINATOR, KafkaError.COORDINATOR_NOT_AVAILABLE,
+                         KafkaError.COORDINATOR_LOAD_IN_PROGRESS, KafkaError._WAIT_COORD}
+    deadline = monotonic() + timeout
+    previous = None
+    attempts = 0
+    while monotonic() < deadline:
+        attempts += 1
+        snapshot = {}
+        try:
+            for name, config in configs.items():
+                client = factory(config)
+                try:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('Committed-offset snapshot deadline expired')
+                    partitions = client.committed([TopicPartition(topic, n) for n in range(3)],
+                                                  timeout=min(10, remaining))
+                    errors = [p.error for p in partitions if p.error is not None]
+                    # A mixed response must never retry past an ACL failure.
+                    terminal = next((error for error in errors
+                                     if error.code() not in coordinator_codes), None)
+                    if terminal is not None:
+                        raise KafkaException(terminal)
+                    if errors:
+                        raise KafkaException(errors[0])
+                    expected = {(topic, n) for n in range(3)}
+                    assert len(partitions) == 3 and {(p.topic, p.partition) for p in partitions} == expected, \
+                        'Committed-offset response must include exactly the three requested partitions'
+                    assert all(p.offset == OFFSET_INVALID or p.offset >= 0 for p in partitions), \
+                        'Committed-offset response contains an invalid offset sentinel'
+                    snapshot[name] = {str(p.partition): p.offset for p in partitions}
+                finally:
+                    client.close()
+        except KafkaException as exc:
+            error = exc.args[0] if exc.args else None
+            if not isinstance(error, KafkaError) or error.code() not in coordinator_codes:
+                raise
+            previous = None
+            if on_retry:
+                on_retry(error.code(), attempts)
+        else:
+            if snapshot == previous:
+                return snapshot
+            previous = snapshot
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            sleep(min(.25, remaining))
+    raise TimeoutError('Committed-offset snapshot did not stabilize within its deadline')
+
+
 class Harness:
     def __init__(self, args):
         self.args = args
@@ -389,16 +449,12 @@ class Harness:
                      'schedule_lateness_seconds': max(0, elapsed - count / rate)}
 
     def offsets(self):
-        from confluent_kafka import Consumer, TopicPartition
-        result = {}
-        for name in ('notification', 'analytics'):
-            client = Consumer(self.consumer_config(name))
-            try:
-                result[name] = {str(p.partition): p.offset for p in client.committed(
-                    [TopicPartition(self.settings.KAFKA_TOPIC, n) for n in range(3)], timeout=15)}
-            finally:
-                client.close()
-        return result
+        def retry(code, attempt):
+            with (self.evidence / 'errors.jsonl').open('a') as out:
+                out.write(json.dumps({'kind': 'offset_coordinator_refresh',
+                                      'error_code': code, 'attempt': attempt}) + '\n')
+        return stable_committed_offsets({name: self.consumer_config(name)
+            for name in ('notification', 'analytics')}, self.settings.KAFKA_TOPIC, on_retry=retry)
 
     def drained(self, ids, timeout=180):
         expected = len(ids)
