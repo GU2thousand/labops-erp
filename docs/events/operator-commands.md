@@ -99,6 +99,38 @@ relations. Never clear processed markers or generate new IDs to force effects.
 For notification replay, inspect restored users/notification state and the scope
 of any real external delivery before applying a range.
 
+## Conditional notification member canary
+
+The acceptance harness's `notification-dual` preset is currently an unexecuted
+candidate. Production scaling requires successful correctness/capacity evidence
+and authorization for the actual deployment and bounded canary. First verify
+the topic/source namespace, existing group and members, three partitions, role
+credentials/ACLs, retained offsets, supervisor ownership and PostgreSQL connection
+headroom. Budget the additional owning connection and actual transient metrics
+connections; a long-running daemon's connection age setting does not establish
+per-record connection closure.
+
+Run the added member as a separately supervised instance of the same
+`python manage.py consume_kafka notification` command, with the same intended
+group prefix and notification credentials. Give it a distinct process/container
+identity and metrics port or container endpoint. The static Prometheus target
+`notification-consumer:9100` alone does not prove both instances were scraped;
+verify each authenticated endpoint and its actual process identity. An
+unqualified Compose scale command is insufficient for this admission.
+
+Before canary input, observe exactly the two owned STABLE clients with nonempty,
+disjoint assignments covering all three partitions. Preserve the existing
+per-record durable transaction and synchronous ACK, group identity and offsets.
+Measure logical event/effect/notification counts, deduplication, committed next
+offsets, all errors, original latency gates and DB/CPU/RSS pressure. A second
+logical group, offset reset or automatic commit/store would change the experiment.
+
+If admission or canary fails, SIGTERM and reap only the newly added member.
+Verify the retained member reacquires all three partitions and continues from
+retained group offsets; original-ID redelivery must remain deduplicated. Record
+the exit, assignment and effect/offset outcomes. A forced stop or missing proof
+does not establish a successful rollback; retain the failure for investigation.
+
 ## Independent worker commands
 
 ```sh

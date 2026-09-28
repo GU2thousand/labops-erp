@@ -543,16 +543,21 @@ class _RecoveryMatrix:
                 'committed_offset': cursor, 'source_generation': scope['source_generation']}
 
     def _pause_main(self):
-        for name in ('publisher', 'notification', 'analytics'):
-            self.h.stop(name)
+        self.h.stop('publisher')
+        for name in ('notification', 'analytics'):
+            self.h.stop_consumer_role(name)
 
     def _resume_main(self):
         h = self.h
         if 'publisher' not in h.workers:
             h.start_publisher()
         for name in ('notification', 'analytics'):
-            if name not in h.workers:
-                h.start_consumer(name)
+            roles = h.pool_roles(name)
+            if any(role not in h.workers for role in roles):
+                h.stop_consumer_role(name)
+                h.restore_consumer_pool(name)
+            else:
+                h.wait_consumer_pool(name)
 
     def _drain_main(self, ids):
         self._resume_main()
@@ -883,6 +888,7 @@ class _RecoveryMatrix:
         h = self.h
         h.drained([item['event_id'] for item in h.events], timeout=h.args.drain_timeout)
         self._pause_main()
+        primary = None
         try:
             for name, exercise in zip(CASE_NAMES, (self.restart, self.retention, self.recreate)):
                 began = time.monotonic()
@@ -890,6 +896,7 @@ class _RecoveryMatrix:
                 try:
                     case = exercise()
                 except Exception as exc:
+                    primary = exc
                     case = {'name': name, 'passed': False, 'error_type': type(exc).__name__,
                             'error_code': self.h.api.safe_error(exc),
                             'last_kafka_operation': self.last_kafka_operation,
@@ -906,10 +913,19 @@ class _RecoveryMatrix:
                 self.cases.append(case)
                 self._report()
                 print(json.dumps({'recovery_case': name, 'state': 'passed' if case['passed'] else 'failed'}), flush=True)
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            raise
         finally:
             # Validation failures retain topics/backup/failed rows for diagnosis.
             # The owning workflow performs exact-project volume cleanup later.
-            self._resume_main()
+            try:
+                self._resume_main()
+            except BaseException as error:
+                h.record_cleanup_error('recovery_pool_restoration', error)
+                if primary is None:
+                    raise
         return self.cases
 
 

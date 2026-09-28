@@ -20,6 +20,15 @@ from labops.tests.test_process_resources import ProcessFixture
 class HarnessProcessCleanupCatalogTests(SimpleTestCase):
     """Exercise Harness's real observer with exact-PID, resource-free fixtures."""
 
+    def test_dual_catalog_refuses_missing_selected_member_before_proc_read(self):
+        h = object.__new__(Harness)
+        h.consumer_topology = 'notification-dual'
+        h.workers = {'publisher': Mock(), 'notification': Mock(), 'analytics': Mock()}
+        with patch('benchmarks.events.process_resources._stat_reader') as reader:
+            with self.assertRaisesRegex(AssertionError, 'member is missing'):
+                h.create_process_catalog('steady')
+        reader.assert_not_called()
+
     def run_observer(self, script):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -433,6 +442,7 @@ class HarnessRuntimeDiagnosticsTests(SimpleTestCase):
         with observer_patch as factory, clock_patch:
             result, workload = h.generate(32, 'steady')
         factory.assert_called_once_with(path, scenario='steady',
+            consumer_topology='single',
             resource_sampler=h.container_resources.snapshot, known_stopped_roles=(),
             expected_resource_roles=DEFAULT_SERVICES)
         self.assertIs(result, ids)

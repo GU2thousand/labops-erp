@@ -305,6 +305,20 @@ class DiagnosticContractTests(unittest.TestCase):
 
 
 class RuntimeSamplerTests(unittest.TestCase):
+    def test_dual_frozen_contract_passes_and_single_relabelling_is_incomplete(self):
+        for selected in ('single', 'notification-dual'):
+            fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')
+            fixture.start_all()
+            with tempfile.TemporaryDirectory() as directory:
+                diagnostics, database = self.start(directory, roles=(),
+                    managed_process_sampler=fixture.catalog.sample, consumer_topology=selected)
+                with diagnostics:
+                    self.assertTrue(database.sampled.wait(timeout=2))
+                    fixture.finish_generators()
+                report = diagnostics.summary()
+                self.assertEqual(report['collection_complete'], selected == 'notification-dual')
+                self.assertEqual(report['managed_process_resources']['collection_complete'], selected == 'notification-dual')
+
     def start(self, directory, *, resources=None, database=None, roles=(SERVICE,), stopped=(), **kwargs):
         database = database or FakeDatabaseSampler()
         diagnostics = RuntimeDiagnostics(Path(directory)/'runtime.json', scenario='steady',

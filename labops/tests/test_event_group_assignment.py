@@ -52,7 +52,8 @@ class GroupAssignmentObserverTests(SimpleTestCase):
             harness.evidence = Path(directory)
             try:
                 with patch('confluent_kafka.admin.AdminClient', NativeClient):
-                    return harness.group_assignment('notification', client_id=expected, timeout=probe_timeout)
+                    ownership = {'client_ids': expected} if isinstance(expected, tuple) else {'client_id': expected}
+                    return harness.group_assignment('notification', **ownership, timeout=probe_timeout)
             finally:
                 records = (harness.evidence / 'group-assignment-observations.jsonl').read_text().splitlines()
                 self.observations = [json.loads(value) for value in records]
@@ -65,6 +66,37 @@ class GroupAssignmentObserverTests(SimpleTestCase):
         self.assertEqual(result['client_id'], 'acceptance-123')
         self.assertEqual(self.observations[0]['member_count'], 1)
         self.assertEqual(len(self.observations[0]['members'][0]['assignments']), 3)
+
+    def test_dual_exact_owned_clients_cover_one_and_two_partitions(self):
+        description = self.description(partitions=(0,))
+        description.members += self.description(client_id='acceptance-456', partitions=(1, 2)).members
+        result = self.probe(description, expected=('acceptance-123', 'acceptance-456'))
+        self.assertTrue(self.live_during_completion)
+        self.assertEqual(result['member_count'], 2)
+        self.assertEqual(result['client_ids'], ['acceptance-123', 'acceptance-456'])
+        self.assertEqual(sorted(len(row['assignments']) for row in result['members']), [1, 2])
+
+    def test_dual_foreign_duplicate_empty_overlap_missing_or_malformed_is_unready(self):
+        cases = (
+            (('acceptance-123', (0,)), ('acceptance-999', (1, 2))),
+            (('acceptance-123', (0,)), ('acceptance-123', (1, 2))),
+            (('acceptance-123', ()), ('acceptance-456', (0, 1, 2))),
+            (('acceptance-123', (0, 1)), ('acceptance-456', (1, 2))),
+            (('acceptance-123', (0,)), ('acceptance-456', (1,))),
+            (('acceptance-123', (0,)),),
+            (('acceptance-123', (0,)), ('acceptance-456', (1, True))),
+            (('acceptance-123', (0,)), ('acceptance-456', (1, 3))),
+        )
+        for case in cases:
+            description = self.description()
+            description.members = [self.description(client_id=client, partitions=parts).members[0]
+                                   for client, parts in case]
+            with self.subTest(case=case):
+                self.assertFalse(self.probe(description, expected=('acceptance-123', 'acceptance-456')))
+        description = self.description(partitions=(0,))
+        description.members += self.description(client_id='acceptance-456', partitions=(1, 2)).members
+        description.members[1].assignment.topic_partitions[0].topic = 'foreign.topic'
+        self.assertFalse(self.probe(description, expected=('acceptance-123', 'acceptance-456')))
 
     def test_wrong_client_or_unstable_or_partial_assignment_remains_unready(self):
         for description in (self.description(client_id='acceptance-999'),

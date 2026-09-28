@@ -9,6 +9,7 @@ from benchmarks.events.process_resources import (
     GENERATOR_ROLES, PROCESS_ROLES, ProcessResources, own_process_snapshot,
     process_resources_profile, sanitize_process_resources, summarize_process_resources,
 )
+from benchmarks.events.consumer_topology import worker_roles
 
 
 def stat_text(pid, *, start=42, user=20, system=10, rss=8, comm='PRIVATE ) process (name)'):
@@ -18,11 +19,13 @@ def stat_text(pid, *, start=42, user=20, system=10, rss=8, comm='PRIVATE ) proce
 
 
 class ProcessFixture:
-    def __init__(self, *, required_workers=('publisher',), stopped=()):
+    def __init__(self, *, required_workers=('publisher',), stopped=(), consumer_topology='single'):
         self.files, self.reads, self.clock_value = {}, [], 100.0
-        self.pids = {role: 1001 + index for index, role in enumerate(PROCESS_ROLES)}
+        self.consumer_topology = consumer_topology
+        self.pids = {role: 1001 + index for index, role in enumerate(GENERATOR_ROLES + worker_roles(consumer_topology))}
         self.catalog = ProcessResources(required_roles=GENERATOR_ROLES + tuple(required_workers),
-            known_stopped_roles=stopped, read_text=self.read, clock_ticks=100, page_size=4096,
+            known_stopped_roles=stopped, consumer_topology=consumer_topology,
+            read_text=self.read, clock_ticks=100, page_size=4096,
             monotonic=self.clock)
 
     def clock(self):
@@ -70,10 +73,54 @@ class ProcessFixture:
             self.finish(role)
 
     def clean(self):
-        return sanitize_process_resources(self.catalog.sample())
+        return sanitize_process_resources(self.catalog.sample(), consumer_topology=self.consumer_topology)
 
 
 class ProcessResourceTests(unittest.TestCase):
+    def test_dual_second_member_is_required_and_independently_measured(self):
+        fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')
+        fixture.start_all()
+        sample = fixture.clean()
+        fixture.finish_generators()
+        final = fixture.clean()
+        result = summarize_process_resources([sample], final, consumer_topology='notification-dual')
+        self.assertTrue(result['collection_complete'])
+        self.assertIn('notification-1', result['worker_complete_roles'])
+        rows = {row['role']: row for row in sample['processes']}
+        self.assertNotEqual(rows['notification']['pid'], rows['notification-1']['pid'])
+        self.assertNotEqual(rows['notification']['start_time_ticks'], None)
+        final['processes'] = [row for row in final['processes'] if row['role'] != 'notification-1']
+        self.assertFalse(summarize_process_resources([sample], final, consumer_topology='notification-dual')['collection_complete'])
+
+    def test_dual_catalog_cannot_be_relabelled_as_single_or_omit_slot_one(self):
+        fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')
+        value = fixture.catalog.sample()
+        self.assertFalse(sanitize_process_resources(value)['observed'])
+        value['processes'] = [row for row in value['processes'] if row['role'] != 'notification-1']
+        self.assertFalse(sanitize_process_resources(value, consumer_topology='notification-dual')['observed'])
+
+    def test_dual_callback_cannot_downgrade_independently_frozen_required_members(self):
+        fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')
+        expected = fixture.catalog.profile()
+        fixture.start_all()
+        value = fixture.catalog.sample()
+        value['profile']['required_roles'].remove('notification-1')
+        for row in value['processes']:
+            if row['role'] == 'notification-1':
+                row.update(generation=None, stage='planned', applicable=False, pid=None,
+                    start_time_ticks=None, value=None, registration_snapshot=None, ready_snapshot=None)
+        self.assertFalse(sanitize_process_resources(value, consumer_topology='notification-dual',
+            expected_profile=expected)['observed'])
+        self.assertFalse(summarize_process_resources([value], value, consumer_topology='notification-dual',
+            expected_profile=expected)['collection_complete'])
+
+    def test_dual_member_rejects_foreign_role_and_duplicate_live_pid(self):
+        fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')
+        fixture.start('notification')
+        with self.assertRaises(ValueError):
+            fixture.catalog.register('notification-1', fixture.pids['notification'])
+        with self.assertRaises(ValueError):
+            fixture.catalog.register('notification-2', 8888)
     def test_profile_names_all_planned_roles_and_precise_spans_without_wall_cpu_sum(self):
         profile = process_resources_profile(GENERATOR_ROLES + ('publisher',))
         self.assertEqual(profile['planned_roles'], list(PROCESS_ROLES))

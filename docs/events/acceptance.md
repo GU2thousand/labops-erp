@@ -255,6 +255,56 @@ claim therefore requires a separately frozen compatible policy or an explicitly
 audited operator recovery. Production policy and recovery SLA remain deployment
 decisions requiring executed staging evidence.
 
+## Frozen consumer topology
+
+`--consumer-topology` accepts `single` (default) or the explicit
+`notification-dual` preset. `consumer-topology.json` freezes profile version
+`consumer-topology-v1` before environment/setup; the workflow freezes it before
+services. Both presets keep four writers, one publisher, one analytics member
+and the existing three inventory partitions. The dual preset starts
+`notification` and `notification-1` in the same existing notification group.
+Production consumption retains one durable database transaction followed by an
+immediate synchronous offset commit for each record. Function profiling ON with
+the nondefault preset is rejected before setup; runtime diagnostics are a
+separate, predeclared choice.
+
+Readiness requires STABLE membership with exactly the owned
+`acceptance-<PID>` client IDs, nonempty disjoint assignments and the complete
+topic/partition union `0,1,2`. Dual notification assignments therefore have sizes
+one and two; analytics retains all three. After the broker observation, the
+harness rechecks each member's live PID, generation and process start identity
+within the original deadline. Every generation has distinct log, delivery and
+metrics identities. `.started`/`.closed` receipts bind the actual PostgreSQL
+backend and application name to that process. Their startup query warms the owning
+connection for both presets outside generation; this is no cold-start
+measurement. A close receipt covers the owning thread only; after reaping,
+separate settlement checks all sessions in the exact owned application namespace.
+Cleanup retains every started child, exit/signal outcome and secondary error,
+including partial pool startup failures.
+
+Exclusive fault, retry, database and restore drills stop every owned supervised
+or temporary member of the affected group before their targeted child runs.
+Recovery restores the selected pool and exact readiness. The mandatory
+rebalance remains the original temporary **1→3→1** drill, followed by restoration
+to notification two/analytics one for the dual preset; it is not replaced with
+2→3→2. Per-member delivery files are joined by logical consumer, original event
+and broker coordinate, retaining process/log provenance. Worker count does not
+change effect or latency denominators; a delivery log still precedes ACK and
+cannot replace committed-offset evidence.
+
+The dual preset is a new topology candidate, currently unexecuted and without a
+capacity claim. The preceding `single` capacity
+[run 36486112533](https://github.com/GU2thousand/labops-erp/actions/runs/36486112533)
+at `cc4569ac` remains **FAIL**: 3,000 commands took 75.694751744 seconds
+(39.632866624/s), and notification p95 was 8.656019926 seconds. A fresh unprofiled
+dual run must retain the same native four-logical-CPU runner/resource limits,
+global 50/s, 3,000-command maximum 63-second window, p95 ≤5s and p99 ≤15s,
+3,000 durable latency samples per logical consumer with none missing, exact
+6,000 logical consumer/event effects and the fixture's 9,000
+notification rows. All errors, consistency, security, fault and full-tier gates
+remain unchanged. Extra members establish no expected speedup, same-baseline
+code gain, independent-host HA or production release.
+
 ## Frozen business execution profile and known results
 
 Before environment/setup, the CLI freezes an automatic selection policy:
@@ -582,6 +632,12 @@ For each run write a new unique directory and preserve failures as well as passe
 evidence/<run-id>/
   requested-profile.json   # exclusively created numeric request before env/setup
   generation-execution-profile.json # frozen lane/cycle/queue/rate execution model
+  consumer-topology.json   # exclusively frozen preset/member/partition/ACK contract
+  worker-processes.jsonl   # role/generation/PID/start/client/log/delivery/metrics identity
+  consumer-pool-readiness.jsonl # exact owned STABLE assignment and live-process proof
+  group-assignment-observations.jsonl # raw membership, failures and deadline outcomes
+  worker-close-observations.jsonl # owning close receipts, exits and intentional faults
+  worker-session-settlement.jsonl # exact owned PostgreSQL application namespace
   business-lane-topology.json # actual independent aggregates and shared context
   generation-topology-*.json # per-batch actual lane counts, journal batches/results
   generation-schedule-*.jsonl # incremental scheduler/worker observations

@@ -92,6 +92,9 @@ class FaultRecoveryBudgetTests(SimpleTestCase):
 
         harness.stop = stop
         harness.start_consumer = start_consumer
+        harness.stop_consumer_role = stop
+        harness.wait_consumer_pool = lambda role, **kwargs: {'consumer': role, 'exact_owned_assignment': True}
+        harness.ensure_consumer_pool = harness.wait_consumer_pool
         harness.generate = generate
         harness.compose = compose
         harness.drained = drained
@@ -191,3 +194,30 @@ class FaultRecoveryBudgetTests(SimpleTestCase):
             qualification = json.loads((Path(directory) /
                 'one_broker_stop-workload-qualification.json').read_text())
             self.assertTrue(qualification['passed'])
+
+    def test_broker_pool_assignment_exhausts_original_window_before_any_drain(self):
+        with TemporaryDirectory() as directory:
+            harness = self.make_harness(directory, analytics_running=True)
+            def slow_pool(role, **kwargs):
+                self.clock.advance(901)
+                return {'owned_members': True}
+            harness.ensure_consumer_pool = slow_pool
+            with self.fake_runtime(), self.assertRaisesRegex(AssertionError, 'assignment exhausted'):
+                harness.broker_fault(['redpanda-0'], 1, 'one_broker_stop')
+            evidence = self.window(directory, 'one_broker_stop')
+            self.assertEqual(self.drain_budgets, [])
+            self.assertEqual(evidence['observation_elapsed_seconds'], 901)
+            self.assertFalse(evidence['successful_completion_within_budget'])
+
+    def test_analytics_recovery_cannot_hide_missing_continuing_notification_member(self):
+        with TemporaryDirectory() as directory:
+            harness = self.make_harness(directory)
+            def missing_pool(role, **kwargs):
+                self.assertEqual(role, 'notification')
+                raise AssertionError('Selected notification pool is incomplete')
+            harness.ensure_consumer_pool = missing_pool
+            with self.fake_runtime(), self.assertRaisesRegex(AssertionError, 'pool is incomplete'):
+                harness.analytics_outage()
+            evidence = self.window(directory, 'analytics_outage')
+            self.assertEqual(self.drain_budgets, [])
+            self.assertFalse(evidence['successful_completion_within_budget'])

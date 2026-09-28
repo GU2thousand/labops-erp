@@ -26,6 +26,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
+from benchmarks.events.consumer_topology import (
+    PRESETS, DEFAULT_PRESET, topology_profile, freeze_topology, consumer_roles, worker_roles,
+    assignment_result,
+)
+
 
 def write_json(path, value):
     path = Path(path)
@@ -54,14 +59,18 @@ def load_environment(path):
 
 
 def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False,
-                                        diagnostic_profile=False, diagnostic_profile_engine='cprofile'):
+                                        diagnostic_profile=False, diagnostic_profile_engine='cprofile',
+                                        consumer_topology=DEFAULT_PRESET):
     from benchmarks.events.process_generation import frozen_process_profile
     from benchmarks.events.runtime_diagnostics import diagnostics_profile
     from benchmarks.events.diagnostic_profile import request_profile
     request = request_profile(diagnostic_profile, diagnostic_profile_engine)
+    topology = freeze_topology(Path(evidence) / 'consumer-topology.json', run_id,
+                              consumer_topology, diagnostic_profile=diagnostic_profile)
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
         json.dump({'run_id': run_id, **frozen_process_profile(),
+            'consumer_topology': topology,
             'diagnostic_profile': request,
             'qualification_admissible': not diagnostic_profile,
             'selection_policy': {'mode': 'automatic', 'spawn_minimum_batch_count': 512,
@@ -144,6 +153,9 @@ def stable_committed_offsets(configs, topic, *, timeout=30, consumer_factory=Non
 
 class Harness:
     def __init__(self, args, generation=None):
+        self.consumer_topology = getattr(args, 'consumer_topology', DEFAULT_PRESET)
+        self.topology = topology_profile(self.consumer_topology,
+            diagnostic_profile=getattr(args, 'diagnostic_profile', False))
         self.args = args
         self.evidence = args.evidence_dir
         self.evidence.mkdir(parents=True, exist_ok=True)
@@ -158,13 +170,18 @@ class Harness:
             freeze_generation_execution_profile(self.evidence, args.run_id,
                 runtime_diagnostics=getattr(args, 'runtime_diagnostics', False),
                 diagnostic_profile=getattr(args, 'diagnostic_profile', False),
-                diagnostic_profile_engine=getattr(args, 'diagnostic_profile_engine', 'cprofile'))
+                diagnostic_profile_engine=getattr(args, 'diagnostic_profile_engine', 'cprofile'),
+                consumer_topology=self.consumer_topology)
         self.diagnostic_profile_enabled = getattr(args, 'diagnostic_profile', False)
         self.diagnostic_profile_engine = getattr(args, 'diagnostic_profile_engine', 'cprofile')
         self.publisher_profile_paths = []
         self.children = []
         self.child_metrics = {}
         self.child_groups = {}
+        self.child_identities = {}
+        self.rejected_child_generations = {}
+        self.cleanup_errors = []
+        self.worker_closures = {}
         self.workers = {}
         self.shutdowns = []
         self.supervisor_restarts = []
@@ -256,49 +273,116 @@ class Harness:
         raise AssertionError(f'{message}; last_error_type={last}')
 
     def spawn(self, name, argv, role, *, metrics_port=None, extra_env=None):
+        index = len(self.children)
         env = {**self.env, 'KAFKA_SASL_USERNAME': role,
                'KAFKA_SASL_PASSWORD': self.secrets[role],
-               'WORKER_METRICS_PORT': str(metrics_port or (21000 + len(self.children)))}
+               'WORKER_METRICS_PORT': str(metrics_port or (21000 + index))}
         if extra_env:
             env.update(extra_env)
-        log = (self.evidence / 'logs' / f'{name}-{len(self.children)}.log').open('x')
+        consumer = argv[argv.index('--consumer') + 1] if '--consumer' in argv else None
+        receipt = None
+        if consumer in {'notification', 'analytics'} and str(HERE / 'workers.py') in argv:
+            receipt = self.evidence / 'logs' / f'{name}-{index}-identity'
+            application_name = f'lv-{self.args.run_id}-{index}'
+            env.update(LABOPS_VALIDATION_WORKER_IDENTITY=str(receipt),
+                LABOPS_VALIDATION_WORKER_ROLE=name,
+                LABOPS_VALIDATION_WORKER_APPLICATION_NAME=application_name)
+        log_path = self.evidence / 'logs' / f'{name}-{index}.log'
+        log = log_path.open('x')
         self.logs.append(log)
         process = subprocess.Popen([sys.executable, *argv], cwd=ROOT, env=env,
                                    stdout=log, stderr=log)
         self.children.append(process)
+        if process.pid in self.child_identities:
+            # A PID-keyed old receipt must never identify a newly started child.
+            if not hasattr(self, 'rejected_child_generations'):
+                self.rejected_child_generations = {}
+            rejected = {'role': name, 'pid': process.pid, 'generation': index,
+                'identity_receipt': receipt.name if receipt else None,
+                'application_name': env.get('LABOPS_VALIDATION_WORKER_APPLICATION_NAME') if receipt else None,
+                'status': 'historical_pid_reuse_rejected', 'log_file': log_path.name}
+            self.rejected_child_generations[id(process)] = rejected
+            original = AssertionError('A historical owned child PID was reused')
+            try:
+                process.kill()
+                process.wait(timeout=10)
+                assert process.poll() is not None, 'Rejected owned child was not reaped'
+            except BaseException as error:
+                self.record_cleanup_error('rejected_spawn_reap', error, name, process.pid)
+            try:
+                with (self.evidence / 'worker-processes.jsonl').open('a') as output:
+                    output.write(json.dumps(rejected, sort_keys=True) + '\n')
+            except BaseException as error:
+                self.record_cleanup_error('rejected_spawn_evidence', error, name, process.pid)
+            raise original
         self.child_metrics[process.pid] = int(env['WORKER_METRICS_PORT'])
-        consumer = None
-        if '--consumer' in argv:
-            consumer = argv[argv.index('--consumer') + 1]
-        elif 'consume_kafka' in argv:
+        if consumer is None and 'consume_kafka' in argv:
             consumer = argv[argv.index('consume_kafka') + 1]
         self.child_groups[process.pid] = (env['KAFKA_GROUP_PREFIX'] + '.' + consumer + '.v1'
                                         if consumer in {'notification', 'analytics'} else None)
+        from benchmarks.events.process_resources import registered_process_snapshot
+        identity = registered_process_snapshot(process.pid)
+        self.child_identities[process.pid] = {'role': name, 'logical_consumer': consumer,
+            'generation': index, 'pid': process.pid, 'start_time_ticks': identity['start_time_ticks'],
+            'process_identity_status': identity['status'], 'client_id': 'acceptance-' + str(process.pid),
+            'group': self.child_groups[process.pid], 'metrics_port': self.child_metrics[process.pid],
+            'log_file': log_path.name, 'identity_receipt': receipt.name if receipt else None,
+            'application_name': env.get('LABOPS_VALIDATION_WORKER_APPLICATION_NAME') if receipt else None,
+            'fault_stage': argv[argv.index('--stage') + 1] if '--stage' in argv else 'normal',
+            'delivery_file': Path(argv[argv.index('--observations') + 1]).name if '--observations' in argv else None}
+        with (self.evidence / 'worker-processes.jsonl').open('a') as output:
+            output.write(json.dumps(self.child_identities[process.pid], sort_keys=True) + '\n')
         return process
 
-    def stop_consumer_role(self, name):
+    def stop_consumer_role(self, name, *, expected_fault_exit=False):
+        first = None
         for label in list(self.workers):
             if label == name or label.startswith(name + '-'):
-                self.stop(label)
+                try:
+                    self.stop(label, expected_fault_exit=expected_fault_exit)
+                except BaseException as error:
+                    if first is None:
+                        first = error
+                    self.record_cleanup_error('consumer_stop', error, label)
         for child in self.children:
-            if self.child_groups.get(child.pid) != self.consumer_group(name) or child.poll() is not None:
-                continue
-            child.send_signal(signal.SIGTERM)
-            escalated = False
-            began = time.monotonic()
             try:
-                child.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                escalated = True
-                child.kill()
-                child.wait(timeout=10)
-            self.shutdowns.append({'worker': name + '-untracked-instance', 'pid': child.pid,
-                'requested_signal': 'SIGTERM', 'forced_SIGKILL': escalated,
-                'exit_code': child.returncode, 'elapsed_seconds': time.monotonic() - began})
-        assert not any(child.poll() is None and self.child_groups.get(child.pid) == self.consumer_group(name)
-                       for child in self.children), 'An old consumer group instance remains alive'
+                if self.child_groups.get(child.pid) != self.consumer_group(name) or child.poll() is not None:
+                    continue
+                child.send_signal(signal.SIGTERM)
+                escalated = False
+                began = time.monotonic()
+                try:
+                    child.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    escalated = True
+                    child.kill()
+                    child.wait(timeout=10)
+                self.shutdowns.append({'worker': name + '-untracked-instance', 'pid': child.pid,
+                    'requested_signal': 'SIGTERM', 'forced_SIGKILL': escalated,
+                    'exit_code': child.returncode, 'elapsed_seconds': time.monotonic() - began})
+                self.observe_worker_close(child, expected_fault_exit=expected_fault_exit)
+            except BaseException as error:
+                if first is None:
+                    first = error
+                self.record_cleanup_error('consumer_untracked_stop', error, name, child.pid)
+        for child in self.children:
+            try:
+                if self.child_groups.get(child.pid) == self.consumer_group(name) and child.poll() is None:
+                    raise AssertionError('An old consumer group instance remains alive')
+            except BaseException as error:
+                if first is None:
+                    first = error
+                self.record_cleanup_error('consumer_reap_incomplete', error, name, child.pid)
+        if first is not None:
+            raise first
 
-    def group_assignment(self, name, *, client_id=None, timeout=10):
+    def record_cleanup_error(self, stage, error, role=None, pid=None):
+        if not hasattr(self, 'cleanup_errors'):
+            self.cleanup_errors = []
+        self.cleanup_errors.append({'stage': stage, 'error_type': type(error).__name__,
+                                    'role': role, 'pid': pid})
+
+    def group_assignment(self, name, *, client_id=None, client_ids=None, timeout=10):
         from confluent_kafka import ConsumerGroupState
         from confluent_kafka.admin import AdminClient
         group = self.consumer_group(name)
@@ -306,6 +390,7 @@ class Harness:
         request_timeout = min(8, timeout * .8)
         observation = {'observed_at': time.time(), 'group': group,
                        'expected_client_id': client_id, 'request_timeout_seconds': request_timeout,
+                       'expected_client_ids': list(client_ids) if client_ids is not None else [client_id],
                        'future_timeout_seconds': timeout}
         try:
             # The returned future does not retain the native AdminClient. A
@@ -333,28 +418,20 @@ class Harness:
             observation['elapsed_seconds'] = time.monotonic() - began
             with (self.evidence / 'group-assignment-observations.jsonl').open('a') as out:
                 out.write(json.dumps(observation, sort_keys=True) + '\n')
-        if description.state != ConsumerGroupState.STABLE or len(description.members) != 1:
-            return False
-        member = description.members[0]
-        parts = getattr(member.assignment, 'topic_partitions', None) or []
-        expected = {(self.settings.KAFKA_TOPIC, partition) for partition in range(3)}
-        if len(parts) != 3 or {(part.topic, part.partition) for part in parts} != expected:
-            return False
-        if client_id and member.client_id != client_id:
-            return False
-        return {'group': group, 'state': str(description.state), 'member_count': 1,
-                'client_id': member.client_id, 'assignments': [
-                    {'topic': part.topic, 'partition': part.partition}
-                    for part in member.assignment.topic_partitions]}
+        expected_ids = tuple(client_ids) if client_ids is not None else (client_id,)
+        result = assignment_result(description, topic=self.settings.KAFKA_TOPIC,
+            client_ids=expected_ids, stable_state=ConsumerGroupState.STABLE)
+        return {'group': group, **result} if result else False
 
-    def wait_group_assignment(self, name, *, client_id, message, timeout=90):
+    def wait_group_assignment(self, name, *, client_id=None, client_ids=None, message, timeout=90):
         """Share the original assignment deadline with every native request."""
         deadline = time.monotonic() + timeout
         last = None
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             try:
-                result = self.group_assignment(name, client_id=client_id, timeout=min(10, remaining))
+                options = {'client_ids': client_ids} if client_ids is not None else {'client_id': client_id}
+                result = self.group_assignment(name, **options, timeout=min(10, remaining))
             except Exception as exc:
                 last = type(exc).__name__
                 result = False
@@ -370,18 +447,125 @@ class Harness:
             time.sleep(min(.15, max(0, deadline - time.monotonic())))
         raise AssertionError(f'{message}; last_error_type={last}')
 
+    def pool_roles(self, name):
+        return consumer_roles(name, getattr(self, 'consumer_topology', DEFAULT_PRESET))
+
+    def start_consumer_pool(self, name):
+        """Leave every started child owned even if a later slot fails to start."""
+        for label in self.pool_roles(name):
+            if label in self.workers:
+                raise AssertionError('Consumer pool role already started: ' + label)
+            suffix = label[len(name):]
+            if suffix:
+                self.start_consumer(name, suffix)
+            else:
+                self.start_consumer(name)
+
+    def wait_consumer_pool(self, name, *, timeout=90, labels=None):
+        deadline = time.monotonic() + timeout
+        labels = tuple(labels if labels is not None else self.pool_roles(name))
+        processes = [self.workers[label] for label in labels]
+        assert all(process.poll() is None for process in processes), 'Owned consumer exited before readiness'
+        assert len({process.pid for process in processes}) == len(processes), 'Owned consumer PID reused across roles'
+        identities = [copy.deepcopy(self.child_identities[process.pid]) for process in processes]
+        for label, process, identity in zip(labels, processes, identities):
+            def receipt_ready():
+                assert process.poll() is None, 'Owned consumer exited during readiness'
+                path = self.evidence / 'logs' / (identity['identity_receipt'] + '.started')
+                if not path.exists():
+                    return False
+                value = json.loads(path.read_text())
+                snapshot, backend = value.get('process_snapshot', {}), value.get('backend_identity', {})
+                assert (value.get('status') == 'ready' and value.get('pid') == process.pid
+                    and value.get('role') == label and snapshot.get('status') == 'available'
+                    and identity['process_identity_status'] == 'available'
+                    and snapshot.get('pid') == process.pid and snapshot.get('start_time_ticks') == identity['start_time_ticks']
+                    and backend.get('application_name') == identity['application_name']
+                    and backend.get('database_name') == 'labops_events'
+                    and type(backend.get('backend_pid')) is int
+                    and value.get('autocommit') is True and value.get('in_atomic_block') is False), 'Worker identity receipt mismatch'
+                return value
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, 'Consumer readiness exhausted its original budget'
+            identity['startup_receipt'] = self.wait(receipt_ready, 'Worker startup identity missing: ' + label, remaining)
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, 'Consumer startup exhausted assignment budget'
+        result = self.wait_group_assignment(name, client_ids=[identity['client_id'] for identity in identities],
+            message='Owned consumer pool did not obtain exact partitions: ' + name, timeout=remaining)
+        from benchmarks.events.process_resources import registered_process_snapshot
+        for label, process, identity in zip(labels, processes, identities):
+            assert self.workers.get(label) is process and process.pid == identity['pid'], 'Owned consumer generation changed during readiness'
+            assert all(self.child_identities[process.pid].get(key) == identity.get(key)
+                for key in ('role', 'pid', 'generation', 'start_time_ticks', 'client_id')), 'Owned consumer identity changed during readiness'
+            assert process.poll() is None, 'Owned consumer exited during group observation'
+            current = registered_process_snapshot(process.pid)
+            assert (current['status'] == 'available' and current['pid'] == process.pid
+                    and current['start_time_ticks'] == identity['start_time_ticks']), 'Owned consumer start identity changed'
+        assert time.monotonic() < deadline, 'Late consumer readiness cannot pass'
+        result['owned_processes'] = copy.deepcopy(identities)
+        with (self.evidence / 'consumer-pool-readiness.jsonl').open('a') as output:
+            output.write(json.dumps(result, sort_keys=True) + '\n')
+        return result
+
+    def restore_consumer_pool(self, name, *, timeout=90):
+        deadline = time.monotonic() + timeout
+        self.start_consumer_pool(name)
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, 'Consumer pool startup exhausted readiness budget'
+        result = self.wait_consumer_pool(name, timeout=remaining)
+        assert time.monotonic() < deadline, 'Late restored pool cannot pass original readiness deadline'
+        return result
+
+    def wait_consumer_pools(self, *, timeout=120, labels_by_name=None):
+        """Both logical groups share the original stage readiness deadline."""
+        deadline = time.monotonic() + timeout
+        results = {}
+        for name in ('notification', 'analytics'):
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, 'Consumer groups exhausted shared readiness budget'
+            labels = labels_by_name[name] if labels_by_name is not None else None
+            results[name] = self.wait_consumer_pool(name, timeout=remaining, labels=labels)
+            assert time.monotonic() < deadline, 'Late group cannot pass shared readiness deadline'
+        return results
+
+    def restore_consumer_pools(self, *, timeout=120):
+        deadline = time.monotonic() + timeout
+        for name in ('notification', 'analytics'):
+            self.start_consumer_pool(name)
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, 'Consumer groups startup exhausted shared readiness budget'
+        result = self.wait_consumer_pools(timeout=remaining)
+        assert time.monotonic() < deadline, 'Late restored groups cannot pass original readiness deadline'
+        return result
+
+    def ensure_consumer_pool(self, name, *, timeout=90):
+        """Replace only missing/exited declared slots, keeping live owners unchanged."""
+        deadline = time.monotonic() + timeout
+        for label in self.pool_roles(name):
+            process = self.workers.get(label)
+            if process is None or process.poll() is not None:
+                if process is not None:
+                    self.stop(label, expected_fault_exit=True)
+                suffix = label[len(name):]
+                if suffix:
+                    self.start_consumer(name, suffix)
+                else:
+                    self.start_consumer(name)
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, 'Consumer replacement exhausted recovery budget'
+        result = self.wait_consumer_pool(name, timeout=remaining)
+        assert time.monotonic() < deadline, 'Late replacement pool cannot pass original recovery deadline'
+        return result
+
     def supervisor_after_postgres_restart(self, reason):
         before = {name: {'pid': process.pid, 'exit_code_before_restart': process.poll()}
                   for name, process in self.workers.items()}
         self.stop('publisher')
-        self.stop_consumer_role('notification')
-        self.stop_consumer_role('analytics')
+        self.stop_consumer_role('notification', expected_fault_exit=True)
+        self.stop_consumer_role('analytics', expected_fault_exit=True)
+        self.settle_worker_sessions()
         self.start_publisher()
-        self.start_consumer('notification')
-        self.start_consumer('analytics')
-        assignments = {name: self.wait_group_assignment(name,
-            client_id='acceptance-' + str(self.workers[name].pid),
-            message='Supervised consumer did not regain all partitions: ' + name, timeout=90)
+        assignments = {name: self.restore_consumer_pool(name, timeout=90)
             for name in ('notification', 'analytics')}
         evidence = {'reason': reason, 'previous_processes': before,
                     'restarted_processes': {name: {'pid': process.pid} for name, process in self.workers.items()},
@@ -390,7 +574,7 @@ class Harness:
         self.supervisor_restarts.append(evidence)
         return evidence
 
-    def stop(self, name, *, kill=False):
+    def stop(self, name, *, kill=False, expected_fault_exit=False):
         process = self.workers.pop(name, None)
         if process and process.poll() is None:
             started = time.monotonic()
@@ -406,7 +590,105 @@ class Harness:
                 'requested_signal': 'SIGKILL' if kill else 'SIGTERM',
                 'forced_SIGKILL': escalated, 'exit_code': process.returncode,
                 'elapsed_seconds': time.monotonic() - started})
+        if process:
+            self.observe_worker_close(process, expected_fault_exit=expected_fault_exit,
+                                      expected_sigkill=kill)
         self.sync_metrics_targets()
+
+    def observe_worker_close(self, process, *, expected_fault_exit=False, expected_sigkill=False):
+        rejected = getattr(self, 'rejected_child_generations', {}).get(id(process))
+        if rejected is not None:
+            if 'close_outcome' not in rejected:
+                outcome = {'pid': process.pid, 'role': rejected['role'], 'generation': rejected['generation'],
+                    'exit_code': process.poll(), 'closed_receipt_present': False,
+                    'owning_close_receipt_complete': False, 'intentional_SIGKILL': True,
+                    'fault_context': False, 'historical_pid_reuse_rejected': True,
+                    'all_process_sessions_closed': None}
+                rejected['close_outcome'] = outcome
+                with (self.evidence / 'worker-close-observations.jsonl').open('a') as output:
+                    output.write(json.dumps(outcome, sort_keys=True) + '\n')
+            return
+        identity = getattr(self, 'child_identities', {}).get(process.pid)
+        if not identity or not identity.get('identity_receipt'):
+            return
+        if not hasattr(self, 'worker_closures'):
+            self.worker_closures = {}
+        if process.pid in self.worker_closures:
+            return
+        path = self.evidence / 'logs' / (identity['identity_receipt'] + '.closed')
+        value = json.loads(path.read_text()) if path.exists() else None
+        snapshot = (value.get('process_snapshot') or {}) if value else {}
+        complete = bool(value and value.get('status') == 'closed' and value.get('cleanup_complete') is True
+            and value.get('connection_closed') is True and not value.get('errors')
+            and value.get('role') == identity['role'] and value.get('pid') == process.pid
+            and value.get('expected_application_name') == identity['application_name']
+            and snapshot.get('status') == 'available' and snapshot.get('pid') == process.pid
+            and snapshot.get('start_time_ticks') == identity['start_time_ticks'])
+        fault_context = expected_fault_exit or identity.get('fault_stage', 'normal') != 'normal'
+        outcome = {'pid': process.pid, 'role': identity['role'], 'generation': identity['generation'],
+            'exit_code': process.poll(), 'closed_receipt_present': value is not None,
+            'owning_close_receipt_complete': complete, 'intentional_SIGKILL': expected_sigkill,
+            'fault_context': fault_context, 'all_process_sessions_closed': None}
+        self.worker_closures[process.pid] = outcome
+        with (self.evidence / 'worker-close-observations.jsonl').open('a') as output:
+            output.write(json.dumps(outcome, sort_keys=True) + '\n')
+        if not expected_sigkill and not fault_context:
+            assert process.poll() == 0 and complete, 'Graceful owned worker exit or close receipt failed'
+
+    def cleanup_workers(self):
+        """Attempt every exact owned child; a first failure cannot hide slot1."""
+        first = None
+        for name in list(self.workers):
+            try:
+                self.stop(name)
+            except BaseException as error:
+                if first is None:
+                    first = error
+                self.record_cleanup_error('final_worker_stop', error, name)
+        for process in self.children:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+                assert process.poll() is not None, 'Owned child was not reaped'
+                self.observe_worker_close(process)
+            except BaseException as error:
+                if first is None:
+                    first = error
+                self.record_cleanup_error('final_child_reap', error, pid=process.pid)
+        for log in self.logs:
+            try:
+                log.close()
+            except BaseException as error:
+                if first is None:
+                    first = error
+                self.record_cleanup_error('final_log_close', error)
+        return first
+
+    def settle_worker_sessions(self, *, timeout=30):
+        """Observe absence of only exact authored worker namespaces; never kill sessions."""
+        identities = [*getattr(self, 'child_identities', {}).values(),
+                      *getattr(self, 'rejected_child_generations', {}).values()]
+        names = sorted({row['application_name'] for row in identities
+                        if row.get('application_name')})
+        if not names:
+            return True
+        deadline = time.monotonic() + timeout
+        observed = None
+        try:
+            while time.monotonic() < deadline:
+                with self.connection.cursor() as cursor:
+                    cursor.execute('SELECT pid,application_name FROM pg_stat_activity WHERE application_name = ANY(%s)', [names])
+                    observed = [{'backend_pid': pid, 'application_name': name} for pid, name in cursor.fetchall()]
+                if not observed and time.monotonic() < deadline:
+                    return True
+                time.sleep(min(.1, max(0, deadline - time.monotonic())))
+            raise AssertionError('Owned validation worker database sessions remain or arrived late')
+        finally:
+            with (self.evidence / 'worker-session-settlement.jsonl').open('a') as output:
+                output.write(json.dumps({'application_names': names, 'remaining_owned_sessions': observed,
+                    'complete': observed == [] and time.monotonic() < deadline,
+                    'scope': 'exact authored application identities only; no backend termination'}) + '\n')
 
     def sync_metrics_targets(self):
         """Publish only supervised workers, excluding temporary fault children."""
@@ -414,15 +696,18 @@ class Harness:
         if not path.parent.is_dir():
             return
         targets = [{'targets': [f'127.0.0.1:{self.child_metrics[process.pid]}'],
-                    'labels': {'worker': name}}
+                    'labels': {'worker': 'notification' if name in self.pool_roles('notification') else name,
+                               'owned_role': name, 'owned_pid': str(process.pid)}}
                    for name, process in sorted(self.workers.items()) if process.poll() is None]
         write_json(path, targets)
         path.chmod(0o644)
 
     def start_consumer(self, name, suffix=''):
         label = name + suffix
+        assert label not in self.workers, 'Consumer role already supervised'
+        generation = len(self.children)
         process = self.spawn(label, [str(HERE / 'workers.py'), 'consumer', '--consumer', name,
-                             '--observations', str(self.evidence / 'logs' / f'{label}-deliveries.jsonl')], name)
+                             '--observations', str(self.evidence / 'logs' / f'{label}-{generation}-deliveries.jsonl')], name)
         self.workers[label] = process
         self.sync_metrics_targets()
         return process
@@ -435,7 +720,7 @@ class Harness:
             argv = [str(HERE / 'profile_publisher.py'), '--output', str(path),
                     '--profile-engine', getattr(self, 'diagnostic_profile_engine', 'cprofile')]
         self.workers['publisher'] = self.spawn('publisher-' + str(len(self.children)),
-            argv, 'publisher', metrics_port=21000)
+            argv, 'publisher')
         self.sync_metrics_targets()
 
     def setup(self):
@@ -588,9 +873,11 @@ class Harness:
             if self.use_process_generation(count):
                 self._active_process_catalog = self.create_process_catalog(label)
                 process_options['managed_process_sampler'] = self._active_process_catalog.sample
+                process_options['expected_process_profile'] = self._active_process_catalog.profile()
                 write_json(self.evidence / f'process-resource-profile-{number:03d}.json',
                            self._active_process_catalog.profile())
             observer = RuntimeDiagnostics(path, scenario=label,
+                consumer_topology=getattr(self, 'consumer_topology', DEFAULT_PRESET),
                 resource_sampler=resources.snapshot,
                 known_stopped_roles=stopped_roles,
                 expected_resource_roles=tuple(role for role in DEFAULT_SERVICES if role not in stopped_roles),
@@ -820,11 +1107,15 @@ class Harness:
             'elapsed_boundary': 'before lane batch setup through all worker commits/observations and joined connection cleanup'}
 
     def create_process_catalog(self, label):
-        from benchmarks.events.process_resources import ProcessResources, GENERATOR_ROLES, WORKER_ROLES
-        required = tuple(name for name in self.workers if name in WORKER_ROLES)
+        from benchmarks.events.process_resources import ProcessResources, GENERATOR_ROLES
+        preset = getattr(self, 'consumer_topology', DEFAULT_PRESET)
         stopped = ('analytics',) if label == 'analytics_outage' else ()
+        expected = ('publisher', *self.pool_roles('notification'), *self.pool_roles('analytics'))
+        required = tuple(name for name in expected if name not in stopped)
+        required += tuple(name for name in ('retry', 'dlq') if name in self.workers)
+        assert all(name in self.workers for name in required), 'Frozen worker pool member is missing'
         catalog = ProcessResources(required_roles=GENERATOR_ROLES + required,
-                                   known_stopped_roles=stopped)
+                                   known_stopped_roles=stopped, consumer_topology=preset)
         for name in required:
             process = self.workers[name]
             if process.poll() is not None:
@@ -1484,12 +1775,13 @@ class Harness:
                     child.send_signal(signal.SIGTERM)
                     child.wait(timeout=30)
                     assert self.models.ProcessedEvent.objects.filter(consumer_name=name, event_id=eid).count() == 1
-                    self.start_consumer(name)
+                    restoration = self.restore_consumer_pool(name)
                     self.drained(ids)
                     self.cases.append({'name': 'consumer_sigkill', 'consumer': name, 'stage': stage,
                         'repetition': repetition, 'event_id': eid, 'source_replayed': paused['delivery_key'],
                         'offset_before_kill': before_offset, 'offset_after_recovery': int(offset) + 1,
                         'effects_visible_before_kill': effect_count, 'effects_after_recovery': 1, 'passed': True})
+                    self.cases[-1]['preset_restoration'] = restoration
 
     def publisher_crashes(self):
         self.stop('publisher')
@@ -1648,6 +1940,10 @@ class Harness:
                 self.start_publisher()
             remaining = self.args.drain_timeout - (time.monotonic() - recovery)
             assert remaining > 0, 'Broker health recovery exhausted the frozen drain window'
+            for name in ('notification', 'analytics'):
+                self.ensure_consumer_pool(name, timeout=remaining)
+                remaining = self.args.drain_timeout - (time.monotonic() - recovery)
+                assert remaining > 0, 'Broker consumer assignment exhausted the frozen drain window'
             self.drained(ids, timeout=remaining)
             from benchmarks.events.health import completed_recovery_seconds
             completed_seconds = completed_recovery_seconds(recovery, self.args.drain_timeout)
@@ -1766,7 +2062,7 @@ class Harness:
             session.close()
 
     def analytics_outage(self):
-        self.stop('analytics')
+        self.stop_consumer_role('analytics')
         started = time.monotonic()
         ids, workload = self.generate(self.args.fault_events, 'analytics_outage')
         self.wait(lambda: self.models.ProcessedEvent.objects.filter(consumer_name='notification',
@@ -1786,9 +2082,15 @@ class Harness:
         recovered = time.monotonic()
         completed_seconds = None
         try:
-            self.start_consumer('analytics')
+            self.start_consumer_pool('analytics')
             remaining = self.args.drain_timeout - (time.monotonic() - recovered)
             assert remaining > 0, 'Analytics process startup exhausted the frozen recovery window'
+            self.wait_consumer_pool('analytics', timeout=remaining)
+            remaining = self.args.drain_timeout - (time.monotonic() - recovered)
+            assert remaining > 0, 'Analytics assignment exhausted the frozen recovery window'
+            self.ensure_consumer_pool('notification', timeout=remaining)
+            remaining = self.args.drain_timeout - (time.monotonic() - recovered)
+            assert remaining > 0, 'Notification assignment exhausted the frozen recovery window'
             self.drained(ids, timeout=remaining)
             from benchmarks.events.health import completed_recovery_seconds
             completed_seconds = completed_recovery_seconds(recovered, self.args.drain_timeout)
@@ -1811,8 +2113,8 @@ class Harness:
 
     def postgres_failure(self):
         self.stop('publisher')
-        self.stop('notification')
-        self.stop('analytics')
+        self.stop_consumer_role('notification')
+        self.stop_consumer_role('analytics')
         before = self.snapshot()
         movement_count = self.models.StockMovement.objects.count()
         marker = self.marker('postgres-business')
@@ -1990,7 +2292,7 @@ class Harness:
     def retry_drill(self):
         from django.utils import timezone
         for name in ('notification', 'analytics'):
-            self.stop(name)
+            self.stop_consumer_role(name)
             ids, _ = self.generate(1, 'transient_retry_' + name)
             eid = ids[0]
             label = 'transient-' + name
@@ -2007,7 +2309,7 @@ class Harness:
             original_due = row.next_attempt_at
             fixture_due = timezone.now()
             self.models.FailedDelivery.objects.filter(id=row.id).update(next_attempt_at=fixture_due)
-            self.start_consumer(name)
+            restoration = self.restore_consumer_pool(name)
             healthy, _ = self.generate(4, 'healthy_while_retry_' + name)
             self.drained(healthy)
             retry = self.spawn('retry-independent-' + name, ['manage.py', 'retry_events', '--limit', '100'], 'replay')
@@ -2023,49 +2325,43 @@ class Harness:
                 'original_next_attempt_at': original_due, 'fixture_next_attempt_at': fixture_due,
                 'natural_retry_wait_verified': False,
                 'audit_actions': list(audit), 'resolved_same_event_id': True, 'passed': True})
+            self.cases[-1]['preset_restoration'] = restoration
 
     def rebalance(self):
-        from confluent_kafka import ConsumerGroupState
-        from confluent_kafka.admin import AdminClient
-        admin = AdminClient(self.configs['admin'])
-
-        def membership(expected):
-            result = {}
-            for name in ('notification', 'analytics'):
-                group = self.consumer_group(name)
-                description = admin.describe_consumer_groups([group])[group].result(timeout=10)
-                assignments = [[{'topic': part.topic, 'partition': part.partition}
-                                for part in member.assignment.topic_partitions] for member in description.members]
-                coordinates = [(part['topic'], part['partition']) for member in assignments for part in member]
-                if (description.state != ConsumerGroupState.STABLE or len(description.members) != expected or
-                        len(coordinates) != 3 or set(coordinates) !=
-                        {(self.settings.KAFKA_TOPIC, partition) for partition in range(3)}):
-                    return False
-                result[name] = {'group': group, 'state': str(description.state),
-                                'member_count': len(description.members), 'assignments': assignments}
-            return result
         for repetition in range(self.args.fault_repetitions):
-            before = self.wait(lambda: membership(1), 'Groups did not stabilise at one member', timeout=120)
+            for name in ('notification', 'analytics'):
+                self.stop_consumer_role(name)
+                self.start_consumer(name)
+            before = self.wait_consumer_pools(timeout=120,
+                labels_by_name={name: [name] for name in ('notification', 'analytics')})
             extras = []
             for name in ('notification', 'analytics'):
                 for n in (2, 3):
                     label = name + f'-scale-{n}-{repetition}'
                     self.start_consumer(name, label[len(name):])
                     extras.append(label)
-            scaled = self.wait(lambda: membership(3), 'Groups did not actually assign three members', timeout=120)
+            scaled = self.wait_consumer_pools(timeout=120, labels_by_name={name:
+                [name] + [label for label in extras if label.startswith(name + '-')]
+                for name in ('notification', 'analytics')})
             ids, _ = self.generate(8, 'rebalance_1_3_1')
             for n, label in enumerate(extras):
                 self.stop(label, kill=bool(n % 2))
-            restored = self.wait(lambda: membership(1), 'Groups did not recover one member', timeout=120)
+            restored = self.wait_consumer_pools(timeout=120,
+                labels_by_name={name: [name] for name in ('notification', 'analytics')})
             self.drained(ids)
+            shutdowns = self.shutdowns[-4:]
+            for name in ('notification', 'analytics'):
+                self.stop_consumer_role(name)
+            selected = self.restore_consumer_pools(timeout=120)
             self.cases.append({'name': 'rebalance_1_3_1', 'repetition': repetition,
                 'input': len(ids), 'membership_before': before, 'membership_scaled': scaled,
-                'membership_after': restored, 'shutdowns': self.shutdowns[-4:], 'passed': True})
+                'membership_after': restored, 'shutdowns': shutdowns,
+                'selected_preset_restoration': selected, 'passed': True})
 
     def restore(self):
         self.stop('publisher')
-        self.stop('notification')
-        self.stop('analytics')
+        self.stop_consumer_role('notification')
+        self.stop_consumer_role('analytics')
         baseline = self.snapshot([item['event_id'] for item in self.events])
         watermark = {'created_events': len(self.events), 'last_event_id': self.events[-1]['event_id'],
                      'snapshot_at': time.time(), 'offsets': self.offsets()}
@@ -2145,8 +2441,8 @@ class Harness:
             'limits': ['Snapshot restore at frozen watermark only; PITR and older-snapshot loss not measured',
                        'Broker retention exhaustion and same-name topic replacement not executed']})
         self.start_publisher()
-        self.start_consumer('notification')
-        self.start_consumer('analytics')
+        self.cases[-1]['preset_restoration'] = {name: self.restore_consumer_pool(name)
+            for name in ('notification', 'analytics')}
 
     def latencies(self):
         ids = [item['event_id'] for item in self.events if item['scenario'] == 'steady']
@@ -2220,18 +2516,19 @@ class Harness:
         self.sync_metrics_targets()
         token = self.env.get('WORKER_METRICS_TOKEN', self.env.get('METRICS_TOKEN', ''))
         cases = []
-        for name in ('publisher', 'notification', 'analytics', 'retry', 'dlq'):
+        for name in worker_roles(getattr(self, 'consumer_topology', DEFAULT_PRESET)):
             process = self.workers[name]
+            logical_name = 'notification' if name in self.pool_roles('notification') else name
             port = self.child_metrics[process.pid]
             endpoint = f'http://127.0.0.1:{port}/metrics'
 
             def scrape():
                 request = urllib.request.Request(endpoint, headers={'Authorization': 'Bearer ' + token})
                 payload = urllib.request.urlopen(request, timeout=5).read().decode()
-                assert f'worker="{name}"' in payload and 'labops_worker_database_available 1.0' in payload
+                assert f'worker="{logical_name}"' in payload and 'labops_worker_database_available 1.0' in payload
                 assert 'labops_worker_outbox_events' in payload and 'labops_worker_failed_deliveries' in payload
                 heartbeat = re.search(r'^labops_worker_heartbeat_timestamp_seconds\{worker="' +
-                                      re.escape(name) + r'"\} (\S+)$', payload, re.MULTILINE)
+                                      re.escape(logical_name) + r'"\} (\S+)$', payload, re.MULTILINE)
                 assert heartbeat, 'Actual worker heartbeat metric missing'
                 timestamp = float(heartbeat.group(1))
                 assert math.isfinite(timestamp) and -2 <= time.time() - timestamp <= 30, 'Worker heartbeat is stale'
@@ -2239,12 +2536,12 @@ class Harness:
             payload = self.wait(scrape, 'Worker authenticated metrics missing: ' + name, timeout=30)
             observed_before = time.time()
             before_timestamp = float(re.search(r'^labops_worker_heartbeat_timestamp_seconds\{worker="' +
-                re.escape(name) + r'"\} (\S+)$', payload, re.MULTILINE).group(1))
+                re.escape(logical_name) + r'"\} (\S+)$', payload, re.MULTILINE).group(1))
 
             def advancing():
                 candidate = scrape()
                 timestamp = float(re.search(r'^labops_worker_heartbeat_timestamp_seconds\{worker="' +
-                    re.escape(name) + r'"\} (\S+)$', candidate, re.MULTILINE).group(1))
+                    re.escape(logical_name) + r'"\} (\S+)$', candidate, re.MULTILINE).group(1))
                 return (candidate, timestamp) if timestamp > before_timestamp else False
             after_payload, after_timestamp = self.wait(advancing, 'Worker heartbeat did not advance: ' + name, timeout=15)
             observed_after = time.time()
@@ -2256,7 +2553,8 @@ class Harness:
             assert denied, 'Unauthenticated worker metrics exposed'
             (self.evidence / 'metrics' / f'{name}-accepted.prom').write_text(payload)
             (self.evidence / 'metrics' / f'{name}-heartbeat-advanced.prom').write_text(after_payload)
-            cases.append({'worker': name, 'pid': process.pid, 'port': port,
+            cases.append({'worker': name, 'logical_worker': logical_name, 'pid': process.pid, 'port': port,
+                'process_identity': copy.deepcopy(self.child_identities[process.pid]),
                 'heartbeat_observed': True, 'heartbeat_before': before_timestamp,
                 'heartbeat_after': after_timestamp, 'heartbeat_advanced': after_timestamp > before_timestamp,
                 'first_scrape_observed_at': observed_before, 'second_scrape_observed_at': observed_after,
@@ -2349,19 +2647,7 @@ class Harness:
     def run(self):
         self.setup()
         self.start_publisher()
-        self.start_consumer('notification')
-        self.start_consumer('analytics')
-        from confluent_kafka.admin import AdminClient
-        admin = AdminClient(self.configs['admin'])
-
-        def ready():
-            for name in ('notification', 'analytics'):
-                group = self.consumer_group(name)
-                description = admin.describe_consumer_groups([group])[group].result(timeout=10)
-                if len(description.members) != 1 or len(description.members[0].assignment.topic_partitions) != 3:
-                    return False
-            return True
-        self.wait(ready, 'Steady workload consumers never received partitions', timeout=120)
+        self.restore_consumer_pools(timeout=120)
         steady_started = time.monotonic()
         ids, workload = self.generate(self.args.events, 'steady')
         while time.monotonic() - steady_started < self.args.duration:
@@ -2477,14 +2763,16 @@ class Harness:
         return result
 
     def finish(self, error=None):
-        for name in list(self.workers):
-            self.stop(name)
-        for process in self.children:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=10)
-        for log in self.logs:
-            log.close()
+        cleanup_error = self.cleanup_workers()
+        try:
+            self.settle_worker_sessions()
+        except BaseException as secondary:
+            if cleanup_error is None:
+                cleanup_error = secondary
+            self.record_cleanup_error('final_worker_sessions', secondary)
+        original_error = error
+        if error is None:
+            error = cleanup_error
         generation = self.generation.finalize()
         final_state = self.final_inventory_evidence()
         passing_cases = {case.get('name') for case in self.cases if case.get('passed')}
@@ -2534,12 +2822,18 @@ class Harness:
             and not final_state['journal_committed_movements_missing_from_database']
             and not final_state['database_committed_movements_missing_from_journal']
             and not final_state['journal_identified_events_missing_from_database'])
+        owned_cleanup_complete = not getattr(self, 'cleanup_errors', [])
+        final_complete = final_complete and owned_cleanup_complete
         fault_targets_passed = all(any(case.get('name') == name and case.get('passed') and
             case.get('workload_qualification', {}).get('capacity_qualified') for case in self.cases)
             for name in ('analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'))
         report = {'passed': qualification_admissible and error is None and all(case.get('passed') for case in self.cases) and final_complete,
             'qualification_admissible': qualification_admissible,
             'diagnostic_profile': profile_evidence,
+            'consumer_topology': getattr(self, 'topology', topology_profile()),
+            'owned_worker_cleanup_complete': owned_cleanup_complete,
+            'owned_worker_cleanup_errors': getattr(self, 'cleanup_errors', []),
+            'owned_worker_close_observations': list(getattr(self, 'worker_closures', {}).values()),
             'run_id': self.args.run_id, 'unique_generated_events': len(self.events),
             'acceptance_tier': self.args.tier, 'production_ready': False,
             'full_workload_requested': self.args.tier == 'full',
@@ -2588,6 +2882,8 @@ class Harness:
         (self.evidence / 'summary.md').write_text('\n'.join(lines) + '\n')
         print(json.dumps({'passed': report['passed'], 'evidence_dir': str(self.evidence),
                           'cases_completed': len(self.cases), 'error_type': report['error_type']}), flush=True)
+        if original_error is None and cleanup_error is not None:
+            raise cleanup_error
         return report
 
     def diagnostic_profile_evidence(self):
@@ -2645,6 +2941,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-id', required=True)
     p.add_argument('--tier', choices=['smoke', 'full'], default='smoke')
+    p.add_argument('--consumer-topology', choices=PRESETS, default=DEFAULT_PRESET,
+                   help='Explicit frozen consumer preset; nondefault requires function profiling OFF')
     p.add_argument('--runtime-diagnostics', action='store_true',
                    help='Opt in to timed CPU/SQL/PostgreSQL/container diagnostics; disabled by default')
     p.add_argument('--diagnostic-profile', action='store_true',
@@ -2668,6 +2966,7 @@ def main():
     args = p.parse_args()
     try:
         request_profile(args.diagnostic_profile, args.diagnostic_profile_engine)
+        topology_profile(args.consumer_topology, diagnostic_profile=args.diagnostic_profile)
     except ValueError as error:
         p.error(str(error))
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', args.run_id):
@@ -2705,7 +3004,8 @@ def main():
     try:
         freeze_generation_execution_profile(args.evidence_dir, args.run_id,
             runtime_diagnostics=args.runtime_diagnostics, diagnostic_profile=args.diagnostic_profile,
-            diagnostic_profile_engine=args.diagnostic_profile_engine)
+            diagnostic_profile_engine=args.diagnostic_profile_engine,
+            consumer_topology=args.consumer_topology)
         load_environment(args.generated_dir / 'client.env')
         for key in list(os.environ):
             if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':
