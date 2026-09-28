@@ -1,6 +1,6 @@
 # Acceptance status and evidence gates
 
-Status on 2026-09-27: implementation and acceptance tooling are being delivered;
+Status on 2026-09-28: implementation and acceptance tooling are being delivered;
 the full upgrade plan's Phase 0-6 acceptance is **pending executed evidence**.
 Production endpoints, cloud authorization, budget, real load and independent
 failure-domain deployment have not been supplied. No staging HA or production
@@ -101,6 +101,77 @@ claim therefore requires a separately frozen compatible policy or an explicitly
 audited operator recovery. Production policy and recovery SLA remain deployment
 decisions requiring executed staging evidence.
 
+## Frozen business execution profile and known results
+
+Capacity scenarios use the separately declared `parallel-lanes-v1` execution
+profile: four FIFO worker lanes, each with queue capacity four. Assign an entire
+four-command cycle to lane `(global_index//4)%4`; command kind follows
+`global_index%4` as receipt, issue, transfer, reversal. Each complete cycle retains
+that exact mix and its own batch/issue state. Global indices and lane state persist
+across batches. Small fault fixtures explicitly use serial execution with the
+same global-index/lane mapping, identified as `serial_fault_fixture` in their
+workload result. A small drill may split a cycle across calls; its persistent lane
+state completes the original cycle rather than resetting the command mix.
+
+Each lane uses independent project, task, approved material request, purchase
+order and order-line records created through the ordinary application services.
+Each cycle creates its own inventory batch. The application retains its normal
+transactions and business locks; concurrency does not bypass them or substitute
+synthetic event inserts. The actor, item and source/target warehouse context are
+shared read-only; business aggregates and per-cycle batch balances belong to
+their lane. `business-lane-topology.json` records the actual project/task/order/
+order-line IDs, shared context and lock scope.
+
+One scheduler applies the requested **global** rate. At 50/s, 12.5/s per lane is a
+nominal average, not four independent 50/s schedulers or a 200/s workload. Bounded
+queues apply backpressure; each queue's four slots exclude its in-flight command.
+For each capacity batch, elapsed time starts before
+per-lane journal-batch setup and ends only after actual business commits,
+observations, connection cleanup, worker completion and joins, and journal
+finalization. Initial project/task/request/order fixture setup precedes that
+capacity clock and is excluded. Report completed commands divided by that elapsed time and
+the corresponding schedule lateness. Enqueuing 50 commands/s alone cannot pass
+the frozen generation-rate gate.
+
+The shared incremental journal uses an `RLock`; each lane receives its own batch
+under the original scenario label. Retain requested/attempted/committed/
+identified/unattempted counts, per-lane outcomes and scheduled/started/completed/
+cancelled/unscheduled indices. A first failure stops scheduling and new command
+starts; already-started commands finish before cleanup. Every lane closes its
+own database connection and signals explicit completion, and every worker is
+joined before the original failure or interruption is rethrown. A passing final
+report requires every recorded generation topology to have `passed=true`, as
+well as all mandatory scenarios and journal/database/effect gates. A partial topology or cleanup failure
+cannot be hidden by a successful queue schedule or completed subset.
+
+Freeze `generation-execution-profile.json` exclusively and fsync it before
+environment loading or harness setup, alongside the numeric requested profile.
+Retain actual `business-lane-topology.json`, per-batch
+`generation-topology-*.json` and incremental `generation-schedule-*.jsonl`.
+The per-batch topology/schedule files cover concurrent capacity batches; small
+serial drills identify their execution mode in the workload result. The actual
+artifacts distinguish the declared profile from the topology and
+business work that really ran. A change from serial to concurrent execution
+requires a new identified run; it does not change an earlier run's outcome.
+
+The hosted serial probe [Actions run 36375853169](https://github.com/GU2thousand/labops-erp/actions/runs/36375853169),
+at commit `dee603f649a097ebfcf78b3f6ad83fda937df654`, requested 3,000 commands at
+50/s. It completed all 3,000 in **155.793580068s**, an actual **19.25624919/s**,
+with **95.793580068s** of schedule lateness: the frozen 50/s rate gate **failed**.
+The same run reconciled all 3,000 inventory events and both consumers' effects,
+with no ledger/balance/projection mismatch; analytics p99 was 1.02153s and
+notification p99 1.03008s. Those correctness/latency results remain valid for that
+measured workload, but do not pass the throughput gate or unexecuted fault matrix.
+Retained `report.json` SHA-256 is
+`74e375ba7b5453c69aecc3c6c93c6b21fdf9c1ba9b3a910b25562c09f3083375`;
+the failing report remains unchanged.
+
+The new four-lane profile has no claimed hosted/full 50/s pass in this document.
+A local SQL profile of 200 application-service commands is implementation
+profiling, not an RF3 workload or hosted/production acceptance result. Full RF3,
+independent-domain staging and production acceptance remain pending executed
+evidence at their frozen denominators and clock boundaries.
+
 ## Required scenarios and frozen targets
 
 Use [capacity](capacity.md) for latency/retention/RPO assumptions. Preserve all
@@ -171,6 +242,10 @@ For each run write a new unique directory and preserve failures as well as passe
 ```text
 evidence/<run-id>/
   requested-profile.json   # exclusively created numeric request before env/setup
+  generation-execution-profile.json # frozen lane/cycle/queue/rate execution model
+  business-lane-topology.json # actual independent aggregates and shared context
+  generation-topology-*.json # per-batch actual lane counts, journal batches/results
+  generation-schedule-*.jsonl # incremental scheduler/worker observations
   generation-journal.jsonl # incrementally flushed attempts/commit/ID transitions
   generation-summary.json # requested/attempted/committed/failure/pending totals
   startup-failure.json     # conditional env/setup failure and unobserved DB state
@@ -208,6 +283,11 @@ validation but **before** loading the generated environment or constructing the
 harness. A startup failure therefore retains its original request and marks the
 database as unobserved. Never derive requested counts from `events.jsonl`, completed
 effects or whichever scenarios happened to run.
+
+The execution profile is likewise frozen before environment/setup. Actual lane
+and per-batch topology evidence must match that profile; generation completion
+and the final report include all topology pass/failure outcomes. The package
+retains a failed or partial schedule, not just successful event-log entries.
 
 For each generation batch, record requested and attempted counts before the
 outer business transaction; record committed movement identity immediately after

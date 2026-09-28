@@ -1,7 +1,9 @@
 """Requested denominators and durable accounting across generation failures."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -196,3 +198,62 @@ class GenerationJournalTests(SimpleTestCase):
         journal.finish_success(batch)
         self.assertEqual(journal.batch_summary(batch)['requested'], 1)
         self.assertNotIn('private value', journal.journal_path.read_text())
+
+    def test_four_concurrent_lanes_preserve_all_counts_ids_and_raw_transition_order(self):
+        journal = self.journal()
+        commit_barrier = Barrier(4, timeout=10)
+
+        def lane(index):
+            batch = journal.begin_batch(100, 12.5, 'steady_lane_' + str(index))
+            identities = []
+            for command in range(100):
+                attempt = journal.attempt(batch)
+                movement_id, event_id = str(uuid4()), str(uuid4())
+                # All lanes reach a pending transaction before racing to write
+                # their commit transition through the shared journal writer.
+                commit_barrier.wait()
+                journal.commit(batch, attempt, movement_id=movement_id)
+                journal.identify_event(batch, attempt, event_id)
+                identities.append((batch, attempt, movement_id, event_id))
+                if command % 25 == 0:
+                    snapshot = journal.summary()
+                    snapshot['totals']['committed'] = -1
+                    snapshot['requested_numeric_profile']['events'] = -1
+                    snapshot['batches'][0]['requested'] = -1
+            journal.finish_success(batch)
+            return identities
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            groups = list(executor.map(lane, range(4)))
+        identities = [identity for group in groups for identity in group]
+        final = journal.finalize()
+        self.assertEqual({key: final['totals'][key] for key in
+            ('requested', 'attempted', 'committed', 'identified_events',
+             'failed_before_commit', 'post_commit_observation_failed', 'unattempted')},
+            {'requested': 400, 'attempted': 400, 'committed': 400, 'identified_events': 400,
+             'failed_before_commit': 0, 'post_commit_observation_failed': 0, 'unattempted': 0})
+        self.assertEqual(len({identity[0] for identity in identities}), 4)
+        self.assertEqual(len({identity[2] for identity in identities}), 400)
+        self.assertEqual(len({identity[3] for identity in identities}), 400)
+        self.assertEqual(final['requested_numeric_profile']['events'], 90000)
+        self.assertTrue(all(batch['requested'] == 100 and batch['status'] == 'succeeded'
+                            for batch in final['batches']))
+        raw = [json.loads(line) for line in journal.journal_path.read_text().splitlines()]
+        self.assertEqual(len(raw), 1210)  # frozen profile + 4 batches + 3*400 + 4 finishes + final
+        self.assertEqual([item['sequence'] for item in raw], list(range(1, 1211)))
+        commands = {}
+        for item in raw:
+            if 'attempt_id' in item:
+                commands.setdefault((item['batch_id'], item['attempt_id']), []).append(item)
+        self.assertEqual(len(commands), 400)
+        for batch, attempt, movement_id, event_id in identities:
+            records = commands[(batch, attempt)]
+            self.assertEqual([item['action'] for item in records],
+                             ['command_attempted', 'command_committed', 'event_identified'])
+            self.assertEqual(records[1]['movement_id'], movement_id)
+            self.assertEqual(records[2]['event_id'], event_id)
+        committed = journal.committed_attempts()
+        self.assertEqual(len(committed), 400)
+        committed[0]['event_id'] = 'mutated-copy'
+        self.assertNotEqual(journal.committed_attempts()[0]['event_id'], 'mutated-copy')
+        self.assertEqual(json.loads(journal.summary_path.read_text()), final)

@@ -15,6 +15,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlparse, urlunparse
 import uuid
@@ -49,6 +50,18 @@ def load_environment(path):
             raise ValueError('Invalid client.env assignment')
         parsed = shlex.split(raw, comments=True)
         os.environ[key] = parsed[0] if len(parsed) == 1 else raw
+
+
+def freeze_generation_execution_profile(evidence, run_id):
+    from benchmarks.events.concurrent_generation import frozen_generation_profile
+    path = Path(evidence) / 'generation-execution-profile.json'
+    with path.open('x') as out:
+        json.dump({'run_id': run_id, **frozen_generation_profile(),
+            'capacity_scenarios': ['steady', 'analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'],
+            'small_fault_drills': 'serial execution using the same global cycle/lane mapping; topology reported per batch'}, out, sort_keys=True)
+        out.write('\n')
+        out.flush()
+        os.fsync(out.fileno())
 
 
 def stable_committed_offsets(configs, topic, *, timeout=30, consumer_factory=None,
@@ -123,6 +136,8 @@ class Harness:
         (self.evidence / 'errors.jsonl').touch(exist_ok=False)
         from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
         self.generation = generation or GenerationJournal(self.evidence, args.run_id, numeric_profile(args))
+        if generation is None:
+            freeze_generation_execution_profile(self.evidence, args.run_id)
         self.children = []
         self.child_metrics = {}
         self.child_groups = {}
@@ -130,6 +145,9 @@ class Harness:
         self.shutdowns = []
         self.supervisor_restarts = []
         self.events = []
+        self._event_lock = threading.Lock()
+        self._next_command_index = 0
+        self.generation_topologies = []
         self.cases = []
         self.delivery_proofs = []
         self.logs = []
@@ -405,6 +423,7 @@ class Harness:
         write_json(self.evidence / 'harness-manifest.json', {
             'run_id': self.args.run_id, 'commit': self.command(['git', 'rev-parse', 'HEAD']).strip(),
             'acceptance_tier': self.args.tier, 'generation_window_tolerance_fraction': .05,
+            'generation_execution_profile': json.loads((self.evidence / 'generation-execution-profile.json').read_text()),
             'worktree_dirty': bool(self.command(['git', 'status', '--porcelain']).strip()),
             'python': sys.version, 'host': platform.platform(), 'cpu_count': os.cpu_count(),
             'security_protocol': 'SASL_SSL', 'compose_project': self.env['LABOPS_VALIDATION_PROJECT'],
@@ -424,25 +443,57 @@ class Harness:
     def prepare_order(self):
         from django.utils import timezone
         from labops.purchasing import services
+        from labops.projects import services as projects
         maximum = self.args.events + self.args.fault_events * 4 + self.args.fault_repetitions * 20 + 1000
         quantity = maximum * 4
-        rid = self.args.run_id[:40] + '-setup'
-        request = services.write_request(self.admin, {'reason': 'Synthetic isolated event acceptance',
-            'lines': [{'item_id': str(self.batch.item_id), 'qty': quantity,
-                       'needed_by': str(timezone.localdate() + timedelta(days=1))}]}, rid)
-        request = services.request_action(self.admin, request.id, 'submit',
-            {'expected_version': request.version}, rid)
-        request = services.request_action(self.reviewer, request.id, 'decision',
-            {'expected_version': request.version, 'decision': 'APPROVE', 'reason': 'Isolated acceptance'}, rid)
-        order = services.write_order(self.admin, {'supplier_id': str(self.models.Supplier.objects.first().id),
-            'lines': [{'request_line_id': str(request.lines.first().id), 'qty': quantity, 'unit_price': '1'}]}, rid)
-        self.order = services.order_action(self.admin, order.id, 'confirm',
-            {'expected_version': order.version}, rid)
-        self.order_line = self.order.lines.first()
+        self.business_lanes = []
+        for lane in range(4):
+            rid = self.args.run_id[:36] + '-setup-' + str(lane)
+            project = projects.write_project(self.admin, {'code': 'AC-' + self.args.run_id + '-' + str(lane),
+                'name': 'Isolated acceptance lane ' + str(lane)}, rid)
+            project = projects.project_action(self.admin, project.id, 'transition',
+                {'expected_version': project.version, 'target_status': 'ACTIVE'}, rid)
+            project = projects.project_action(self.admin, project.id, 'members',
+                {'expected_version': project.version, 'user_id': str(self.reviewer.id)}, rid)
+            task = projects.write_task(self.admin, {'project_id': str(project.id),
+                'title': 'Isolated inventory acceptance', 'assignee_id': str(self.admin.id)}, rid)
+            task = projects.task_action(self.admin, task.id, 'transition',
+                {'expected_version': task.version, 'target_status': 'IN_PROGRESS'}, rid)
+            request = services.write_request(self.admin, {'reason': 'Synthetic isolated event acceptance',
+                'project_id': str(project.id),
+                'lines': [{'item_id': str(self.batch.item_id), 'qty': quantity,
+                           'needed_by': str(timezone.localdate() + timedelta(days=1))}]}, rid)
+            request = services.request_action(self.admin, request.id, 'submit',
+                {'expected_version': request.version}, rid)
+            request = services.request_action(self.reviewer, request.id, 'decision',
+                {'expected_version': request.version, 'decision': 'APPROVE', 'reason': 'Isolated acceptance'}, rid)
+            order = services.write_order(self.admin, {'supplier_id': str(self.models.Supplier.objects.first().id),
+                'lines': [{'request_line_id': str(request.lines.first().id), 'qty': quantity, 'unit_price': '1'}]}, rid)
+            order = services.order_action(self.admin, order.id, 'confirm',
+                {'expected_version': order.version}, rid)
+            self.business_lanes.append({'project': project, 'task': task,
+                                        'order': order, 'order_line': order.lines.first(),
+                                        'batch': None, 'cycle_issue': None})
+        self.order = self.business_lanes[0]['order']
+        self.order_line = self.business_lanes[0]['order_line']
         self.cycle_issue = None
+        write_json(self.evidence / 'business-lane-topology.json', {
+            'lane_count': 4, 'assignment': '(global_index//4)%4', 'position': 'global_index%4',
+            'cycle': ['RECEIPT', 'ISSUE', 'TRANSFER', 'REVERSAL'],
+            'shared_durable_journal': True, 'per_lane_journal_batches': True,
+            'shared_read_only_context': {'actor_id': str(self.admin.id),
+                'source_warehouse_id': str(self.source.id), 'target_warehouse_id': str(self.target.id),
+                'item_id': str(self.batch.item_id)},
+            'lock_scope': 'normal application locks retained; independent project/task/order/orderline and per-cycle batch/balance',
+            'lanes': [{'lane': n, **{key + '_id': str(data[key].id)
+                for key in ('project', 'task', 'order', 'order_line')}}
+                for n, data in enumerate(self.business_lanes)]})
 
     def generate(self, count, label, *, rate=None):
         rate = rate or self.args.rate
+        if hasattr(self, 'business_lanes') and label in {
+                'steady', 'analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'}:
+            return self._generate_concurrent(count, label, rate=rate)
         batch = self.generation.begin_batch(count, rate, label)
         self._generation_attempt = None
         self._generation_stage = 'initialization'
@@ -461,86 +512,184 @@ class Harness:
         return ids, workload
 
     def _generate_commands(self, count, label, *, rate, batch):
-        from django.utils import timezone
-        from labops.purchasing.services import create_receipt
         rate = rate or self.args.rate
         started = time.monotonic()
         ids = []
+        start_index = getattr(self, '_next_command_index', len(self.events))
+        self._next_command_index = start_index + count
         for index in range(count):
             self._generation_attempt = None
             self._generation_stage = 'pacing'
             target = started + index / rate
             while time.monotonic() < target:
                 time.sleep(min(.05, target - time.monotonic()))
-            seq = len(self.events)
-            key = f'{self.args.run_id}:{seq}'
-            rid = f'acceptance-{seq}'
-            before = time.time()
-            from django.db import transaction
-            attempt = self.generation.attempt(batch)
-            self._generation_attempt = attempt
-            self._generation_stage = 'business_transaction'
-            with transaction.atomic():
-                with self.connection.cursor() as cursor:
-                    cursor.execute('SELECT txid_current()::text')
-                    inserted_xid = cursor.fetchone()[0]
-                position = seq % 4
-                if position == 0 or (position == 3 and self.cycle_issue is None):
-                    receipt = create_receipt(self.admin, {'order_id': str(self.order.id), 'lines': [{
-                        'order_line_id': str(self.order_line.id), 'warehouse_id': str(self.source.id),
-                        'qty': '4', 'batch_no': f'ACCEPTANCE-{self.args.run_id[:24]}-{seq}',
-                        'supplier_lot': 'SYNTHETIC', 'expires_on': str(timezone.localdate() + timedelta(days=365))}]}, rid)
-                    self.batch = receipt.lines.first().batch
-                    movement = self.services.post_receipt(self.admin, receipt.id,
-                        {'expected_version': receipt.version, 'receipt_id': str(receipt.id)}, key, rid)
-                elif position == 1:
-                    movement = self.services.issue(self.admin, {'task_id': str(self.task.id), 'lines': [{
-                        'batch_id': str(self.batch.id), 'warehouse_id': str(self.source.id), 'qty': '1'}]}, key, rid)
-                    self.cycle_issue = movement
-                elif position == 2:
-                    movement = self.services.transfer(self.admin, {'batch_id': str(self.batch.id),
-                        'from_warehouse_id': str(self.source.id), 'to_warehouse_id': str(self.target.id), 'qty': '1'}, key, rid)
-                else:
-                    movement = self.services.reverse(self.admin, self.cycle_issue.id,
-                        {'reason': 'Synthetic acceptance reversal'}, key, rid)
-                    self.cycle_issue = None
-            # Commit accounting precedes every optional timestamp/outbox/log
-            # observation, so an observation failure cannot erase a DB commit.
-            self._generation_stage = 'commit_accounting'
-            self.generation.commit(batch, attempt, movement_id=str(movement.id))
-            transaction_return = time.time()
-            self._generation_stage = 'commit_timestamp_observation'
+            seq = start_index + index
+            lane = (seq // 4) % 4
+            data = (self.business_lanes[lane] if hasattr(self, 'business_lanes') else {
+                'order': self.order, 'order_line': self.order_line,
+                'batch': getattr(self, 'batch', None), 'cycle_issue': self.cycle_issue})
+            state = {'attempt': None, 'stage': 'initialization'}
+            try:
+                item = self._execute_inventory_command(seq, label, batch, state, data,
+                                                       lane=lane, scheduled_at=target)
+            finally:
+                self._generation_attempt = state['attempt']
+                self._generation_stage = state['stage']
+                self.batch, self.cycle_issue = data['batch'], data['cycle_issue']
+            ids.append(item['event_id'])
+        elapsed = time.monotonic() - started
+        return ids, {'input': count, 'completed_commands': count, 'elapsed_seconds': elapsed,
+                     'target_rate': rate, 'actual_command_rate': count / elapsed if elapsed else None,
+                     'schedule_lateness_seconds': max(0, elapsed - count / rate),
+                     'generator_topology': 'serial_fault_fixture', 'lane_assignment': '(global_index//4)%4'}
+
+    def _generate_concurrent(self, count, label, *, rate):
+        from benchmarks.events.concurrent_generation import allocate_lane_indices, run_paced_lanes
+        began = time.monotonic()
+        start_index = self._next_command_index
+        self._next_command_index += count
+        allocation = allocate_lane_indices(count, start_index=start_index)
+        batches = [self.generation.begin_batch(len(indices), rate / 4, label) for indices in allocation]
+        states = [{'attempt': None, 'stage': 'initialization', 'error_type': None} for _ in range(4)]
+        number = len(self.generation_topologies) + 1
+        topology = {'scenario': label, 'generator_topology': 'parallel-lanes-v1',
+            'requested': count, 'global_target_rate': rate, 'start_global_index': start_index,
+            'nominal_per_lane_average_rate': rate / 4,
+            'journal_batch_target_rate_scope': 'nominal per-lane average; global pacing is applied once by scheduler',
+            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'assignment': '(global_index//4)%4', 'position': 'global_index%4',
+            'journal_batches': [{'lane': n, 'batch_id': batch, 'requested': len(allocation[n])}
+                                for n, batch in enumerate(batches)]}
+        self.generation_topologies.append(topology)
+        write_json(self.evidence / f'generation-topology-{number:03d}.json', topology)
+        observations = self.evidence / f'generation-schedule-{number:03d}.jsonl'
+
+        def observe(value):
+            with self._event_lock, observations.open('a') as out:
+                out.write(json.dumps(value, sort_keys=True) + '\n')
+
+        def execute(lane, seq, target):
+            state = states[lane]
+            try:
+                return self._execute_inventory_command(seq, label, batches[lane], state,
+                    self.business_lanes[lane], lane=lane, scheduled_at=target)
+            except BaseException as exc:
+                state['error_type'] = type(exc).__name__
+                raise
+
+        try:
+            # Django connections are thread-local. The shutdown callback runs
+            # in its owning lane, after every in-flight transaction has returned.
+            items = run_paced_lanes(count, rate, execute, start_index=start_index,
+                on_observation=observe, on_lane_shutdown=lambda _lane: self.connections.close_all())
+        except BaseException as exc:
+            for lane, batch in enumerate(batches):
+                try:
+                    summary = self.generation.batch_summary(batch)
+                    if summary['identified_events'] == summary['requested'] and not states[lane]['error_type']:
+                        self.generation.finish_success(batch)
+                    else:
+                        self.generation.finish_failure(batch,
+                            states[lane]['stage'] if states[lane]['error_type'] else 'peer_lane_failure',
+                            states[lane]['error_type'] or type(exc).__name__, attempt_id=states[lane]['attempt'])
+                except Exception as accounting_error:
+                    self._generation_accounting_error = type(accounting_error).__name__
+            topology.update({'passed': False, 'error_type': type(exc).__name__,
+                             'elapsed_seconds': time.monotonic() - began,
+                             'batches': [self.generation.batch_summary(batch) for batch in batches]})
+            try:
+                write_json(self.evidence / f'generation-topology-{number:03d}.json', topology)
+            except Exception as accounting_error:
+                self._generation_accounting_error = type(accounting_error).__name__
+            raise
+        for batch in batches:
+            self.generation.finish_success(batch)
+        elapsed = time.monotonic() - began
+        # Raw event lines retain completion order; the in-memory catalogue keeps
+        # globally assigned order for deterministic recovery fixtures.
+        self.events.sort(key=lambda item: item['global_index'])
+        last = self.business_lanes[((start_index + count - 1) // 4) % 4]
+        self.batch, self.cycle_issue = last['batch'], last['cycle_issue']
+        topology.update({'passed': True, 'elapsed_seconds': elapsed,
+                         'batches': [self.generation.batch_summary(batch) for batch in batches]})
+        write_json(self.evidence / f'generation-topology-{number:03d}.json', topology)
+        return [item['event_id'] for item in items], {
+            'input': count, 'completed_commands': len(items), 'elapsed_seconds': elapsed,
+            'target_rate': rate, 'actual_command_rate': count / elapsed if elapsed else None,
+            'schedule_lateness_seconds': max(0, elapsed - count / rate),
+            'generator_topology': 'parallel-lanes-v1', 'lane_count': 4,
+            'queue_capacity_per_lane': 4, 'topology_artifact': f'generation-topology-{number:03d}.json',
+            'elapsed_boundary': 'before lane batch setup through all worker commits/observations and joined connection cleanup'}
+
+    def _execute_inventory_command(self, seq, label, batch, state, data, *, lane, scheduled_at):
+        from django.utils import timezone
+        from labops.purchasing.services import create_receipt
+        from django.db import transaction
+        key = f'{self.args.run_id}:{seq}'
+        rid = f'acceptance-{seq}'
+        before = time.time()
+        attempt = self.generation.attempt(batch)
+        state.update(attempt=attempt, stage='business_transaction')
+        with transaction.atomic():
             with self.connection.cursor() as cursor:
-                cursor.execute('SHOW track_commit_timestamp')
-                enabled = cursor.fetchone()[0] == 'on'
-                if enabled:
-                    cursor.execute('SELECT pg_xact_commit_timestamp(%s::xid)', [inserted_xid])
-                    committed_at = cursor.fetchone()[0]
-                else:
-                    committed_at = None
-            self._generation_stage = 'outbox_observation'
-            event = self.models.OutboxEvent.objects.get(aggregate_id=movement.id)
-            self.generation.identify_event(batch, attempt, str(event.id))
-            item = {'event_id': str(event.id), 'movement_id': str(movement.id), 'kind': movement.type,
+                cursor.execute('SELECT txid_current()::text')
+                inserted_xid = cursor.fetchone()[0]
+            position = seq % 4
+            if position == 0:
+                receipt = create_receipt(self.admin, {'order_id': str(data['order'].id), 'lines': [{
+                    'order_line_id': str(data['order_line'].id), 'warehouse_id': str(self.source.id),
+                    'qty': '4', 'batch_no': f'ACCEPTANCE-{self.args.run_id[:24]}-{seq}',
+                    'supplier_lot': 'SYNTHETIC', 'expires_on': str(timezone.localdate() + timedelta(days=365))}]}, rid)
+                data['batch'] = receipt.lines.first().batch
+                movement = self.services.post_receipt(self.admin, receipt.id,
+                    {'expected_version': receipt.version, 'receipt_id': str(receipt.id)}, key, rid)
+            elif position == 1:
+                movement = self.services.issue(self.admin, {'task_id': str(data.get('task', self.task).id), 'lines': [{
+                    'batch_id': str(data['batch'].id), 'warehouse_id': str(self.source.id), 'qty': '1'}]}, key, rid)
+                data['cycle_issue'] = movement
+            elif position == 2:
+                movement = self.services.transfer(self.admin, {'batch_id': str(data['batch'].id),
+                    'from_warehouse_id': str(self.source.id), 'to_warehouse_id': str(self.target.id), 'qty': '1'}, key, rid)
+            else:
+                assert data['cycle_issue'] is not None, 'Business lane lost its original issue before reversal'
+                movement = self.services.reverse(self.admin, data['cycle_issue'].id,
+                    {'reason': 'Synthetic acceptance reversal'}, key, rid)
+                data['cycle_issue'] = None
+        # Commit accounting precedes every optional timestamp/outbox/log
+        # observation, so an observation failure cannot erase a DB commit.
+        state['stage'] = 'commit_accounting'
+        self.generation.commit(batch, attempt, movement_id=str(movement.id))
+        transaction_return = time.time()
+        state['stage'] = 'commit_timestamp_observation'
+        with self.connection.cursor() as cursor:
+            cursor.execute('SHOW track_commit_timestamp')
+            enabled = cursor.fetchone()[0] == 'on'
+            if enabled:
+                cursor.execute('SELECT pg_xact_commit_timestamp(%s::xid)', [inserted_xid])
+                committed_at = cursor.fetchone()[0]
+            else:
+                committed_at = None
+        state['stage'] = 'outbox_observation'
+        event = self.models.OutboxEvent.objects.get(aggregate_id=movement.id)
+        self.generation.identify_event(batch, attempt, str(event.id))
+        item = {'event_id': str(event.id), 'movement_id': str(movement.id), 'kind': movement.type,
+                    'global_index': seq, 'business_lane': lane, 'scheduled_at_monotonic': scheduled_at,
                     'scenario': label, 'command_started_at': before,
                     'transaction_return_observed_at': transaction_return,
                     'insert_transaction_xid': inserted_xid,
                     'outbox_transaction_commit_at': committed_at.timestamp() if committed_at else None,
                     'outbox_created_at': event.created_at.timestamp(),
                     'payload_bytes': len(json.dumps(self.api.envelope(event)).encode())}
-            ids.append(str(event.id))
+        state['stage'] = 'event_log_observation'
+        with getattr(self, '_event_lock', threading.Lock()):
             self.events.append(item)
-            self._generation_stage = 'event_log_observation'
             with (self.evidence / 'events.jsonl').open('a') as out:
                 out.write(json.dumps(item, sort_keys=True) + '\n')
-            for name, process in self.workers.items():
-                if process.poll() is not None:
-                    raise AssertionError(f'Worker exited during generation: {name} ({process.returncode})')
-            self._generation_attempt = None
-        elapsed = time.monotonic() - started
-        return ids, {'input': count, 'completed_commands': count, 'elapsed_seconds': elapsed,
-                     'target_rate': rate, 'actual_command_rate': count / elapsed if elapsed else None,
-                     'schedule_lateness_seconds': max(0, elapsed - count / rate)}
+        for name, process in self.workers.items():
+            if process.poll() is not None:
+                raise AssertionError(f'Worker exited during generation: {name} ({process.returncode})')
+        state['attempt'] = None
+        return item
 
     def offsets(self, timeout=30):
         def retry(code, attempt):
@@ -1797,9 +1946,11 @@ class Harness:
             and generation['totals']['requested'] == generation['totals']['committed']
             == generation['totals']['identified_events']
             and not getattr(self, '_generation_accounting_error', None))
+        topologies_complete = all(topology.get('passed') is True
+                                  for topology in getattr(self, 'generation_topologies', []))
         final_complete = (final_state['database_observed'] and final_state['offsets_observed']
             and not final_state['errors'] and not final_state['unpublished_count']
-            and reconciliation_complete and generation_complete
+            and reconciliation_complete and generation_complete and topologies_complete
             and not final_state['processed_hash_conflicts']
             and all(not consumer['incomplete_count'] for consumer in final_state['consumers'].values())
             and not final_state['event_log_ids_missing_from_database']
@@ -1817,6 +1968,8 @@ class Harness:
             'full_workload_targets_passed': self.args.tier == 'full' and 'steady' in passing_cases and fault_targets_passed,
             'requested_numeric_profile': generation['requested_numeric_profile'],
             'generation_accounting': generation, 'final_inventory_state': final_state,
+            'generation_topologies': getattr(self, 'generation_topologies', []),
+            'generation_topologies_complete': topologies_complete,
             'generation_accounting_complete': generation_complete,
             'generation_accounting_error_type': getattr(self, '_generation_accounting_error', None),
             'final_reconciliation_complete': reconciliation_complete,
@@ -1904,6 +2057,7 @@ def main():
     harness = None
     error = None
     try:
+        freeze_generation_execution_profile(args.evidence_dir, args.run_id)
         load_environment(args.generated_dir / 'client.env')
         for key in list(os.environ):
             if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':

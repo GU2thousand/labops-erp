@@ -10,10 +10,12 @@ business payloads, connection strings, environment values, or credentials.
 from __future__ import annotations
 
 import json
+from functools import wraps
 import math
 import os
 from pathlib import Path
 import re
+from threading import RLock
 import time
 from typing import Mapping
 from uuid import UUID
@@ -64,8 +66,16 @@ def _uuid(value):
     return str(UUID(str(value)))
 
 
+def _synchronized(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class GenerationJournal:
-    """Single-process journal; each generation call has a distinct batch ID.
+    """One writer shared by threads; each generation lane has its own batch.
 
     Append and flush every transition; fsync the committed boundary and batch
     completion. Attempt/identification lines do not incur extra per-command
@@ -73,6 +83,7 @@ class GenerationJournal:
     """
 
     def __init__(self, evidence_dir, run_id, profile):
+        self._lock = RLock()
         if not isinstance(run_id, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', run_id):
             raise ValueError('Invalid validation run identifier')
         self.evidence_dir = Path(evidence_dir)
@@ -120,6 +131,7 @@ class GenerationJournal:
         batch = self._batch(batch_id, running=True)
         return batch, batch['attempts'][attempt_id]
 
+    @_synchronized
     def begin_batch(self, requested, rate, label):
         if self._closed:
             raise RuntimeError('Generation journal is closed')
@@ -137,6 +149,7 @@ class GenerationJournal:
                      requested=requested, target_rate=rate)
         return batch_id
 
+    @_synchronized
     def attempt(self, batch_id):
         batch = self._batch(batch_id, running=True)
         if len(batch['attempts']) >= batch['requested']:
@@ -151,6 +164,7 @@ class GenerationJournal:
         self._append('command_attempted', batch_id=batch_id, attempt_id=attempt_id)
         return attempt_id
 
+    @_synchronized
     def commit(self, batch_id, attempt_id, movement_id=None):
         _, attempt = self._attempt(batch_id, attempt_id)
         if attempt['state'] != 'attempted':
@@ -160,6 +174,7 @@ class GenerationJournal:
         self._append('command_committed', sync=True, batch_id=batch_id,
                      attempt_id=attempt_id, movement_id=movement_id)
 
+    @_synchronized
     def identify_event(self, batch_id, attempt_id, event_id):
         batch, attempt = self._attempt(batch_id, attempt_id)
         if attempt['state'] != 'committed':
@@ -170,6 +185,7 @@ class GenerationJournal:
         self._append('event_identified', batch_id=batch_id,
                      attempt_id=attempt_id, event_id=event_id)
 
+    @_synchronized
     def finish_success(self, batch_id):
         batch = self._batch(batch_id, running=True)
         if len(batch['attempts']) != batch['requested'] or any(
@@ -180,6 +196,7 @@ class GenerationJournal:
         self._write_summary()
         return self.batch_summary(batch_id)
 
+    @_synchronized
     def finish_failure(self, batch_id, stage, error_type, attempt_id=None):
         """Preserve partial counts without deriving them from observed event IDs.
 
@@ -210,6 +227,7 @@ class GenerationJournal:
         self._write_summary()
         return self.batch_summary(batch_id)
 
+    @_synchronized
     def batch_summary(self, batch_id):
         batch = self._batch(batch_id)
         attempts = list(batch['attempts'].values())
@@ -226,6 +244,7 @@ class GenerationJournal:
                 'pending_observation': states.count('committed'),
                 'failure': dict(batch['failure']) if batch['failure'] else None}
 
+    @_synchronized
     def committed_attempts(self):
         """Recorded IDs only; a database snapshot supplies any boundary gap."""
         return [{'batch_id': batch_id, 'label': batch['label'],
@@ -235,6 +254,7 @@ class GenerationJournal:
                 for batch_id, batch in self._batches.items()
                 for attempt in batch['attempts'].values() if attempt['committed']]
 
+    @_synchronized
     def summary(self):
         batches = [self.batch_summary(batch_id) for batch_id in self._batches]
         return {'schema_version': 1, 'run_id': self.run_id,
@@ -255,6 +275,7 @@ class GenerationJournal:
         os.replace(temporary, self.summary_path)
         return report
 
+    @_synchronized
     def finalize(self):
         """Write final counts, keeping any unresolved transitions explicitly pending."""
         if self._closed:
