@@ -1,4 +1,5 @@
 from collections import defaultdict
+from django.db.models import Sum
 from labops.common import *
 from labops.models import *
 
@@ -12,7 +13,10 @@ def request_scope(user,request,write=False):
 def request_available(line,exclude=None):
     return line.qty-sum((x.qty for x in line.order_lines.exclude(order__status='CANCELLED').exclude(order_id=exclude)),Decimal(0))
 def received_qty(line):
-    return sum((x.qty for x in line.receipt_lines.filter(receipt__status='POSTED')),Decimal(0))
+    total=line.receipt_lines.filter(receipt__status='POSTED').aggregate(
+        total=Sum('qty',output_field=ReceiptLine._meta.get_field('qty')))['total']
+    # Fixed6Field converts the summed stored micro-units to an exact Decimal.
+    return Decimal(0) if total is None else total
 def order_state(order):
     if order.status in ['CONFIRMED','CLOSED']:
         lines=list(order.lines.all())

@@ -80,7 +80,10 @@ def new(model, user, rid, **fields):
     audit(user,record,'CREATE',rid)
     return record
 
-def number(prefix): return f'{prefix}-{timezone.localdate():%y%m%d}-{uuid.uuid4().hex[:8].upper()}'
+def number(prefix):
+    # Retain the full UUID entropy: an eight-hex-digit suffix has only 32 bits
+    # and can collide within a normal high-volume day's unique document numbers.
+    return f'{prefix}-{timezone.localdate():%y%m%d}-{uuid.uuid4().hex.upper()}'
 def digest(data): return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',',':'),cls=DjangoJSONEncoder).encode()).hexdigest()
 def idempotent(user,key,kind,data,fn):
     key=text(key or '', 'Idempotency-Key',128)

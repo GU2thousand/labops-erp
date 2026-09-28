@@ -112,7 +112,7 @@ def stable_committed_offsets(configs, topic, *, timeout=30, consumer_factory=Non
 
 
 class Harness:
-    def __init__(self, args):
+    def __init__(self, args, generation=None):
         self.args = args
         self.evidence = args.evidence_dir
         self.evidence.mkdir(parents=True, exist_ok=True)
@@ -121,6 +121,8 @@ class Harness:
         for directory in ('logs', 'metrics', 'markers', 'backup'):
             (self.evidence / directory).mkdir(exist_ok=True)
         (self.evidence / 'errors.jsonl').touch(exist_ok=False)
+        from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
+        self.generation = generation or GenerationJournal(self.evidence, args.run_id, numeric_profile(args))
         self.children = []
         self.child_metrics = {}
         self.child_groups = {}
@@ -129,6 +131,7 @@ class Harness:
         self.supervisor_restarts = []
         self.events = []
         self.cases = []
+        self.delivery_proofs = []
         self.logs = []
         self.secrets = json.loads((args.generated_dir / 'secrets.json').read_text())
         self.env = {**os.environ, 'DJANGO_SETTINGS_MODULE': 'config.settings',
@@ -439,12 +442,33 @@ class Harness:
         self.cycle_issue = None
 
     def generate(self, count, label, *, rate=None):
+        rate = rate or self.args.rate
+        batch = self.generation.begin_batch(count, rate, label)
+        self._generation_attempt = None
+        self._generation_stage = 'initialization'
+        try:
+            ids, workload = self._generate_commands(count, label, rate=rate, batch=batch)
+        except BaseException as exc:
+            try:
+                self.generation.finish_failure(batch, self._generation_stage, type(exc).__name__,
+                    attempt_id=self._generation_attempt)
+            except Exception as accounting_error:
+                # A filesystem/journal error must not replace the business or
+                # observation exception. Final accounting remains incomplete.
+                self._generation_accounting_error = type(accounting_error).__name__
+            raise
+        self.generation.finish_success(batch)
+        return ids, workload
+
+    def _generate_commands(self, count, label, *, rate, batch):
         from django.utils import timezone
         from labops.purchasing.services import create_receipt
         rate = rate or self.args.rate
         started = time.monotonic()
         ids = []
         for index in range(count):
+            self._generation_attempt = None
+            self._generation_stage = 'pacing'
             target = started + index / rate
             while time.monotonic() < target:
                 time.sleep(min(.05, target - time.monotonic()))
@@ -453,6 +477,9 @@ class Harness:
             rid = f'acceptance-{seq}'
             before = time.time()
             from django.db import transaction
+            attempt = self.generation.attempt(batch)
+            self._generation_attempt = attempt
+            self._generation_stage = 'business_transaction'
             with transaction.atomic():
                 with self.connection.cursor() as cursor:
                     cursor.execute('SELECT txid_current()::text')
@@ -477,7 +504,12 @@ class Harness:
                     movement = self.services.reverse(self.admin, self.cycle_issue.id,
                         {'reason': 'Synthetic acceptance reversal'}, key, rid)
                     self.cycle_issue = None
+            # Commit accounting precedes every optional timestamp/outbox/log
+            # observation, so an observation failure cannot erase a DB commit.
+            self._generation_stage = 'commit_accounting'
+            self.generation.commit(batch, attempt, movement_id=str(movement.id))
             transaction_return = time.time()
+            self._generation_stage = 'commit_timestamp_observation'
             with self.connection.cursor() as cursor:
                 cursor.execute('SHOW track_commit_timestamp')
                 enabled = cursor.fetchone()[0] == 'on'
@@ -486,7 +518,9 @@ class Harness:
                     committed_at = cursor.fetchone()[0]
                 else:
                     committed_at = None
+            self._generation_stage = 'outbox_observation'
             event = self.models.OutboxEvent.objects.get(aggregate_id=movement.id)
+            self.generation.identify_event(batch, attempt, str(event.id))
             item = {'event_id': str(event.id), 'movement_id': str(movement.id), 'kind': movement.type,
                     'scenario': label, 'command_started_at': before,
                     'transaction_return_observed_at': transaction_return,
@@ -496,23 +530,26 @@ class Harness:
                     'payload_bytes': len(json.dumps(self.api.envelope(event)).encode())}
             ids.append(str(event.id))
             self.events.append(item)
+            self._generation_stage = 'event_log_observation'
             with (self.evidence / 'events.jsonl').open('a') as out:
                 out.write(json.dumps(item, sort_keys=True) + '\n')
             for name, process in self.workers.items():
                 if process.poll() is not None:
                     raise AssertionError(f'Worker exited during generation: {name} ({process.returncode})')
+            self._generation_attempt = None
         elapsed = time.monotonic() - started
         return ids, {'input': count, 'completed_commands': count, 'elapsed_seconds': elapsed,
                      'target_rate': rate, 'actual_command_rate': count / elapsed if elapsed else None,
                      'schedule_lateness_seconds': max(0, elapsed - count / rate)}
 
-    def offsets(self):
+    def offsets(self, timeout=30):
         def retry(code, attempt):
             with (self.evidence / 'errors.jsonl').open('a') as out:
                 out.write(json.dumps({'kind': 'offset_coordinator_refresh',
                                       'error_code': code, 'attempt': attempt}) + '\n')
         return stable_committed_offsets({name: self.consumer_config(name)
-            for name in ('notification', 'analytics')}, self.settings.KAFKA_TOPIC, on_retry=retry)
+            for name in ('notification', 'analytics')}, self.settings.KAFKA_TOPIC,
+            timeout=timeout, on_retry=retry)
 
     def drained(self, ids, timeout=180):
         expected = len(ids)
@@ -566,35 +603,131 @@ class Harness:
     def duplicate_drill(self, ids):
         before = self.snapshot(ids)
         sender = self.api.producer()
+        acknowledgements = []
+        cluster, generation = self.api.source_identity()
+        write_json(self.evidence / 'duplicate-requests.json', {'event_ids': ids,
+            'requested_unique_inventory_ids': len(ids), 'requested_new_broker_records': len(ids) * 2,
+            'new_coordinates_required_per_event_per_consumer': 2})
+        owner = self
+
+        class ObservingProducer:
+            event_id = None
+
+            def __getattr__(self, name):
+                return getattr(sender, name)
+
+            @property
+            def last_security_error(self):
+                return sender.last_security_error
+
+            @last_security_error.setter
+            def last_security_error(self, value):
+                sender.last_security_error = value
+
+            def produce(self, *args, **kwargs):
+                callback = kwargs.get('on_delivery')
+                event_id = self.event_id
+                def delivered(error, message):
+                    if error is None:
+                        item = {'event_id': event_id, 'topic': message.topic(),
+                            'partition': message.partition(), 'offset': message.offset(),
+                            'source_cluster': cluster, 'source_generation': generation}
+                        acknowledgements.append(item)
+                        with (owner.evidence / 'duplicate-publications.jsonl').open('a') as output:
+                            output.write(json.dumps(item, sort_keys=True) + '\n')
+                    if callback:
+                        callback(error, message)
+                kwargs['on_delivery'] = delivered
+                return sender.produce(*args, **kwargs)
+        observed_sender = ObservingProducer()
         sent = 0
         started = time.monotonic()
         for event in self.models.OutboxEvent.objects.filter(id__in=ids):
             for _ in range(2):
-                self.api.send(sender, self.settings.KAFKA_TOPIC,
+                observed_sender.event_id = str(event.id)
+                self.api.send(observed_sender, self.settings.KAFKA_TOPIC,
                               f'{event.aggregate_type}:{event.aggregate_id}', self.api.envelope(event))
                 sent += 1
-        self.wait_for_log_deliveries(ids, minimum=(sent + len(ids)) * 2, timeout=180)
+        required = {eid: [] for eid in ids}
+        for record in acknowledgements:
+            assert record['topic'] == self.settings.KAFKA_TOPIC
+            required[record['event_id']].append({'partition': record['partition'], 'offset': record['offset']})
+        assert sent == len(ids) * 2 and all(len(parts) == 2 for parts in required.values()), 'Duplicate ACK denominator is incomplete'
+        observation_started = time.monotonic()
+        coverage = self.wait_for_log_deliveries(ids, minimum=(sent + len(ids)) * 2, timeout=180,
+            required_coordinates=required)
+        remaining = 180 - (time.monotonic() - observation_started)
+        assert remaining > 0, 'Duplicate receipt proof exhausted the frozen observation window'
+        cursor_proof = self.wait_for_acknowledged_offsets(required, timeout=remaining)
+        from benchmarks.events.health import completed_recovery_seconds
+        completed_recovery_seconds(observation_started, 180)
         after = self.snapshot(ids)
         for key in ('notification_count', 'notification_hash', 'dedupe_count', 'dedupe_hash', 'projection_hash'):
             assert before[key] == after[key], f'Duplicate changed {key}'
         self.cases.append({'name': 'duplicates', 'unique_input': len(ids), 'duplicate_broker_records': sent,
             'extra_database_effects': 0, 'before': before, 'after': after,
+            'delivery_coverage': coverage,
+            'acknowledged_coordinate_commit_coverage': cursor_proof,
             'elapsed_seconds': time.monotonic() - started, 'passed': True})
 
-    def wait_for_log_deliveries(self, ids, minimum, timeout=90):
-        wanted = set(ids)
-        def count():
-            count = 0
+    def wait_for_log_deliveries(self, ids, minimum, timeout=90, required_coordinates=None):
+        from benchmarks.events.delivery_contract import qualify_delivery_observations
+        wanted = sorted(set(ids))
+        pairs = len(wanted) * 2
+        assert pairs and minimum % pairs == 0, 'Delivery denominator is not uniform for all event/consumer pairs'
+        required_per_pair = minimum // pairs
+        proof = None
+        artifact = self.evidence / f'delivery-proof-{len(self.delivery_proofs):03d}.json'
+
+        def observations():
             for path in (self.evidence / 'logs').glob('*-deliveries.jsonl'):
-                for line in path.read_text().splitlines():
-                    try:
-                        row = json.loads(line)
-                    except ValueError:
-                        continue
-                    if row.get('event_id') in wanted:
-                        count += 1
-            return count >= minimum
-        self.wait(count, 'Expected broker redeliveries were not observed', timeout)
+                with path.open() as source:
+                    for number, line in enumerate(source, 1):
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        yield {**row, 'log_file': path.name, 'line_number': number}
+
+        def qualified():
+            nonlocal proof
+            proof = qualify_delivery_observations(observations(), wanted,
+                self.settings.KAFKA_TOPIC, required_per_pair,
+                expected_source_identity=self.api.source_identity(),
+                required_coordinates=required_coordinates)
+            return proof if proof['passed'] else False
+        try:
+            self.wait(qualified, 'Every inventory event/consumer pair requires distinct broker coordinates', timeout)
+        finally:
+            write_json(artifact, proof or {'passed': False, 'requested_event_ids': wanted,
+                'required_per_pair': required_per_pair, 'expected_pairs': pairs,
+                'expected_total_distinct_coordinates': minimum,
+                'qualification_error': 'No complete parseable observation proof was obtained'})
+            summary = {'artifact': artifact.name, 'passed': bool(proof and proof['passed']),
+                'requested_event_count': len(wanted), 'required_per_pair': required_per_pair,
+                'expected_pairs': pairs, 'expected_total_distinct_coordinates': minimum,
+                'covered_pair_count': proof['covered_pair_count'] if proof else None,
+                'qualified_total_distinct_coordinates': proof['qualified_total_distinct_coordinates'] if proof else None}
+            self.delivery_proofs.append(summary)
+        return summary
+
+    def wait_for_acknowledged_offsets(self, required_coordinates, timeout):
+        from benchmarks.events.delivery_contract import acknowledged_offsets_coverage
+        from benchmarks.events.health import completed_recovery_seconds
+        started = time.monotonic()
+        deadline = started + timeout
+        while time.monotonic() < deadline:
+            snapshot = self.offsets(timeout=min(30, deadline - time.monotonic()))
+            proof = acknowledged_offsets_coverage(snapshot, required_coordinates)
+            with (self.evidence / 'duplicate-offset-observations.jsonl').open('a') as output:
+                output.write(json.dumps({'elapsed_seconds': time.monotonic() - started, **proof}) + '\n')
+            if proof['passed']:
+                completed_recovery_seconds(started, timeout)
+                return proof
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(.15, remaining))
+        raise AssertionError('Both consumer groups did not commit beyond every new duplicate ACK coordinate')
 
     def marker(self, label):
         return self.evidence / 'markers' / f'{label}.json'
@@ -779,9 +912,15 @@ class Harness:
             downtime = time.monotonic() - started
         finally:
             self.compose('start', *services)
+        recovery = time.monotonic()
+        from benchmarks.events.workload_contract import qualify_fault_workload
+        qualification = qualify_fault_workload(workload, tier=self.args.tier,
+            requested_events=self.args.fault_events, configured_rate=self.args.rate,
+            actual_input_count=len(ids), requested_min_outage_seconds=seconds,
+            measured_outage_seconds=downtime)
+        write_json(self.evidence / (label + '-workload-qualification.json'), qualification)
         # The frozen drain window begins when stopped processes return, so
         # network/cluster recovery cannot quietly extend the 900-second SLA.
-        recovery = time.monotonic()
         completed_seconds = None
         try:
             network_after = self.network_snapshot(label + '-after')
@@ -813,7 +952,9 @@ class Harness:
                     out.write(json.dumps({'kind': 'automatic_broker_recovery_exhausted',
                         'scenario': label, 'dead_event_ids': dead, 'operator_requeued_events': 0}) + '\n')
         self.cases.append({'name': label, 'services': services, 'downtime_seconds': downtime,
-            'input': len(ids), 'workload': workload, 'publish_denial_error_type': publish_error,
+            'requested_minimum_outage_seconds': seconds,
+            'input': len(ids), 'workload': workload, 'workload_qualification': qualification,
+            'publish_denial_error_type': publish_error,
             'attempted_publish_event_id': attempted.get('event_id'),
             'attempted_publish_ack_count': len(attempted.get('acknowledgements', [])) if len(services) >= 2 else None,
             'attempted_publish_delivery_errors': attempted.get('delivery_errors', []),
@@ -827,7 +968,9 @@ class Harness:
             'recovery_window_seconds': self.args.drain_timeout,
             'recovery_window_start': 'broker compose start completed; includes network/cluster health recovery',
             'recovery_drain_seconds': completed_seconds, 'offsets_before': before,
-            'offsets_after': self.offsets(), 'passed': True})
+            'offsets_after': self.offsets(), 'passed': qualification['passed']})
+        if not qualification['passed']:
+            raise AssertionError('Broker fault workload missed the frozen generation/count/outage contract')
 
     def network_snapshot(self, stage):
         self.command([sys.executable, 'infra/events/validation/collect.py',
@@ -918,12 +1061,39 @@ class Harness:
         assert parked == 0
         while time.monotonic() - started < self.args.consumer_outage_seconds:
             time.sleep(.2)
-        self.start_consumer('analytics')
+        downtime = time.monotonic() - started
+        from benchmarks.events.workload_contract import qualify_fault_workload
+        qualification = qualify_fault_workload(workload, tier=self.args.tier,
+            requested_events=self.args.fault_events, configured_rate=self.args.rate,
+            actual_input_count=len(ids), requested_min_outage_seconds=self.args.consumer_outage_seconds,
+            measured_outage_seconds=downtime)
+        write_json(self.evidence / 'analytics_outage-workload-qualification.json', qualification)
+        # Process startup belongs to the same frozen recovery deadline.
         recovered = time.monotonic()
-        self.drained(ids, timeout=self.args.drain_timeout)
+        completed_seconds = None
+        try:
+            self.start_consumer('analytics')
+            remaining = self.args.drain_timeout - (time.monotonic() - recovered)
+            assert remaining > 0, 'Analytics process startup exhausted the frozen recovery window'
+            self.drained(ids, timeout=remaining)
+            from benchmarks.events.health import completed_recovery_seconds
+            completed_seconds = completed_recovery_seconds(recovered, self.args.drain_timeout)
+        finally:
+            write_json(self.evidence / 'analytics_outage-recovery-window.json', {
+                'budget_seconds': self.args.drain_timeout,
+                'observation_elapsed_seconds': time.monotonic() - recovered,
+                'window_start': 'analytics replacement start requested; includes startup and effect drain',
+                'successful_completion_elapsed_seconds': completed_seconds,
+                'successful_completion_within_budget': completed_seconds is not None})
         self.cases.append({'name': 'analytics_outage', 'input': len(ids), 'workload': workload,
+            'workload_qualification': qualification, 'downtime_seconds': downtime,
+            'requested_minimum_outage_seconds': self.args.consumer_outage_seconds,
             'notification_completed_while_analytics_down': len(ids), 'analytics_effects_while_down': 0,
-            'catch_up_seconds': time.monotonic() - recovered, 'passed': True})
+            'catch_up_seconds': completed_seconds, 'recovery_window_seconds': self.args.drain_timeout,
+            'recovery_window_start': 'analytics replacement start requested; includes startup and effect drain',
+            'passed': qualification['passed']})
+        if not qualification['passed']:
+            raise AssertionError('Analytics outage workload missed the frozen generation/count/outage contract')
 
     def postgres_failure(self):
         self.stop('publisher')
@@ -1381,17 +1551,24 @@ class Harness:
 
         def exporter_scrape():
             payload = urllib.request.urlopen('http://127.0.0.1:19308/metrics', timeout=5).read().decode()
+            with (self.evidence / 'metrics' / 'exporter-observations.jsonl').open('a') as output:
+                output.write(json.dumps({'observed_at': time.time(), 'raw_exposition': payload}) + '\n')
             assert re.search(r'^kafka_brokers(?:\{[^}]*\})? 3(?:\.0)?$', payload, re.MULTILINE)
             replicas = [float(line.rsplit(' ', 1)[1]) for line in payload.splitlines()
                 if line.startswith('kafka_topic_partition_replicas{') and
                 f'topic="{self.settings.KAFKA_TOPIC}"' in line]
             assert len(replicas) == 3 and all(value == 3 for value in replicas)
-            assert 'kafka_consumergroup_lag{' in payload
-            return payload
-        exporter = self.wait(exporter_scrape, 'Exporter actual broker/replica/group lag metrics missing', timeout=60)
+            from benchmarks.events.metrics_contract import require_consumer_group_lag
+            lag = require_consumer_group_lag(payload,
+                [self.consumer_group(name) for name in ('notification', 'analytics')],
+                self.settings.KAFKA_TOPIC)
+            return payload, lag
+        exporter, lag = self.wait(exporter_scrape, 'Exporter exact broker/replica/two-group partition lag metrics missing', timeout=60)
         (self.evidence / 'metrics' / 'exporter-accepted.prom').write_text(exporter)
+        write_json(self.evidence / 'metrics' / 'exporter-lag-coverage.json', lag)
         self.cases.append({'name': 'metrics', 'workers': cases, 'exporter_broker_count': 3,
             'inventory_partition_replicas': [3, 3, 3], 'consumer_group_lag_observed': True,
+            'consumer_group_lag_coverage': lag,
             'durable_RETRY_DEAD_counts_separate_from_lag': True, 'passed': True})
 
     def live_alert_acceptance(self):
@@ -1526,6 +1703,65 @@ class Harness:
             'event_type_counts': dict(Counter(item['kind'] for item in self.events)),
             'fault_repetitions': self.args.fault_repetitions, 'cases': self.cases})
 
+    def final_inventory_evidence(self):
+        """Retain actual isolated DB truth even when generation/reporting failed."""
+        result = {'database_observed': False, 'offsets_observed': False,
+                  'event_log_identified_count': len(self.events), 'errors': []}
+        observed = {item['event_id'] for item in self.events}
+        try:
+            self.connections.close_all()
+            rows = list(self.models.OutboxEvent.objects.filter(transport='kafka').order_by('created_at', 'id').values(
+                'id', 'aggregate_id', 'aggregate_type', 'aggregate_version', 'payload_hash',
+                'status', 'attempts', 'next_attempt_at', 'locked_until', 'lease_token',
+                'published_at', 'created_at'))
+            write_json(self.evidence / 'final-outbox-state.json', rows)
+            actual = {str(row['id']) for row in rows}
+            movements = {str(row['aggregate_id']) for row in rows}
+            markers = list(self.models.ProcessedEvent.objects.filter(
+                consumer_name__in=('notification', 'analytics')).values('consumer_name', 'event_id', 'payload_hash'))
+            markers = [row for row in markers if str(row['event_id']) in actual]
+            write_json(self.evidence / 'final-processed-state.json', markers)
+            hashes = {str(row['id']): row['payload_hash'] for row in rows}
+            marker_conflicts = [{'consumer': row['consumer_name'], 'event_id': str(row['event_id'])}
+                for row in markers if row['payload_hash'] != hashes[str(row['event_id'])]]
+            consumers = {}
+            for name in ('notification', 'analytics'):
+                completed = {str(row['event_id']) for row in markers if row['consumer_name'] == name}
+                consumers[name] = {'expected_inventory_ids': len(actual), 'completed_unique_ids': len(completed),
+                    'incomplete_count': len(actual - completed), 'incomplete_event_ids': sorted(actual - completed)}
+            recorded = self.generation.committed_attempts()
+            recorded_movements = {item['movement_id'] for item in recorded if item['movement_id']}
+            recorded_events = {item['event_id'] for item in recorded if item['event_id']}
+            result.update({'database_observed': True, 'actual_inventory_outbox_count': len(actual),
+                'outbox_status_counts': dict(Counter(row['status'] for row in rows)),
+                'unpublished_count': sum(row['status'] != 'PUBLISHED' for row in rows),
+                'consumers': consumers, 'actual_committed_ids_missing_from_event_log': sorted(actual - observed),
+                'event_log_ids_missing_from_database': sorted(observed - actual),
+                'journal_committed_attempts': len(recorded),
+                'journal_committed_movements_missing_from_database': sorted(recorded_movements - movements),
+                'database_committed_movements_missing_from_journal': sorted(movements - recorded_movements),
+                'journal_identified_events_missing_from_database': sorted(recorded_events - actual),
+                'processed_hash_conflicts': marker_conflicts,
+                'journal_database_atomic': False})
+            try:
+                reconciliation = self.snapshot(sorted(actual))
+                write_json(self.evidence / 'final-reconciliation.json', reconciliation)
+                result['reconciliation'] = reconciliation
+            except Exception as exc:
+                result['errors'].append({'stage': 'reconciliation', 'error_type': type(exc).__name__})
+        except Exception as exc:
+            result['errors'].append({'stage': 'database_snapshot', 'error_type': type(exc).__name__})
+        try:
+            offsets = self.offsets()
+            write_json(self.evidence / 'final-offsets.json', offsets)
+            result['offsets_observed'] = True
+        except Exception as exc:
+            from benchmarks.events.recovery_matrix import _kafka_diagnostics
+            result['errors'].append({'stage': 'committed_offsets', 'error_type': type(exc).__name__,
+                                    **_kafka_diagnostics(exc)})
+        write_json(self.evidence / 'final-inventory-state.json', result)
+        return result
+
     def finish(self, error=None):
         for name in list(self.workers):
             self.stop(name)
@@ -1535,6 +1771,8 @@ class Harness:
                 process.wait(timeout=10)
         for log in self.logs:
             log.close()
+        generation = self.generation.finalize()
+        final_state = self.final_inventory_evidence()
         passing_cases = {case.get('name') for case in self.cases if case.get('passed')}
         limits = ['Mandatory independent-host/AZ fault exercise not executed by this same-host harness',
                   'Synthetic command workload; HTTP command throughput and production capacity unmeasured',
@@ -1550,12 +1788,41 @@ class Harness:
                 limits.append('Mandatory ' + description + ' has no passing execution evidence')
         if self.args.tier != 'full':
             limits.append('Smoke tier does not establish the 90,000-event/1,800-second/50-per-second capacity target')
-        report = {'passed': error is None and all(case.get('passed') for case in self.cases),
+        reconciliation = final_state.get('reconciliation', {})
+        reconciliation_complete = (bool(reconciliation)
+            and not reconciliation['mismatches']
+            and reconciliation['dedupe_count'] == 2 * final_state['actual_inventory_outbox_count']
+            and reconciliation['notification_count'] == reconciliation['expected_notification_count'])
+        generation_complete = (all(batch['status'] == 'succeeded' for batch in generation['batches'])
+            and generation['totals']['requested'] == generation['totals']['committed']
+            == generation['totals']['identified_events']
+            and not getattr(self, '_generation_accounting_error', None))
+        final_complete = (final_state['database_observed'] and final_state['offsets_observed']
+            and not final_state['errors'] and not final_state['unpublished_count']
+            and reconciliation_complete and generation_complete
+            and not final_state['processed_hash_conflicts']
+            and all(not consumer['incomplete_count'] for consumer in final_state['consumers'].values())
+            and not final_state['event_log_ids_missing_from_database']
+            and not final_state['actual_committed_ids_missing_from_event_log']
+            and not final_state['journal_committed_movements_missing_from_database']
+            and not final_state['database_committed_movements_missing_from_journal']
+            and not final_state['journal_identified_events_missing_from_database'])
+        fault_targets_passed = all(any(case.get('name') == name and case.get('passed') and
+            case.get('workload_qualification', {}).get('capacity_qualified') for case in self.cases)
+            for name in ('analytics_outage', 'one_broker_stop', 'quorum_loss', 'cluster_outage'))
+        report = {'passed': error is None and all(case.get('passed') for case in self.cases) and final_complete,
             'run_id': self.args.run_id, 'unique_generated_events': len(self.events),
             'acceptance_tier': self.args.tier, 'production_ready': False,
             'full_workload_requested': self.args.tier == 'full',
-            'full_workload_targets_passed': self.args.tier == 'full' and 'steady' in passing_cases,
-            'steady_inventory_inputs_committed': sum(item['scenario'] == 'steady' for item in self.events),
+            'full_workload_targets_passed': self.args.tier == 'full' and 'steady' in passing_cases and fault_targets_passed,
+            'requested_numeric_profile': generation['requested_numeric_profile'],
+            'generation_accounting': generation, 'final_inventory_state': final_state,
+            'generation_accounting_complete': generation_complete,
+            'generation_accounting_error_type': getattr(self, '_generation_accounting_error', None),
+            'final_reconciliation_complete': reconciliation_complete,
+            'final_inventory_complete': final_complete, 'delivery_proofs': self.delivery_proofs,
+            'steady_inventory_inputs_committed': sum(batch['committed'] for batch in generation['batches']
+                                                      if batch['label'] == 'steady'),
             'elapsed_seconds': time.time() - self.started_at, 'cases': self.cases,
             'error_type': type(error).__name__ if error else None,
             'error': str(error) if error else None,
@@ -1583,6 +1850,7 @@ class Harness:
         (self.evidence / 'summary.md').write_text('\n'.join(lines) + '\n')
         print(json.dumps({'passed': report['passed'], 'evidence_dir': str(self.evidence),
                           'cases_completed': len(self.cases), 'error_type': report['error_type']}), flush=True)
+        return report
 
 
 def main():
@@ -1625,21 +1893,44 @@ def main():
         for name, minimum in minimums.items():
             if getattr(args, name) < minimum:
                 p.error(f'--tier full requires --{name.replace("_", "-")} >= {minimum}')
+        if args.drain_timeout != 900:
+            p.error('--tier full requires exactly --drain-timeout 900')
+        if args.duplicate_events > args.events:
+            p.error('--tier full requires --duplicate-events <= --events; the requested denominator cannot be reduced')
     args.generated_dir = args.generated_dir.resolve()
     args.evidence_dir = args.evidence_dir.resolve()
-    load_environment(args.generated_dir / 'client.env')
-    for key in list(os.environ):
-        if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':
-            os.environ.pop(key)
-    harness = Harness(args)
+    from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
+    generation = GenerationJournal(args.evidence_dir, args.run_id, numeric_profile(args))
+    harness = None
     error = None
     try:
+        load_environment(args.generated_dir / 'client.env')
+        for key in list(os.environ):
+            if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':
+                os.environ.pop(key)
+        harness = Harness(args, generation=generation)
         harness.run()
     except BaseException as exc:
         error = exc
         raise
     finally:
-        harness.finish(error)
+        try:
+            if harness is not None:
+                report = harness.finish(error)
+                if error is None and not report['passed']:
+                    raise AssertionError('Final durable accounting or reconciliation did not qualify; inspect report.json')
+            else:
+                generation.finalize()
+                write_json(args.evidence_dir / 'startup-failure.json', {
+                    'passed': False, 'error_type': type(error).__name__ if error else None,
+                    'stage': 'environment_or_harness_setup', 'requested_numeric_profile': generation.profile,
+                    'generation': generation.summary(), 'database_state_observed': False})
+        except BaseException as finalization_error:
+            if error is None:
+                raise
+            # Preserve the original failure if evidence collection itself fails.
+            print(json.dumps({'passed': False, 'evidence_finalization_error_type':
+                type(finalization_error).__name__}), flush=True)
 
 
 if __name__ == '__main__':

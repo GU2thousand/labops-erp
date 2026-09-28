@@ -203,29 +203,107 @@ class _RecoveryMatrix:
 
     def _alter_topic(self, topic, config):
         self._assert_topic(topic)
-        from confluent_kafka.admin import ConfigResource, ResourceType
+        from confluent_kafka.admin import AlterConfigOpType, ConfigEntry, ConfigResource, ResourceType
         from infra.events.admin import topic_value_matches
-        # Set the complete known configuration of this freshly created topic;
-        # no production or internal topic ever reaches this helper.
-        resource = ConfigResource(ResourceType.TOPIC, topic, set_config=config)
-        self.last_kafka_operation = {'step': 'alter_topic_config', 'topic': topic, 'config': dict(config)}
-        self.admin.alter_configs([resource], request_timeout=20)[resource].result(timeout=25)
-        self.last_kafka_operation = {'step': 'verify_topic_config', 'topic': topic, 'config': dict(config)}
-        observed = self.admin.describe_configs([ConfigResource(ResourceType.TOPIC, topic)],
-                                               request_timeout=20)
-        values = next(iter(observed.values())).result(timeout=25)
-        for name, expected in config.items():
-            assert topic_value_matches(name, expected, values[name].value), 'Sacrificial topic configuration did not apply: ' + name
+        # v26.2.2 AlterConfigs rejects even write.caching=false when the
+        # cluster default is disabled. CreateTopics accepts false separately.
+        # Only retention changes here; incremental SET preserves every other
+        # override and avoids submitting the immutable caching invariant.
+        # https://github.com/redpanda-data/redpanda/blob/v26.2.2/src/v/kafka/server/handlers/configs/config_utils.h#L185-L207
+        # https://github.com/redpanda-data/redpanda/blob/v26.2.2/src/v/kafka/server/handlers/incremental_alter_configs.cc#L230-L233
+        assert set(config) == {'cleanup.policy', 'compression.type', 'retention.ms',
+                               'segment.bytes', 'write.caching'}, 'Unexpected retention topic configuration'
+        operation = {'api': 'incremental_alter_configs', 'topic': topic, 'config': dict(config)}
 
-    def _watermarks(self, topic):
+        def describe():
+            resource = ConfigResource(ResourceType.TOPIC, topic)
+            values = self.admin.describe_configs([resource], request_timeout=20)[resource].result(timeout=25)
+            for name in config:
+                assert name in values, 'Sacrificial topic configuration is missing: ' + name
+            # Only the declared, non-secret topic properties enter evidence.
+            return {name: values[name].value for name in config}
+
+        self.last_kafka_operation = {'step': 'describe_topic_config_before_alter', **operation}
+        before = describe()
+        operation['observed_before'] = before
+        self.last_kafka_operation = {'step': 'verify_topic_config_before_alter', **operation}
+        for name, expected in config.items():
+            if name != 'retention.ms':
+                assert topic_value_matches(name, expected, before[name]), 'Sacrificial topic invariant changed before retention update: ' + name
+
+        updates = ({'retention.ms': config['retention.ms']}
+                   if not topic_value_matches('retention.ms', config['retention.ms'], before['retention.ms'])
+                   else {})
+        operation['updates'] = updates
+        if updates:
+            resource = ConfigResource(ResourceType.TOPIC, topic, incremental_configs=[
+                ConfigEntry(name, value, incremental_operation=AlterConfigOpType.SET)
+                for name, value in updates.items()])
+            self.last_kafka_operation = {'step': 'alter_topic_config', **operation}
+            self.admin.incremental_alter_configs([resource], request_timeout=20)[resource].result(timeout=25)
+        self.last_kafka_operation = {'step': 'verify_topic_config', **operation}
+        after = describe()
+        operation['observed_after'] = after
+        self.last_kafka_operation = {'step': 'verify_topic_config', **operation}
+        for name, expected in config.items():
+            assert topic_value_matches(name, expected, after[name]), 'Sacrificial topic configuration did not apply: ' + name
+        return operation
+
+    def _watermarks(self, topic, *, timeout=10):
         self._assert_topic(topic)
         from confluent_kafka import Consumer, TopicPartition
+        deadline = time.monotonic() + timeout
         client = Consumer(self._consumer_config(f'labops.{self.run_id}.recovery.inspect'))
         try:
-            low, high = client.get_watermark_offsets(TopicPartition(topic, 0), timeout=10, cached=False)
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, 'Sacrificial watermark query budget expired before request'
+            low, high = client.get_watermark_offsets(TopicPartition(topic, 0), timeout=remaining, cached=False)
             return {'low': low, 'high': high}
         finally:
             client.close()
+
+    def _wait_retention_cleanup(self, topic, last_original_offset):
+        """Require an observed policy cleanup within the frozen 75-second gate."""
+        self._assert_topic(topic)
+        started = time.monotonic()
+        deadline = started + 75
+        report = {'topic': topic, 'wait_seconds': 75,
+                  'last_original_offset': last_original_offset,
+                  'policy_cleanup_observed': False, 'watermark_samples': []}
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    report['elapsed_seconds'] = time.monotonic() - started
+                    break
+                query_timeout = min(10, remaining)
+                observed = self._watermarks(topic, timeout=query_timeout)
+                elapsed = time.monotonic() - started
+                within_deadline = elapsed <= 75
+                report['elapsed_seconds'] = elapsed
+                report['watermark_samples'].append({
+                    'elapsed_seconds': elapsed, 'query_timeout_seconds': query_timeout,
+                    'within_deadline': within_deadline, **observed})
+                # A late native response must remain evidence of a failed
+                # deadline even when it finally reports a cleaned watermark.
+                if within_deadline and observed['low'] > last_original_offset:
+                    report['policy_cleanup_observed'] = True
+                    break
+                if elapsed >= 75:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(1, remaining))
+        except Exception as exc:
+            report.update({'error_type': type(exc).__name__,
+                           'elapsed_seconds': time.monotonic() - started,
+                           **_kafka_diagnostics(exc)})
+            raise
+        finally:
+            # Preserve the raw deadline decision before fallback deletion or
+            # later recovery probes can fail. No broker exception text enters.
+            _write_json(self.h.evidence / 'retention-policy.json', report)
+        return report
 
     def _read_at(self, topic, offset):
         self._assert_topic(topic)
@@ -477,19 +555,12 @@ class _RecoveryMatrix:
         filler_records = [self._publish(scope['topic'], filler, key=f'segment-filler-{number}')
                           for number in range(6)]
         config['retention.ms'] = '1000'
-        self._alter_topic(scope['topic'], config)
-        samples = []
-        started = time.monotonic()
-        policy_cleanup = False
+        retention_config_changes = [self._alter_topic(scope['topic'], config)]
         last_original_offset = max(record['offset'] for record in records)
-        while time.monotonic() - started < 75:
-            observed = self._watermarks(scope['topic'])
-            samples.append({'elapsed_seconds': time.monotonic() - started, **observed})
-            if observed['low'] > last_original_offset:
-                policy_cleanup = True
-                break
-            time.sleep(1)
-        policy_wait_seconds = time.monotonic() - started
+        policy_evidence = self._wait_retention_cleanup(scope['topic'], last_original_offset)
+        samples = policy_evidence['watermark_samples']
+        policy_cleanup = policy_evidence['policy_cleanup_observed']
+        policy_wait_seconds = policy_evidence['elapsed_seconds']
         method = 'broker_retention_policy_cleanup' if policy_cleanup else 'retention exhaustion simulation'
         limits = []
         fallback = None
@@ -507,7 +578,7 @@ class _RecoveryMatrix:
         filler_cleanup = (self._purge(scope['topic'], exhausted['high'])
                           if exhausted['low'] < exhausted['high'] else None)
         config['retention.ms'] = '-1'
-        self._alter_topic(scope['topic'], config)
+        retention_config_changes.append(self._alter_topic(scope['topic'], config))
         baseline = h.snapshot(copied_ids)
         assert not baseline['mismatches']
         legal_before = self._fingerprints(h.env['DATABASE_URL'], ('stockmovement', 'stockmovementline', 'stockbalance'))
@@ -549,6 +620,8 @@ class _RecoveryMatrix:
         assert not h.snapshot(future_ids)['mismatches']
         return {'name': CASE_NAMES[1], 'passed': policy_cleanup, 'topic': scope['topic'],
                 'source_identity': scope, 'retention_configuration': {'retention.ms': '1000', 'segment.bytes': '1048576'},
+                'retention_config_changes': retention_config_changes,
+                'retention_policy_evidence': policy_evidence,
                 'policy_cleanup_observed': policy_cleanup, 'exhaustion_method': method,
                 'retention_wait_seconds': policy_wait_seconds,
                 'copied_original_event_ids': copied_ids, 'copied_original_records': records,

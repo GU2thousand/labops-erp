@@ -39,6 +39,53 @@ duration and one crash repetition); manual full inputs request 90,000 events,
 requesting full inputs does not prove every broker/consumer outage lasted the
 plan's five/ten minutes or every acceptance scenario was executed.
 
+Full mode requires `--drain-timeout 900` exactly; a larger timeout does not qualify
+the frozen recovery target. It also requires the requested duplicate-event count
+to be no greater than the steady-event count. Reject an impossible full duplicate
+request rather than reducing its denominator to the available IDs.
+
+Full mode defaults to one shared fault input of `N=30,000` committed inventory
+events at 50 events/s for each applicable broker/analytics outage scenario. An
+explicit larger shared `N` is allowed only when frozen before the run; full mode
+requires `N >= 30,000` and does not lower any input denominator. The nominal
+generation window is `N/50` seconds, or 600 seconds at the default. The
+single-broker argument of 300 seconds is
+a **requested minimum**, not an exact five-minute outage: generating that entire
+shared batch while the broker is stopped normally makes the measured outage
+approximately 600 seconds plus command/probe/observation overhead. Record both
+the requested minimum and measured actual outage, with their clock boundaries.
+Do not report an exact five-minute result or quietly reduce the 30,000-event
+denominator to fit the shorter requested hold.
+
+The full fault generation workload has the same frozen 5% window qualification
+as steady generation; it must not silently become a much slower test with the
+same successful event count. Report requested/committed/observed input counts,
+configured rate, measured generation elapsed time, actual command rate and
+schedule lateness for every fault batch. The full qualification requires:
+
+- Requested input, reported input, completed commands and observed input count
+  all equal the frozen `N`; configured/reported target rate is exactly 50/s.
+- Finite, positive generation elapsed time no greater than `1.05*N/50`; reported
+  lateness agrees with `max(0, elapsed-N/50)` and is no greater than `0.05*N/50`.
+- Reported actual command rate agrees with `N/elapsed` and is between
+  `50/1.05` (approximately 47.619/s) and the separately frozen upper bound 52.5/s.
+- Requested minimum outage and measured actual outage are finite and retained
+  independently; actual outage must be at least the greater of its requested
+  minimum and measured generation elapsed time. The requested minimum is not an
+  extra hold added after generation.
+
+At the default 30,000 inputs the generation window is at most 630 seconds and
+lateness at most 30 seconds. These thresholds are frozen before execution, not
+adjusted after a failing observation. A reduced smoke batch must still report
+finite, internally consistent measurements and its exact requested count, but
+its qualification is `SMOKE_CAPACITY_UNQUALIFIED` with
+`capacity_qualified=false`; it does not pass the full capacity gate. Full evidence
+records `FULL_CAPACITY_QUALIFIED` or `FULL_CAPACITY_FAILED`, with every check,
+failure code and malformed/nonfinite value retained in JSON-safe form. Four
+floating-point ULPs at the operand scale cover representation equality at a
+numeric boundary; they do not add a timing or percentage allowance. Changing
+frozen inputs or qualification requires a separately identified run.
+
 Both CI tiers explicitly freeze `EVENT_RETRY_SECONDS=15,30` followed by twenty-two
 `60`-second delays, with deterministic jitter from the base through 20% above it,
 before any worker starts. Broker outage recovery waits for these durable due
@@ -65,7 +112,7 @@ attempts, committed commands, broker records, effects, errors and unfinished wor
 | Duplicate delivery | 10,000 IDs republished twice, 20,000 duplicate records | Zero additional effects, original hash/ID retained |
 | Publisher failures | Ack-before/ack-after-writeback, lease expiry, stale owner recovery, each 20 | No lost outbox; zero stale successful writeback; zero extra consumer effects |
 | Consumer failures | Both consumers, before DB commit/after commit-before offset, each 20 | Same source redelivery; zero duplicated effects; no offset past unpersisted boundary |
-| Broker failures | RF3, one broker down 5min; separate quorum loss | No acknowledged-record loss; no false publish success without quorum; durable outbox |
+| Broker failures | RF3, requested single-broker minimum 5min; shared full input 30,000 at 50/s extends actual outage to approximately 10min plus overhead; separate quorum loss | Requested minimum and actual window recorded separately; no acknowledged-record loss; no false publish success without quorum; durable outbox |
 | Analytics pause | 10min while 50/s, 30,000 target inputs | Notification independent; drain <=15min after return; zero reconciliation mismatch |
 | All-broker pause | 10min while 50/s, 30,000 target inputs | Business commit denominator retained; audited requeue if needed; drain <=15min |
 | PostgreSQL failure | Business commit, consumer effect and FailedDelivery persistence boundaries | Atomic rollback/commit; offset not advanced when failure cannot persist |
@@ -73,6 +120,44 @@ attempts, committed commands, broker records, effects, errors and unfinished wor
 | Security negative | Anonymous, password, CA, foreign group/topic, write/create | All denied; outbox retained; no secret exposure |
 | Rebalance/shutdown | Same group 1->3->1, SIGTERM/lost, each 20 | No permanent lost work/extra effects; bounded recorded close/commit behavior |
 | Restore/retention | Isolated DB/config/offset restore, expired history, same-name topic recreation | Legal ledger/projection zero mismatch; original-ID replay; actual RPO/RTO/lost history |
+
+The full analytics catch-up budget is 900 seconds and starts immediately **before**
+starting the replacement analytics consumer, so process startup/group recovery
+and effect drain consume that same window. Its final blocking database
+predicate must finish within that same frozen window: starting a count/query
+before the deadline and obtaining a successful answer after it is a failure.
+Measure completion after the predicate returns, retain the window start and
+actual elapsed time, and keep unfinished work in the denominator. Broker recovery
+likewise includes network/cluster-health recovery from the recorded process-start
+boundary rather than granting a fresh drain budget after health polling.
+
+## Duplicate and exporter proof boundaries
+
+The duplicate drill publishes two **new broker records** for every selected
+original event and retains each producer acknowledgement's source/topic/partition/
+offset. Both notification and analytics must demonstrate the two exact new
+acknowledged coordinates for every event; the original delivery or repeated log
+observations of one coordinate cannot substitute for a new duplicate record.
+Delivery proof binds the configured source cluster/generation and main inventory
+topic. The total distinct-coordinate coverage includes the original delivery
+plus both new publications for each event/consumer pair.
+
+Receipt proof and committed-offset proof share one frozen 180-second observation
+window after duplicate publication. Each consumer group's committed **next**
+offset must be strictly greater than every new acknowledged offset on its relevant
+partition. Count a proof only after its final blocking request completes inside
+the remaining original window. Take the zero-extra-effects comparison only after
+both proofs pass; compare notification/dedupe counts and hashes and projection
+hash against the pre-duplicate snapshot. Receipt alone or a count unchanged before
+offset completion does not establish that both duplicates were safely processed.
+
+Exporter coverage uses this run's exact notification and analytics group IDs and
+main inventory topic: two groups times partitions `0`, `1`, `2`, giving six
+required finite, nonnegative lag samples. Another run's groups, the DLQ topic,
+missing partitions, duplicate required coordinates, NaN/Infinity or malformed
+exposition cannot satisfy the gate. Preserve accepted raw sample lines and
+ignored/total sample denominators alongside broker count and RF3 replica checks.
+Six lag samples, even all zero, do not replace durable RETRY/DEAD or effect checks.
 
 Application-oversize messages below broker max should reach consumer isolation.
 Broker-oversize rejection is producer evidence and cannot be counted as a consumer
@@ -85,23 +170,80 @@ For each run write a new unique directory and preserve failures as well as passe
 
 ```text
 evidence/<run-id>/
+  requested-profile.json   # exclusively created numeric request before env/setup
+  generation-journal.jsonl # incrementally flushed attempts/commit/ID transitions
+  generation-summary.json # requested/attempted/committed/failure/pending totals
+  startup-failure.json     # conditional env/setup failure and unobserved DB state
   manifest.json            # commit/images/runtime/host/config hashes/scope
+  harness-manifest.json    # tier/retry policy/runtime identities
   workload.json            # seed/schema hash/payload samples/input/fault schedule
   events.jsonl             # original IDs/timestamps/source/effects/outcomes
   errors.jsonl             # every failure/timeout/parked/uncompleted observation
+  duplicate-requests.json
+  duplicate-publications.jsonl
+  duplicate-offset-observations.jsonl
+  delivery-proof-*.json    # required IDs/source/new ACK coordinates, pass or fail
+  *-workload-qualification.json
+  *-recovery-window.json
   offsets-before.json
   offsets-after.json
   reconciliation.json      # ledger/balance/projection/notification/dedupe counts/hashes
+  final-outbox-state.json  # actual isolated DB rows/status/hash/lease; if observed
+  final-processed-state.json
+  final-inventory-state.json # observed flags, incomplete IDs, accounting conflicts
+  final-offsets.json       # best-effort final durable cursors, even on failure
+  final-reconciliation.json
   latency.csv              # raw timestamps and incomplete markers
+  report.json              # FAIL stays fail; production_ready=false
   metrics/
+    exporter-observations.jsonl
+    exporter-accepted.prom
+    exporter-lag-coverage.json
   logs/
   summary.md               # thresholds/raw denominators/results/limits/restore range
 ```
+
+The numeric requested profile is exclusively created and fsynced after CLI
+validation but **before** loading the generated environment or constructing the
+harness. A startup failure therefore retains its original request and marks the
+database as unobserved. Never derive requested counts from `events.jsonl`, completed
+effects or whichever scenarios happened to run.
+
+For each generation batch, record requested and attempted counts before the
+outer business transaction; record committed movement identity immediately after
+the transaction returns, before timestamp/outbox/event-log observation. Record
+the original event identity separately when observed. Preserve failures before
+commit, post-commit observation failures, identified events, unattempted commands,
+pending commits and pending observations. A commit journal transition is flushed
+and fsynced, but the filesystem journal and PostgreSQL are not atomic; an exit or
+filesystem failure between them requires final database reconciliation.
+
+On both success and failure, stop supervised workers and attempt to export actual
+outbox/processed rows, per-consumer incomplete IDs, committed offsets and
+ledger/balance/projection/notification reconciliation. Reconcile actual committed
+IDs/movements against both the journal and event log, retaining missing/conflicting
+sets. A failed database/offset/reconciliation query is **unknown/unobserved** with
+its safe error classification; it never becomes zero pending work, zero loss or
+a passing denominator. Partial generation and secondary evidence errors remain
+visible. A failing `report.json` causes a nonzero CLI exit even when no earlier
+scenario raised. If finalization fails while another exception is already active,
+preserve the original exception rather than replace it with the collection error.
 
 Artifact name/run ID and hashes identify retained output; immutable publication
 storage must be selected by the deployment operator. Secret JSON, env files,
 passwords, private keys and unrestricted payload dumps do not belong in shared
 Actions artifacts. Preserve authorized original poison evidence separately.
+
+The journal/profile store only allowlisted numeric parameters, authored scenario
+codes, original UUIDs and exception class names; they exclude raw business payload,
+connection strings, environment values and credentials. Final state exports keep
+IDs/status/checksums instead of payload/recipient dumps. The collector masks known
+generated credentials in text artifacts, including worker logs/failure summaries,
+before upload; review collection errors and redaction outcomes before sharing.
+Secret maps, generated env files, tokens and private keys remain excluded. An
+isolated synthetic database dump still contains users, outbox and notification
+data and requires restricted artifact access; text credential masking does not
+make such a binary backup safe for public publication.
 
 The final acceptance report must name every failed/unexecuted gate and distinguish
 current runs from historical evidence. Only after mandatory implementation **and**
