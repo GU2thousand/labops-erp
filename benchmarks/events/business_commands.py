@@ -94,6 +94,12 @@ class BusinessExecutionError(RuntimeError):
 class InventoryProcessWorker:
     """One fresh Django-only client's context, journal and owning connection."""
     def __init__(self, lane, bootstrap):
+        from benchmarks.events.diagnostic_profile import request_profile
+        diagnostic_profile_enabled = bootstrap.get('diagnostic_profile_enabled', False)
+        diagnostic_profile_engine = bootstrap.get('diagnostic_profile_engine', 'cprofile')
+        request_profile(diagnostic_profile_enabled, diagnostic_profile_engine)
+        if diagnostic_profile_engine != bootstrap['profile'].get('diagnostic_profile_engine', 'cprofile'):
+            raise ValueError('Child diagnostic engine differs from frozen requested profile')
         import django
         os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
         os.environ['WORKER_METRICS_ENABLED'] = '0'
@@ -114,7 +120,8 @@ class InventoryProcessWorker:
         self._failure = None
         self.state = {'attempt': None, 'stage': 'initialization'}
         self.runtime_diagnostics_enabled = bootstrap['runtime_diagnostics_enabled']
-        self.diagnostic_profile_enabled = bootstrap.get('diagnostic_profile_enabled', False)
+        self.diagnostic_profile_enabled = diagnostic_profile_enabled
+        self.diagnostic_profile_engine = diagnostic_profile_engine
         self.cpu_profile = None
         self.models, self.api, self.services = models, events, services
         self.connections = connections
@@ -176,7 +183,7 @@ class InventoryProcessWorker:
         if self.diagnostic_profile_enabled:
             from benchmarks.events.diagnostic_profile import CPUProfile
             from labops.purchasing import services as purchasing
-            self.cpu_profile = CPUProfile('generator', lane=lane)
+            self.cpu_profile = CPUProfile('generator', lane=lane, engine=self.diagnostic_profile_engine)
             self.cpu_profile.hook(purchasing, 'create_receipt', 'receipt_create', expected=purchasing.create_receipt)
             self.cpu_profile.hook(services, 'post_receipt', 'receipt_post', expected=services.post_receipt)
             for name in ('commit_generated_movement', 'identify_generated_event', 'record_generated_event'):
@@ -218,6 +225,10 @@ class InventoryProcessWorker:
         from contextlib import nullcontext
         profiled = self.cpu_profile.call('generator_command', global_index) if self.cpu_profile else nullcontext()
         def invoke():
+            if self.cpu_profile and self.cpu_profile.engine == 'python-profile-owned':
+                return self.cpu_profile.run('generator_command', global_index, execute_inventory_command,
+                    self, global_index, self.plan['label'], self.batch, self.state, self.data,
+                    lane=self.lane, scheduled_at=target_monotonic)
             with profiled:
                 return execute_inventory_command(self, global_index, self.plan['label'],
                     self.batch, self.state, self.data, lane=self.lane, scheduled_at=target_monotonic)

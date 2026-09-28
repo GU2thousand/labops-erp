@@ -503,6 +503,25 @@ class DiagnosticProfileHarnessControls(SimpleTestCase):
     def harness(self):
         return accounting.HarnessGenerationAccountingTests.harness(self)
 
+    def test_default_numeric_profile_preserves_existing_frozen_shape_and_explicit_engine_roundtrip(self):
+        expected = dict(events=4, rate=50, duration=0, fault_repetitions=1,
+            fault_events=1, duplicate_events=1, poison_events=12,
+            broker_fault_seconds=1, outage_seconds=1, consumer_outage_seconds=1,
+            drain_timeout=900, runtime_diagnostics_enabled=False,
+            diagnostic_profile_enabled=False)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                default = dict(expected, diagnostic_profile_enabled=enabled)
+                self.assertEqual(numeric_profile(args(Path('/unused'), diagnostic_profile=enabled)), default)
+                self.assertEqual(numeric_profile(args(Path('/unused'), diagnostic_profile=enabled,
+                    diagnostic_profile_engine='cprofile')), default)
+                self.assertEqual(numeric_profile(default), default)
+        explicit = dict(expected, diagnostic_profile_enabled=True,
+            diagnostic_profile_engine='python-profile-owned')
+        self.assertEqual(numeric_profile(args(Path('/unused'), diagnostic_profile=True,
+            diagnostic_profile_engine='python-profile-owned')), explicit)
+        self.assertEqual(numeric_profile(explicit), explicit)
+
     def test_independent_boolean_frozen_before_setup_and_invalid_nonboolean_rejected(self):
         with TemporaryDirectory() as name:
             directory = Path(name)
@@ -567,9 +586,11 @@ class DiagnosticProfileHarnessControls(SimpleTestCase):
                 'scope': 'harness setup failed before generation'})
 
     def test_private_spawn_bootstrap_copies_the_independent_request_without_production_changes(self):
-        with patch.object(accounting, 'args', side_effect=lambda directory: args(directory, diagnostic_profile=True)):
+        with patch.object(accounting, 'args', side_effect=lambda directory: args(directory,
+                diagnostic_profile=True, diagnostic_profile_engine='python-profile-owned')):
             h = self.harness()
         h.diagnostic_profile_enabled = True
+        h.diagnostic_profile_engine = 'python-profile-owned'
         h.process_generation_enabled = True
         h._next_command_index = 0
         from uuid import uuid4
@@ -597,11 +618,13 @@ class DiagnosticProfileHarnessControls(SimpleTestCase):
                 h._generate_processes(16, 'steady', rate=h.args.rate)
         self.assertIs(raised.exception, original)
         self.assertTrue(captured['diagnostic_profile_enabled'])
+        self.assertEqual(captured['diagnostic_profile_engine'], 'python-profile-owned')
         self.assertFalse(captured['runtime_diagnostics_enabled'])
         self.assertEqual(captured['database_config']['PASSWORD'], 'PRIVATE_PASSWORD')
         self.assertEqual([len(plan['indices']) for plan in captured['plans']], [4, 4, 4, 4])
         self.assertEqual(captured['runtime_settings']['EVENT_TRANSPORT'], 'kafka')
         self.assertTrue(captured['profile']['diagnostic_profile_enabled'])
+        self.assertEqual(captured['profile']['diagnostic_profile_engine'], 'python-profile-owned')
         for path in h.evidence.rglob('*.json'):
             self.assertNotIn('PRIVATE_PASSWORD', path.read_text())
 
@@ -637,12 +660,16 @@ class DiagnosticProfileHarnessControls(SimpleTestCase):
             directory.mkdir()
             indices = [lane * 4, lane * 4 + 1]
             plans.append({'directory': str(directory), 'lane': lane, 'indices': indices})
-            value = {'qualification_admissible': False, 'calls': [{'ordinal': i} for i in indices],
+            value = {'qualification_admissible': False, 'engine': 'cprofile', 'caller_schema': 'timed',
+                'function_graph_status': 'COMPLETE', 'functions': [{'id': 'fixture', 'callers': []}],
+                'calls': [{'ordinal': i} for i in indices],
                 'coverage': {'role': 'generator', 'lane': lane, 'complete': True,
                     'requested_calls': 2, 'profiled_calls': 2}}
             (directory / 'diagnostic-profile.json').write_text(json.dumps(value))
         h.process_batches = [{'origin_plans': plans}]
         h.publisher_profile_paths[0].write_text(json.dumps({'qualification_admissible': False,
+            'engine': 'cprofile', 'caller_schema': 'timed', 'function_graph_status': 'COMPLETE',
+            'functions': [{'id': 'fixture', 'callers': []}],
             'calls': [{'ordinal': None}], 'coverage': {'role': 'publisher', 'lane': None,
                 'complete': True, 'requested_calls': 1, 'profiled_calls': 1}}))
         self.assertTrue(h.diagnostic_profile_evidence()['complete'])
@@ -1069,3 +1096,544 @@ class PublisherProfileControlTests(SimpleTestCase):
                 self.assertEqual(Counter(name for name, _args, _kwargs in probe.calls)['send'], 2)
                 self.assertTrue(all(row['complete'] and row['wall_ns'] >= 0 and row['thread_cpu_ns'] >= 0
                                     for row in value['phases']))
+
+    def test_explicit_python_publisher_callable_preserves_all_pinned_hooks_and_ordinals(self):
+        with self.callbacks() as (probe, originals), TemporaryDirectory() as directory:
+            owner = PublisherShardOwner.__new__(PublisherShardOwner)
+            calls = []
+            def management(*args, **kwargs):
+                calls.append((args, kwargs))
+                for _ in range(3):
+                    with publisher_command.database_statement_budget(2.5):
+                        self.assertIs(publisher_command.publish_one(object(), shard_index=0, shard_count=1,
+                            ownership_check=owner.assert_owned), probe.publish_result)
+                publisher_metrics.StopController.wait(object(), .125)
+                return probe.publish_result
+            output = Path(directory) / 'publisher-profile-fixture.json'
+            self.assertIs(run_publisher(output, {'limit': 3}, call_command=management,
+                          engine='python-profile-owned'), probe.publish_result)
+            value = json.loads(output.read_text())
+            self.assert_restored(originals)
+        self.assertEqual(calls, [(('publish_events',), {'limit': 3})])
+        self.assertTrue(value['coverage']['complete'])
+        self.assertEqual(value['coverage']['profiled_calls'], 1)
+        self.assertEqual(value['engine'], 'python-profile-owned')
+        self.assertEqual(value['caller_schema'], 'count_only')
+        self.assertEqual([row['ordinal'] for row in value['phases']
+                          if row['phase'] == 'publish_one_composite'], [1, 2, 3])
+        self.assertEqual(Counter(name for name, _args, _kwargs in probe.calls)['send'], 3)
+        self.assertTrue(value['functions'])
+        self.assertFalse(value['qualification_admissible'])
+        self.assertIsNone(sys.getprofile())
+
+    def test_python_publisher_final_error_sink_controls_respect_only_a_known_body_primary(self):
+        for business_failure in (None, KeyboardInterrupt('PRIVATE business primary')):
+            with self.subTest(business_failure=business_failure is not None):
+                profile = CPUProfile('publisher', engine='python-profile-owned')
+                control, calls = SystemExit('PRIVATE final sink control'), []
+                def management(*args, **kwargs):
+                    calls.append('entered')
+                    if business_failure is not None:
+                        raise business_failure
+                    return 17
+                with patch('benchmarks.events.profile_publisher.install_publisher_hooks'), \
+                     patch.object(profile, 'close', side_effect=OSError('PRIVATE ordinary close')), \
+                     patch.object(profile, 'error', side_effect=control), redirect_stderr(io.StringIO()):
+                    expected = business_failure if business_failure is not None else control
+                    with self.assertRaises(type(expected)) as raised:
+                        run_publisher(Path('/not-written/publisher-profile-000.json'), {},
+                            call_command=management, profile_factory=lambda role: profile)
+                self.assertIs(raised.exception, expected)
+                self.assertEqual(calls, ['entered'])
+                self.assertIsNone(profile.primary_error)
+                self.assertIsNone(sys.getprofile())
+
+    def test_python_publisher_stderr_controls_propagate_without_replacing_known_body_error(self):
+        for business_failure in (None, KeyboardInterrupt('PRIVATE business primary')):
+            with self.subTest(business_failure=business_failure is not None), TemporaryDirectory() as directory:
+                calls, control = [], SystemExit('PRIVATE stderr control')
+                originals = [(target, name, getattr(target, name)) for target, name in self.bindings()]
+                def management(*args, **kwargs):
+                    calls.append('entered')
+                    if business_failure is not None:
+                        raise business_failure
+                    return 17
+                output = Path(directory) / 'publisher-profile-fixture.json'
+                with patch('benchmarks.events.diagnostic_profile.sanitized_stats', side_effect=OSError('PRIVATE export')), \
+                     patch('builtins.print', side_effect=control):
+                    expected = business_failure if business_failure is not None else control
+                    with self.assertRaises(type(expected)) as raised:
+                        run_publisher(output, {}, call_command=management, engine='python-profile-owned')
+                self.assertIs(raised.exception, expected)
+                self.assertEqual(calls, ['entered'])
+                self.assert_restored(originals)
+                self.assertFalse(json.loads(output.read_text())['coverage']['complete'])
+                self.assertIsNone(sys.getprofile())
+
+
+class PythonProfileControls(SimpleTestCase):
+    def recorder(self, role='generator', lane=0):
+        return CPUProfile(role, lane=lane if role == 'generator' else None, engine='python-profile-owned')
+
+    def temporary(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name)
+
+    def document(self, recorder):
+        path = self.temporary() / 'profile.json'
+        result = recorder.close(path)
+        self.assertTrue(result['persisted'])
+        return json.loads(path.read_text())
+
+    def test_actual_owned_callable_repeated_graph_excludes_background_and_keeps_phase_cpu(self):
+        recorder = self.recorder()
+        completed = []
+        def leaf():
+            return sum(index * index for index in range(120))
+        target = SimpleNamespace(action=leaf)
+        recorder.hook(target, 'action', 'receipt_create', expected=leaf)
+        expected = leaf()
+        def business():
+            self.assertIs(sys.getprofile(), recorder.profiler)
+            timer = threading.Timer(.001, lambda: completed.append(leaf()))
+            timer.start()
+            result = target.action()
+            with recorder.phase('receipt_post'):
+                time.sleep(.004)
+            timer.join(timeout=.1)
+            return result
+        for ordinal in (4, 8, 12):
+            self.assertEqual(recorder.run('generator_command', ordinal, business), expected)
+        self.assertEqual(completed, [expected] * 3)
+        value = self.document(recorder)
+        self.assertTrue(value['coverage']['complete'])
+        self.assertEqual(value['coverage']['profiled_calls'], 3)
+        self.assertEqual([row['ordinal'] for row in value['calls']], [4, 8, 12])
+        self.assertEqual(sum(row['total_calls'] for row in value['functions'] if row['function'] == 'leaf'), 3)
+        self.assertIs(target.action, leaf)
+        self.assertIn('repository/labops/tests/test_diagnostic_profile.py', value['repository_source_sha256'])
+        self.assertTrue(any(row['source'] == 'stdlib/threading.py' for row in value['functions']))
+        ids = {row['id'] for row in value['function_identities']}
+        for row in value['functions']:
+            self.assertGreaterEqual(row['self_cpu_seconds'], 0)
+            self.assertGreaterEqual(row['cumulative_cpu_seconds'], 0)
+            for caller in row['callers']:
+                self.assertIn(caller['caller_id'], ids)
+                self.assertIsNone(caller['primitive_calls'])
+                self.assertIsNone(caller['self_cpu_seconds'])
+                self.assertIsNone(caller['cumulative_cpu_seconds'])
+                self.assertEqual(caller['timing_status'], 'UNMEASURED')
+        sleeping = [row for row in value['phases'] if row['phase'] == 'receipt_post']
+        self.assertEqual(len(sleeping), 3)
+        self.assertTrue(all(row['wall_ns'] > row['thread_cpu_ns'] >= 0 for row in sleeping))
+        self.assertFalse(value['qualification_admissible'])
+        self.assertIsNone(sys.getprofile())
+
+    def test_count_only_sanitizer_keeps_privacy_and_rejects_fabricated_or_invalid_values(self):
+        one = ('/private/PRIVATE_DSN.py', 17, 'PRIVATE_TOKEN')
+        two = ('/other/PRIVATE_DSN.py', 17, 'PRIVATE_TOKEN')
+        stats = {one: (1, 2, .1, .2, {two: 2}), two: (1, 1, .1, .1, {})}
+        value = sanitized_stats(stats, engine='python-profile-owned')
+        self.assertNotIn('PRIVATE', json.dumps(value))
+        self.assertEqual(len(value['function_identities']), 2)
+        edge = next(row['callers'][0] for row in value['functions'] if row['callers'])
+        self.assertEqual(edge['total_calls'], 2)
+        self.assertIsNone(edge['primitive_calls'])
+        for invalid in (True, 1.0, -1, (1, 1, 0, 0)):
+            with self.subTest(invalid_type=type(invalid).__name__), self.assertRaises(ValueError):
+                sanitized_stats({one: (1, 1, 0, 0, {two: invalid})}, engine='python-profile-owned')
+        for invalid in (-.1, float('inf'), float('nan')):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                sanitized_stats({one: (1, 1, invalid, 0, {})}, engine='python-profile-owned')
+
+    def test_export_snapshot_does_not_read_a_later_timer_or_finalize_again(self):
+        recorder = self.recorder()
+        result = object()
+        self.assertIs(recorder.run('generator_command', 1, lambda: result), result)
+        with patch.object(recorder.profiler.engine, 'get_time', side_effect=AssertionError('Later CPU gap')), \
+             patch.object(recorder.profiler.engine, 'create_stats', side_effect=AssertionError('Second finalization')):
+            value = self.document(recorder)
+        self.assertTrue(value['coverage']['complete'])
+
+    def test_python_mode_context_misuse_stays_unavailable_and_runs_business_once(self):
+        recorder = self.recorder()
+        calls = []
+        with recorder.call('generator_command', 0):
+            calls.append('entered')
+        value = self.document(recorder)
+        self.assertEqual(calls, ['entered'])
+        self.assertFalse(value['coverage']['complete'])
+        self.assertEqual(value['coverage']['profiled_calls'], 0)
+        self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+
+    def test_constructor_and_prepare_ordinary_failures_run_business_once_with_phases(self):
+        with patch('profile.Profile', side_effect=OSError('PRIVATE constructor')):
+            recorder = self.recorder()
+        calls = []
+        self.assertEqual(recorder.run('generator_command', 0, lambda: calls.append(0) or 17), 17)
+        value = self.document(recorder)
+        self.assertEqual(calls, [0])
+        self.assertFalse(value['coverage']['complete'])
+        self.assertEqual(len(value['phases']), 1)
+        second = self.recorder()
+        with patch.object(second.profiler.engine, 'get_time', side_effect=OSError('PRIVATE prepare')):
+            self.assertEqual(second.run('generator_command', 1, lambda: calls.append(1) or 19), 19)
+        self.assertEqual(calls, [0, 1])
+        self.assertFalse(self.document(second)['coverage']['complete'])
+        self.assertIsNone(sys.getprofile())
+
+    def test_controls_in_constructor_prepare_dispatch_finalize_and_export_propagate_identity(self):
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            for stage in ('constructor', 'prepare', 'dispatch', 'finalize', 'export'):
+                with self.subTest(exception=exception_type.__name__, stage=stage):
+                    original = exception_type('PRIVATE control')
+                    calls = []
+                    def helper():
+                        return 9
+                    def body():
+                        calls.append('entered')
+                        return helper()
+                    if stage == 'constructor':
+                        with patch('profile.Profile', side_effect=original), self.assertRaises(exception_type) as raised:
+                            self.recorder()
+                    else:
+                        recorder = self.recorder()
+                        engine = recorder.profiler.engine
+                        if stage == 'dispatch':
+                            dispatch = engine.dispatcher
+                            def injected(frame, event, arg):
+                                if frame.f_code is helper.__code__ and event == 'call':
+                                    raise original
+                                return dispatch(frame, event, arg)
+                            engine.dispatcher = injected
+                            with self.assertRaises(exception_type) as raised:
+                                recorder.run('generator_command', 0, body)
+                        elif stage == 'export':
+                            recorder.run('generator_command', 0, body)
+                            with patch.object(engine, 'snapshot_stats', side_effect=original), self.assertRaises(exception_type) as raised:
+                                recorder.close(self.temporary() / 'profile.json')
+                        else:
+                            method = 'get_time' if stage == 'prepare' else 'create_stats'
+                            with patch.object(engine, method, side_effect=original), self.assertRaises(exception_type) as raised:
+                                recorder.run('generator_command', 0, body)
+                        self.assertTrue(recorder.graph_unavailable)
+                        self.assertFalse(recorder.summary()['complete'])
+                    self.assertIs(raised.exception, original)
+                    self.assertEqual(calls, [] if stage in {'constructor', 'prepare'} else ['entered'])
+                    self.assertIsNone(sys.getprofile())
+
+    def test_business_primary_and_broken_error_sink_survive_ordinary_callback_failure(self):
+        recorder = self.recorder()
+        original = RuntimeError('PRIVATE business')
+        calls = []
+        def helper():
+            return 9
+        def body():
+            calls.append('entered')
+            helper()
+            raise original
+        dispatch = recorder.profiler.engine.dispatcher
+        def injected(frame, event, arg):
+            if frame.f_code is helper.__code__ and event == 'call':
+                raise OSError('PRIVATE callback')
+            return dispatch(frame, event, arg)
+        recorder.profiler.engine.dispatcher = injected
+        with patch.object(recorder, 'error', side_effect=OSError('PRIVATE error sink')):
+            with self.assertRaises(RuntimeError) as raised:
+                recorder.run('generator_command', 0, body)
+            value = self.document(recorder)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(calls, ['entered'])
+        self.assertTrue(value['coverage']['recording_failed'])
+        self.assertFalse(value['coverage']['complete'])
+        self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+        self.assertNotIn('PRIVATE', json.dumps(value))
+        self.assertIsNone(sys.getprofile())
+
+    def test_business_base_exception_survives_ordinary_finalization_failure(self):
+        recorder = self.recorder()
+        original = KeyboardInterrupt('PRIVATE business')
+        calls = []
+        def business():
+            calls.append('entered')
+            raise original
+        with patch.object(recorder.profiler.engine, 'create_stats', side_effect=OSError('PRIVATE finalize')), \
+             patch.object(recorder, 'error', side_effect=SystemExit('PRIVATE secondary sink control')):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                recorder.run('generator_command', 0, business)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(calls, ['entered'])
+        self.assertFalse(self.document(recorder)['coverage']['complete'])
+        self.assertIsNone(sys.getprofile())
+
+    def test_new_error_sink_controls_propagate_after_owned_cleanup_without_a_known_primary(self):
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            for stage in ('prepare', 'dispatch'):
+                with self.subTest(exception=exception_type.__name__, stage=stage):
+                    recorder, calls = self.recorder(), []
+                    original = exception_type('PRIVATE sink control')
+                    def helper():
+                        return 9
+                    def body():
+                        calls.append('entered')
+                        return helper()
+                    engine = recorder.profiler.engine
+                    dispatch = engine.dispatcher
+                    if stage == 'dispatch':
+                        def injected(frame, event, arg):
+                            if frame.f_code is helper.__code__ and event == 'call':
+                                raise OSError('PRIVATE ordinary callback failure')
+                            return dispatch(frame, event, arg)
+                        engine.dispatcher = injected
+                    with patch.object(recorder, 'error', side_effect=original), ExitStack() as stack:
+                        if stage == 'prepare':
+                            stack.enter_context(patch.object(engine, 'get_time', side_effect=OSError('PRIVATE prepare')))
+                        with self.assertRaises(exception_type) as raised:
+                            recorder.run('generator_command', 0, body)
+                    self.assertIs(raised.exception, original)
+                    self.assertEqual(calls, [] if stage == 'prepare' else ['entered'])
+                    self.assertIsNone(sys.getprofile())
+                    value = self.document(recorder)
+                    self.assertTrue(value['coverage']['recording_failed'])
+                    self.assertFalse(value['coverage']['complete'])
+
+    def test_caught_phase_error_does_not_suppress_a_later_error_sink_control(self):
+        recorder, handled = self.recorder(), []
+        original = KeyboardInterrupt('PRIVATE later sink control')
+        def helper():
+            return 9
+        def business():
+            try:
+                with recorder.phase('receipt_create'):
+                    raise ValueError('PRIVATE handled phase error')
+            except ValueError:
+                handled.append('handled')
+            return helper()
+        dispatch = recorder.profiler.engine.dispatcher
+        def injected(frame, event, arg):
+            if frame.f_code is helper.__code__ and event == 'call':
+                raise OSError('PRIVATE ordinary callback failure')
+            return dispatch(frame, event, arg)
+        recorder.profiler.engine.dispatcher = injected
+        with patch.object(recorder, 'error', side_effect=original):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                recorder.run('generator_command', 0, business)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(handled, ['handled'])
+        self.assertIsNone(recorder.primary_error)
+        self.assertIsNone(recorder.profiler.primary_error)
+        self.assertIsNone(sys.getprofile())
+        self.assertFalse(self.document(recorder)['coverage']['complete'])
+
+    def test_immediate_callback_control_on_unwind_has_explicit_hidden_primary_limit(self):
+        recorder = self.recorder()
+        primary, control = RuntimeError('PRIVATE hidden primary'), SystemExit('PRIVATE control')
+        calls = []
+        def business():
+            calls.append('entered')
+            raise primary
+        dispatch = recorder.profiler.engine.dispatcher
+        def injected(frame, event, arg):
+            if frame.f_code is business.__code__ and event == 'return':
+                raise control
+            return dispatch(frame, event, arg)
+        recorder.profiler.engine.dispatcher = injected
+        with self.assertRaises(SystemExit) as raised:
+            recorder.run('generator_command', 0, business)
+        self.assertIs(raised.exception, control)
+        self.assertEqual(calls, ['entered'])
+        value = self.document(recorder)
+        self.assertFalse(value['coverage']['complete'])
+        self.assertIn('hidden body error', value['control_exception_policy'])
+        self.assertIsNone(sys.getprofile())
+
+    def test_existing_replaced_and_disappearing_callbacks_are_never_complete_or_overwritten(self):
+        def foreign(*args):
+            pass
+        for mode in ('existing', 'replaced', 'disappeared'):
+            with self.subTest(mode=mode):
+                calls = []
+                if mode == 'existing':
+                    sys.setprofile(foreign)
+                try:
+                    recorder = self.recorder()
+                    def business():
+                        calls.append('entered')
+                        if mode != 'existing':
+                            sys.setprofile(foreign if mode == 'replaced' else None)
+                        return 17
+                    self.assertEqual(recorder.run('generator_command', 0, business), 17)
+                    self.assertEqual(calls, ['entered'])
+                    self.assertIs(sys.getprofile(), None if mode == 'disappeared' else foreign)
+                    value = self.document(recorder)
+                    self.assertFalse(value['coverage']['complete'])
+                    self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+                finally:
+                    sys.setprofile(None)  # Test owns this foreign fixture.
+
+    def test_explicit_engine_request_freezes_and_revalidates_and_off_rejects_before_artifact_io(self):
+        directory = self.temporary()
+        requested = args(directory, diagnostic_profile=True, diagnostic_profile_engine='python-profile-owned')
+        numeric = numeric_profile(requested)
+        self.assertEqual(numeric_profile(numeric), numeric)
+        freeze_generation_execution_profile(directory, requested.run_id,
+            diagnostic_profile=True, diagnostic_profile_engine='python-profile-owned')
+        value = json.loads((directory / 'generation-execution-profile.json').read_text())
+        self.assertEqual(value['diagnostic_profile']['engine'], 'python-profile-owned')
+        self.assertFalse(value['qualification_admissible'])
+        with patch('pathlib.Path.open', side_effect=AssertionError('OFF engine artifact I/O')):
+            with self.assertRaises(ValueError):
+                freeze_generation_execution_profile(directory, 'invalid', diagnostic_profile=False,
+                    diagnostic_profile_engine='python-profile-owned')
+        for engine in ('unknown', None, True):
+            with self.subTest(engine=engine), self.assertRaises(ValueError):
+                request_profile(True, engine)
+
+    def test_harness_reader_requires_frozen_engine_and_count_only_caller_shape(self):
+        with patch.object(accounting, 'args', side_effect=lambda directory: args(directory,
+                diagnostic_profile=True, diagnostic_profile_engine='python-profile-owned')):
+            h = accounting.HarnessGenerationAccountingTests.harness(self)
+        h.diagnostic_profile_enabled, h.diagnostic_profile_engine = True, 'python-profile-owned'
+        h.publisher_profile_paths = [h.evidence / 'publisher-profile-000.json']
+        publisher = self.recorder('publisher')
+        publisher.run('publisher_lifecycle', None, lambda: sum(range(20)))
+        publisher.close(h.publisher_profile_paths[0])
+        plans = []
+        for lane in range(4):
+            directory = h.evidence / ('lane-' + str(lane))
+            directory.mkdir()
+            recorder = self.recorder(lane=lane)
+            recorder.run('generator_command', lane, lambda: sum(range(20)))
+            recorder.close(directory / 'diagnostic-profile.json')
+            plans.append({'directory': str(directory), 'lane': lane, 'indices': [lane]})
+        h.process_batches = [{'origin_plans': plans}]
+        self.assertTrue(h.diagnostic_profile_evidence()['complete'])
+        path = h.publisher_profile_paths[0]
+        original = path.read_text()
+        for mode in ('engine', 'source', 'empty_graph', 'extra_call'):
+            with self.subTest(mode=mode):
+                value = json.loads(original)
+                if mode == 'engine':
+                    value['engine'] = 'cprofile'
+                elif mode == 'source':
+                    value['repository_source_sha256']['repository/benchmarks/events/diagnostic_profile.py'] = '0' * 64
+                elif mode == 'empty_graph':
+                    value['functions'] = []
+                else:
+                    value['calls'].append(dict(value['calls'][0]))
+                path.write_text(json.dumps(value))
+                self.assertFalse(h.diagnostic_profile_evidence()['complete'])
+        value = json.loads(original)
+        edge = next(row['callers'][0] for row in value['functions'] if row['callers'])
+        edge['self_cpu_seconds'] = 0
+        path.write_text(json.dumps(value))
+        self.assertFalse(h.diagnostic_profile_evidence()['complete'])
+
+    def test_partial_profile_install_failures_clear_only_owned_callbacks(self):
+        def foreign(*args):
+            pass
+        setter = sys.setprofile
+        for mode in ('owned_ordinary', 'foreign_ordinary', 'foreign_control', 'owned_control_clear_retry'):
+            with self.subTest(mode=mode):
+                recorder, calls, clears = self.recorder(), [], []
+                control = KeyboardInterrupt('PRIVATE partial install')
+                def partial(callback):
+                    if callback is None and mode == 'owned_control_clear_retry' and sys.getprofile() is recorder.profiler:
+                        clears.append('clear')
+                        if len(clears) == 1:
+                            raise OSError('PRIVATE transient partial clear')
+                    setter(callback)
+                    if callback is recorder.profiler:
+                        if mode.startswith('foreign'):
+                            setter(foreign)
+                        raise control if 'control' in mode else OSError('PRIVATE partial install')
+                try:
+                    with patch('sys.setprofile', side_effect=partial):
+                        if 'control' in mode:
+                            with self.assertRaises(KeyboardInterrupt) as raised:
+                                recorder.run('generator_command', 0, lambda: calls.append('entered'))
+                            self.assertIs(raised.exception, control)
+                        else:
+                            self.assertEqual(recorder.run('generator_command', 0,
+                                lambda: calls.append('entered') or 17), 17)
+                    self.assertEqual(calls, [] if 'control' in mode else ['entered'])
+                    if mode == 'owned_control_clear_retry':
+                        self.assertEqual(clears, ['clear', 'clear'])
+                    self.assertIs(sys.getprofile(), foreign if mode.startswith('foreign') else None)
+                    self.assertTrue(recorder.graph_unavailable)
+                    self.assertFalse(self.document(recorder)['coverage']['complete'])
+                finally:
+                    setter(None)
+
+    def test_failed_graph_never_resurrects_in_later_call_and_releases_live_frames(self):
+        recorder, calls = self.recorder(), []
+        with patch.object(recorder.profiler.engine, 'get_time', side_effect=OSError('PRIVATE prepare')):
+            self.assertEqual(recorder.run('generator_command', 0, lambda: calls.append(0) or 17), 17)
+        self.assertIsNone(recorder.profiler.engine.cur)
+        self.assertEqual(recorder.run('generator_command', 1, lambda: calls.append(1) or 19), 19)
+        value = self.document(recorder)
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(value['coverage']['profiled_calls'], 0)
+        self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+        self.assertEqual(value['functions'], [])
+        self.assertFalse(value['coverage']['complete'])
+        self.assertEqual(len(value['phases']), 2)
+
+    def test_transient_owned_clear_failure_retries_cleanup_without_promoting_graph(self):
+        recorder, calls, attempts = self.recorder(), [], []
+        setter = sys.setprofile
+        def fail_once(callback):
+            if callback is None and sys.getprofile() is recorder.profiler:
+                attempts.append('clear')
+                if len(attempts) == 1:
+                    raise OSError('PRIVATE transient clear')
+            return setter(callback)
+        with patch('sys.setprofile', side_effect=fail_once):
+            self.assertEqual(recorder.run('generator_command', 0, lambda: calls.append('entered') or 17), 17)
+        self.assertEqual(calls, ['entered'])
+        self.assertEqual(attempts, ['clear', 'clear'])
+        self.assertIsNone(sys.getprofile())
+        value = self.document(recorder)
+        self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+        self.assertFalse(value['coverage']['complete'])
+
+    def test_private_worker_rejects_drifted_engine_before_django_or_business_setup(self):
+        from benchmarks.events.business_commands import InventoryProcessWorker
+        for enabled, engine, frozen in ((True, 'python-profile-owned', 'cprofile'),
+                                        (False, 'python-profile-owned', 'python-profile-owned')):
+            with self.subTest(enabled=enabled), patch('django.setup') as setup:
+                with self.assertRaises(ValueError):
+                    InventoryProcessWorker(0, {'diagnostic_profile_enabled': enabled,
+                        'diagnostic_profile_engine': engine, 'profile': {'diagnostic_profile_engine': frozen}})
+                setup.assert_not_called()
+
+    def test_nonowner_callable_executes_once_without_phase_or_callback_attribution(self):
+        recorder, calls = self.recorder(), []
+        result = object()
+        def business():
+            calls.append((threading.get_ident(), recorder.run('generator_command', 0, lambda: result)))
+        thread = threading.Thread(target=business)
+        thread.start(); thread.join(timeout=.2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][1], result)
+        self.assertNotEqual(calls[0][0], recorder.owner)
+        self.assertEqual(recorder.calls, [])
+        self.assertEqual(recorder.phases, [])
+        self.assertIsNone(sys.getprofile())
+
+    def test_generator_worker_uses_callable_boundary_only_for_explicit_python_mode(self):
+        from benchmarks.events.business_commands import InventoryProcessWorker
+        worker = object.__new__(InventoryProcessWorker)
+        worker._indices = {4}
+        worker.generation, worker.batch = Mock(), object()
+        worker.plan, worker.data, worker.lane = {'label': 'steady'}, {}, 0
+        worker.cpu_profile, worker.runtime_diagnostics_enabled = self.recorder(), False
+        expected = object()
+        with patch('benchmarks.events.business_commands.execute_inventory_command', return_value=expected) as command:
+            self.assertIs(worker.execute(4, 0, Mock()), expected)
+        command.assert_called_once()
+        value = self.document(worker.cpu_profile)
+        self.assertEqual(value['calls'][0]['ordinal'], 4)
+        self.assertTrue(value['coverage']['complete'])

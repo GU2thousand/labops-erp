@@ -53,14 +53,16 @@ def load_environment(path):
         os.environ[key] = parsed[0] if len(parsed) == 1 else raw
 
 
-def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False, diagnostic_profile=False):
+def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False,
+                                        diagnostic_profile=False, diagnostic_profile_engine='cprofile'):
     from benchmarks.events.process_generation import frozen_process_profile
     from benchmarks.events.runtime_diagnostics import diagnostics_profile
     from benchmarks.events.diagnostic_profile import request_profile
+    request = request_profile(diagnostic_profile, diagnostic_profile_engine)
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
         json.dump({'run_id': run_id, **frozen_process_profile(),
-            'diagnostic_profile': request_profile(diagnostic_profile),
+            'diagnostic_profile': request,
             'qualification_admissible': not diagnostic_profile,
             'selection_policy': {'mode': 'automatic', 'spawn_minimum_batch_count': 512,
                 'smaller_capacity_batches': 'four FIFO thread lanes',
@@ -155,8 +157,10 @@ class Harness:
         if generation is None:
             freeze_generation_execution_profile(self.evidence, args.run_id,
                 runtime_diagnostics=getattr(args, 'runtime_diagnostics', False),
-                diagnostic_profile=getattr(args, 'diagnostic_profile', False))
+                diagnostic_profile=getattr(args, 'diagnostic_profile', False),
+                diagnostic_profile_engine=getattr(args, 'diagnostic_profile_engine', 'cprofile'))
         self.diagnostic_profile_enabled = getattr(args, 'diagnostic_profile', False)
+        self.diagnostic_profile_engine = getattr(args, 'diagnostic_profile_engine', 'cprofile')
         self.publisher_profile_paths = []
         self.children = []
         self.child_metrics = {}
@@ -428,7 +432,8 @@ class Harness:
         if getattr(self, 'diagnostic_profile_enabled', False):
             path = self.evidence / 'logs' / f'publisher-profile-{len(self.children):03d}.json'
             self.publisher_profile_paths.append(path)
-            argv = [str(HERE / 'profile_publisher.py'), '--output', str(path)]
+            argv = [str(HERE / 'profile_publisher.py'), '--output', str(path),
+                    '--profile-engine', getattr(self, 'diagnostic_profile_engine', 'cprofile')]
         self.workers['publisher'] = self.spawn('publisher-' + str(len(self.children)),
             argv, 'publisher', metrics_port=21000)
         self.sync_metrics_targets()
@@ -906,7 +911,8 @@ class Harness:
             bootstrap = {'plans': plans, 'profile': self.generation.profile, 'rate': rate,
                 'database_config': database_config, 'runtime_settings': runtime_settings,
                 'runtime_diagnostics_enabled': getattr(self, 'runtime_diagnostics_enabled', False),
-                'diagnostic_profile_enabled': getattr(self, 'diagnostic_profile_enabled', False)}
+                'diagnostic_profile_enabled': getattr(self, 'diagnostic_profile_enabled', False),
+                'diagnostic_profile_engine': getattr(self, 'diagnostic_profile_engine', 'cprofile')}
             catalog = getattr(self, '_active_process_catalog', None) if bootstrap['runtime_diagnostics_enabled'] else None
 
             def started(lane, pid):
@@ -2587,6 +2593,8 @@ class Harness:
     def diagnostic_profile_evidence(self):
         """Missing or interrupted outputs remain unknown; OFF performs no I/O."""
         enabled = getattr(self, 'diagnostic_profile_enabled', False)
+        engine = self.generation.profile.get('diagnostic_profile_engine', 'cprofile')
+        from benchmarks.events.diagnostic_profile import CALLER_SCHEMAS
         result = {'enabled': enabled, 'applicable': enabled, 'qualification_admissible': not enabled,
             'status': 'NOT_REQUESTED', 'complete': None, 'rows': []}
         if not enabled:
@@ -2609,7 +2617,20 @@ class Harness:
                     and len(value['calls']) == expected
                     and len({call['ordinal'] for call in value['calls']}) == expected
                     and {call['ordinal'] for call in value['calls']} == set(expected_indices)
-                    and value['qualification_admissible'] is False)
+                    and value['qualification_admissible'] is False
+                    and value['engine'] == engine and value['caller_schema'] == CALLER_SCHEMAS[engine]
+                    and value['function_graph_status'] == 'COMPLETE'
+                    and isinstance(value['functions'], list) and bool(value['functions']))
+                if engine == 'python-profile-owned':
+                    row['complete'] = (row['complete']
+                        and value['callback_admission'] == 'sys.getprofile() is owned adapter'
+                        and value['bias_seconds'] == 0
+                        and value['repository_source_sha256'].get('repository/benchmarks/events/diagnostic_profile.py')
+                            == hashlib.sha256((HERE / 'diagnostic_profile.py').read_bytes()).hexdigest()
+                        and all(type(edge['total_calls']) is int and edge['total_calls'] >= 0
+                            and edge['primitive_calls'] is None and edge['self_cpu_seconds'] is None
+                            and edge['cumulative_cpu_seconds'] is None and edge['timing_status'] == 'UNMEASURED'
+                            for function in value['functions'] for edge in function['callers']))
             except BaseException as exc:
                 row['error_type'] = type(exc).__name__
             result['rows'].append(row)
@@ -2628,6 +2649,9 @@ def main():
                    help='Opt in to timed CPU/SQL/PostgreSQL/container diagnostics; disabled by default')
     p.add_argument('--diagnostic-profile', action='store_true',
                    help='Opt in to own-thread CPU profiles; enabled runs are never acceptance-admissible')
+    from benchmarks.events.diagnostic_profile import PROFILE_ENGINES, request_profile
+    p.add_argument('--diagnostic-profile-engine', choices=PROFILE_ENGINES, default='cprofile',
+                   help='Explicit diagnostic engine; a nondefault engine requires --diagnostic-profile')
     p.add_argument('--events', type=int, default=200)
     p.add_argument('--rate', type=float, default=10)
     p.add_argument('--duration', type=float, default=20)
@@ -2642,6 +2666,10 @@ def main():
     p.add_argument('--consumer-outage-seconds', type=float, default=5)
     p.add_argument('--drain-timeout', '--drain-timeout-seconds', type=float, default=180)
     args = p.parse_args()
+    try:
+        request_profile(args.diagnostic_profile, args.diagnostic_profile_engine)
+    except ValueError as error:
+        p.error(str(error))
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', args.run_id):
         p.error('--run-id must contain 1-48 lowercase letters, digits, underscore or hyphen')
     bounds = {'events': (4, 1000000), 'rate': (.01, 1000), 'duration': (0, 86400),
@@ -2676,7 +2704,8 @@ def main():
     error = None
     try:
         freeze_generation_execution_profile(args.evidence_dir, args.run_id,
-            runtime_diagnostics=args.runtime_diagnostics, diagnostic_profile=args.diagnostic_profile)
+            runtime_diagnostics=args.runtime_diagnostics, diagnostic_profile=args.diagnostic_profile,
+            diagnostic_profile_engine=args.diagnostic_profile_engine)
         load_environment(args.generated_dir / 'client.env')
         for key in list(os.environ):
             if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':

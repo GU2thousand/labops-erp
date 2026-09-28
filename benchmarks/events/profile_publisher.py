@@ -60,27 +60,43 @@ def install_publisher_hooks(profile):
         profile.restore()
 
 
-def run_publisher(output, options, *, call_command=None, profile_factory=None):
+def run_publisher(output, options, *, call_command=None, profile_factory=None, engine='cprofile'):
     from benchmarks.events.diagnostic_profile import CPUProfile, _safe_name
-    profile = (profile_factory or CPUProfile)('publisher')
+    profile = (profile_factory('publisher') if profile_factory else CPUProfile('publisher', engine=engine))
+    original = None
     try:
         install_publisher_hooks(profile)
         if call_command is None:
             from django.core.management import call_command
+        if profile.engine == 'python-profile-owned':
+            return profile.run('publisher_lifecycle', None, call_command, 'publish_events', **options)
         with profile.call('publisher_lifecycle'):
             return call_command('publish_events', **options)
+    except BaseException as error:
+        original = error
+        raise
     finally:
         # close contains diagnostic failures; it cannot replace the real
         # management command's first error or stop its own normal shutdown.
         coverage, close_error = None, None
+        previous_primary = profile.primary_error
+        if profile.engine == 'python-profile-owned':
+            profile.primary_error = original
         try:
             coverage = profile.close(output)
         except BaseException as error:
             close_error = error
             try:
-                profile.error('publisher_close', error)
-            except BaseException:
-                pass  # Missing output remains incomplete in the coordinator.
+                profile.record_error('publisher_close', error)
+            except BaseException as recording_error:
+                if (profile.engine == 'python-profile-owned' and original is None
+                        and not isinstance(recording_error, Exception)):
+                    raise
+            if (profile.engine == 'python-profile-owned' and original is None
+                    and not isinstance(error, Exception)):
+                raise
+        finally:
+            profile.primary_error = previous_primary
         try:
             if close_error is not None or not isinstance(coverage, dict) or coverage.get('complete') is not True:
                 metadata = {'kind': 'publisher_diagnostic_profile', 'status': 'INCOMPLETE'}
@@ -91,8 +107,11 @@ def run_publisher(output, options, *, call_command=None, profile_factory=None):
                 # This bootstrap is used only for an enabled diagnostic run.
                 # Emit no exception text, paths, business data or raw stats.
                 print(json.dumps(metadata, sort_keys=True, allow_nan=False), file=sys.stderr, flush=True)
-        except BaseException:
-            pass  # A failed diagnostic log sink cannot replace business work.
+        except BaseException as error:
+            if (profile.engine == 'python-profile-owned' and original is None
+                    and not isinstance(error, Exception)):
+                raise
+            # Ordinary log errors and secondary controls keep the known body error.
 
 
 def main():
@@ -100,13 +119,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--metrics-port', type=int, default=None)
+    from benchmarks.events.diagnostic_profile import PROFILE_ENGINES
+    parser.add_argument('--profile-engine', choices=PROFILE_ENGINES, default='cprofile')
     args = parser.parse_args()
     if not args.output.name.startswith('publisher-profile-') or args.output.suffix != '.json':
         parser.error('Output must be an authored publisher-profile JSON filename')
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
     import django
     django.setup()
-    run_publisher(args.output, {'loop': True, 'limit': 500, 'metrics_port': args.metrics_port})
+    run_publisher(args.output, {'loop': True, 'limit': 500, 'metrics_port': args.metrics_port},
+                  engine=args.profile_engine)
 
 
 if __name__ == '__main__':

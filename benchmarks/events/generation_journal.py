@@ -64,6 +64,12 @@ def numeric_profile(args) -> dict:
     if type(profiling) is not bool:
         raise ValueError('Diagnostic profile request must be a boolean')
     profile['diagnostic_profile_enabled'] = profiling
+    engine = (args.get('diagnostic_profile_engine', 'cprofile') if isinstance(args, Mapping)
+              else getattr(args, 'diagnostic_profile_engine', 'cprofile'))
+    from benchmarks.events.diagnostic_profile import request_profile
+    request_profile(profiling, engine)
+    if engine != 'cprofile':
+        profile['diagnostic_profile_engine'] = engine
     return profile
 
 

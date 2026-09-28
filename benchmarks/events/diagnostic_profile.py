@@ -17,17 +17,24 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+PROFILE_ENGINES = ('cprofile', 'python-profile-owned')
+CALLER_SCHEMAS = {'cprofile': 'timed', 'python-profile-owned': 'count_only'}
 PHASES = frozenset({'generator_command', 'receipt_create', 'receipt_post',
     'provenance_journal', 'publisher_lifecycle', 'publish_one_composite',
     'budget_setup_composite', 'budget_restore_composite', 'claim_commit_composite',
     'envelope_composite', 'shard_ownership', 'lease_check', 'send_composite', 'idle_wait'})
 
 
-def request_profile(enabled):
+def request_profile(enabled, engine='cprofile'):
     if type(enabled) is not bool:
         raise ValueError('Diagnostic profile request must be a boolean')
+    if type(engine) is not str or engine not in PROFILE_ENGINES:
+        raise ValueError('Unexpected diagnostic profile engine')
+    if not enabled and engine != 'cprofile':
+        raise ValueError('A nondefault diagnostic engine requires profiling enabled')
     return {'enabled': enabled, 'applicable': enabled,
         'request_status': 'REQUESTED' if enabled else 'NOT_REQUESTED',
+        'engine': engine, 'caller_schema': CALLER_SCHEMAS[engine],
         'qualification_admissible': not enabled,
         'timer': 'thread_time_ns', 'timeunit_seconds': 1e-9,
         'wall_clock': 'perf_counter_ns', 'scope': 'own main thread only',
@@ -42,8 +49,10 @@ def _safe_name(value):
     return 'name-sha256:' + hashlib.sha256(str(value).encode()).hexdigest()
 
 
-def sanitized_stats(stats):
+def sanitized_stats(stats, *, engine='cprofile'):
     """Keep the entire function/caller graph with collision-safe opaque IDs."""
+    if engine not in PROFILE_ENGINES:
+        raise ValueError('Unexpected diagnostic profile engine')
     roots = [('repository', ROOT), ('site-packages', Path(sysconfig.get_path('purelib'))),
              ('stdlib', Path(sysconfig.get_path('stdlib')))]
     keys = set(stats)
@@ -54,7 +63,7 @@ def sanitized_stats(stats):
     for key in sorted(keys, key=lambda value: repr(value)):
         filename, line, function = key
         source = 'unknown-sha256:' + hashlib.sha256(str(filename).encode()).hexdigest()
-        if filename == '~':
+        if filename == '~' or (engine == 'python-profile-owned' and filename == '' and line == 0):
             source = 'builtin'
         elif Path(filename).is_absolute():
             path = Path(filename).resolve()
@@ -85,6 +94,13 @@ def sanitized_stats(stats):
             raise ValueError('Invalid profile statistic')
         graph = []
         for caller, values in callers.items():
+            if engine == 'python-profile-owned':
+                if type(values) is not int or values < 0:
+                    raise ValueError('Unexpected count-only profile caller schema')
+                graph.append({'caller_id': identities[caller]['id'], 'primitive_calls': None,
+                    'total_calls': values, 'self_cpu_seconds': None,
+                    'cumulative_cpu_seconds': None, 'timing_status': 'UNMEASURED'})
+                continue
             if not isinstance(values, tuple) or len(values) != 4:
                 raise ValueError('Unexpected CPU profile caller schema')
             if any(not math.isfinite(number) or number < 0 for number in values):
@@ -104,11 +120,151 @@ class UnsupportedProfileEngine(RuntimeError):
     """The engine did not bind its callback to the owning thread."""
 
 
+class OwnedPythonProfile:
+    """Explicit callable boundary with a classic callback on one owning thread.
+
+    Control exceptions propagate immediately, including from the callback.
+    An asynchronous callback control exception during a business unwind can
+    replace a still-hidden body exception; no deferral or signal changes occur.
+    """
+    def __init__(self, *, timer, timeunit, record_error):
+        from profile import Profile
+        self.owner = threading.get_ident()
+        self.record_error = record_error
+        self.failed = False
+        self.last_admitted = False
+        self.running = False
+        self.finalized = False
+        self.primary_error = None
+        self.stats = {}
+        self.engine = Profile(timer=lambda: timer() * timeunit, bias=0)
+
+    def fail(self, stage, error):
+        self.failed = True
+        self.record_error(stage, error)
+
+    def report_and_stop(self, stage, error):
+        control = error if not isinstance(error, Exception) else None
+        try:
+            self.fail(stage, error)
+        except BaseException as recording_error:
+            if control is None and not isinstance(recording_error, Exception):
+                control = recording_error
+        try:
+            self.stop_owned()
+        except BaseException as cleanup_error:
+            if control is None and not isinstance(cleanup_error, Exception):
+                control = cleanup_error
+        try:
+            # Admission can fail before run's business finally is reachable.
+            # Retry a transient clear error here, only for this exact callback.
+            if sys.getprofile() is self:
+                self.stop_owned()
+        except BaseException as cleanup_error:
+            if control is None and not isinstance(cleanup_error, Exception):
+                control = cleanup_error
+        if control is not None:
+            raise control
+
+    def __call__(self, frame, event, arg):
+        if threading.get_ident() != self.owner:
+            self.fail('python_dispatch', RuntimeError('WrongProfileOwner'))
+            return
+        if self.failed:
+            return
+        try:
+            self.engine.dispatcher(frame, event, arg)
+        except BaseException as error:
+            self.report_and_stop('python_dispatch', error)
+
+    def stop_owned(self):
+        try:
+            if threading.get_ident() != self.owner:
+                raise RuntimeError('WrongProfileOwner')
+            current = sys.getprofile()
+            if current is self:
+                sys.setprofile(None)
+            elif current is not None:
+                raise RuntimeError('ForeignProfileHook')
+            elif self.running and not self.failed:
+                raise RuntimeError('ProfileHookDisappeared')
+        except BaseException as error:
+            self.fail('python_disable', error)
+            if not isinstance(error, Exception):
+                raise
+        finally:
+            self.running = False
+
+    def run(self, function, /, *args, **kwargs):
+        self.last_admitted = False
+        original = None
+        try:
+            if threading.get_ident() != self.owner or sys.getprofile() is not None:
+                raise RuntimeError('ExistingOrForeignProfileHook')
+            if self.failed:
+                raise UnsupportedProfileEngine()
+            # Profile.runcall uses repr(function); use one fixed synthetic root
+            # so callable repr/arguments can never enter the stats identities.
+            self.engine.set_cmd('diagnostic_owned_scope')
+            self.engine.t = self.engine.get_time()
+            self.finalized = False
+            sys.setprofile(self)
+            self.running = True
+            self.last_admitted = sys.getprofile() is self
+            if not self.last_admitted:
+                raise UnsupportedProfileEngine()
+        except BaseException as error:
+            self.report_and_stop('python_enable', error)
+        try:
+            return function(*args, **kwargs)
+        except BaseException as error:
+            original = error
+            self.primary_error = error
+            raise
+        finally:
+            try:
+                self.stop_owned()
+                if not self.failed:
+                    # Complete pending frames immediately after stopping. At
+                    # export, snapshot only: no later gap is charged as CPU.
+                    self.engine.create_stats()
+                    self.finalized = True
+                    self.stats = self.engine.stats
+            except BaseException as error:
+                self.fail('python_finalize', error)
+                if original is None and not isinstance(error, Exception):
+                    raise
+            finally:
+                try:
+                    if self.failed:
+                        # A transient ordinary clear failure must not leave a
+                        # failed callback installed after business returns.
+                        if sys.getprofile() is self:
+                            self.stop_owned()
+                except BaseException as error:
+                    self.fail('python_finalize_cleanup', error)
+                    if original is None and not isinstance(error, Exception):
+                        raise
+                finally:
+                    self.primary_error = None
+                    if self.failed:
+                        self.engine.cur = None
+                        self.stats = {}
+
+    def create_stats(self):
+        if self.failed or not self.finalized:
+            raise UnsupportedProfileEngine()
+        self.engine.snapshot_stats()
+        self.stats = self.engine.stats
+
+
 class CPUProfile:
-    """One profiler on one owning thread; diagnostic failure never changes work."""
-    def __init__(self, role, *, lane=None, profiler_factory=None):
+    """Own-thread diagnosis; ordinary diagnostic failure never changes work."""
+    def __init__(self, role, *, lane=None, profiler_factory=None, engine='cprofile'):
         if role not in {'generator', 'publisher'} or (role == 'generator' and lane not in range(4)):
             raise ValueError('Invalid fixed profile role')
+        request_profile(True, engine)
+        self.engine = engine
         self.role, self.lane = role, lane
         self.owner = threading.get_ident()
         self.profiler = None
@@ -123,30 +279,54 @@ class CPUProfile:
         self.hook_sources = {}
         self.recording_failed = False
         self.graph_unavailable = False
+        self.primary_error = None
         try:
             if sys.getprofile() is not None:
                 raise RuntimeError('ExistingProfileHook')
-            if profiler_factory is None:
+            if profiler_factory is None and engine == 'python-profile-owned':
+                self.profiler = OwnedPythonProfile(timer=time.thread_time_ns, timeunit=1e-9,
+                    record_error=self.graph_error)
+            elif profiler_factory is None:
                 from cProfile import Profile
                 profiler_factory = Profile
-            self.profiler = profiler_factory(timer=time.thread_time_ns, timeunit=1e-9)
+            if self.profiler is None and profiler_factory is not None:
+                self.profiler = profiler_factory(timer=time.thread_time_ns, timeunit=1e-9)
             if self.profiler is None:
+                raise UnsupportedProfileEngine()
+            if engine == 'python-profile-owned' and not isinstance(self.profiler, OwnedPythonProfile):
                 raise UnsupportedProfileEngine()
         except BaseException as error:
             self.graph_unavailable = True
             self.record_error('admission', error)
+            if engine == 'python-profile-owned' and not isinstance(error, Exception):
+                raise
+
+    def graph_error(self, stage, error):
+        self.graph_unavailable = True
+        self.record_error(stage, error)
 
     def error(self, stage, error):
         try:
             self.errors.append({'stage': stage, 'error_type': _safe_name(type(error).__name__)})
-        except BaseException:
+        except BaseException as recording_error:
             self.recording_failed = True
+            self.propagate_recording_control(error, recording_error)
 
     def record_error(self, stage, error):
         try:
             self.error(stage, error)
-        except BaseException:
+        except BaseException as recording_error:
             self.recording_failed = True
+            self.propagate_recording_control(error, recording_error)
+
+    def propagate_recording_control(self, error, recording_error):
+        if self.engine == 'python-profile-owned' and not isinstance(recording_error, Exception):
+            self.graph_unavailable = True
+            primary = self.primary_error
+            if primary is None:
+                primary = getattr(self.profiler, 'primary_error', None)
+            if primary is None:
+                raise error if not isinstance(error, Exception) else recording_error
 
     def owning_thread(self):
         return threading.get_ident() == self.owner
@@ -160,14 +340,19 @@ class CPUProfile:
             return
         start = None
         original = None
+        previous_primary = self.primary_error
         try:
             start = (time.perf_counter_ns(), time.thread_time_ns())
         except BaseException as error:
             self.record_error('phase_clock_start', error)
+            if self.engine == 'python-profile-owned' and not isinstance(error, Exception):
+                raise
         try:
             yield
         except BaseException as error:
             original = error
+            if self.engine == 'python-profile-owned':
+                self.primary_error = error
             raise
         finally:
             try:
@@ -180,6 +365,50 @@ class CPUProfile:
                     'complete': start is not None})
             except BaseException as error:
                 self.record_error('phase_clock_end', error)
+                if (self.engine == 'python-profile-owned' and original is None
+                        and not isinstance(error, Exception)):
+                    raise
+            finally:
+                self.primary_error = previous_primary
+
+    def run(self, phase, ordinal, function, /, *args, **kwargs):
+        """Python mode requires one callable boundary; default behavior stays."""
+        if self.engine == 'cprofile':
+            with self.call(phase, ordinal):
+                return function(*args, **kwargs)
+        if not self.owning_thread() or self.recording_active:
+            with self.phase(phase):
+                return function(*args, **kwargs)
+        self.ordinal = ordinal
+        self.recording_active = True
+        original = None
+        def invoke():
+            self.active = bool(self.profiler and getattr(self.profiler, 'last_admitted', False)
+                               and not self.graph_unavailable)
+            with self.phase(phase):
+                return function(*args, **kwargs)
+        try:
+            if self.profiler is not None and not self.graph_unavailable:
+                return self.profiler.run(invoke)
+            return invoke()
+        except BaseException as error:
+            original = error
+            self.primary_error = error
+            raise
+        finally:
+            profiled = bool(self.profiler and getattr(self.profiler, 'last_admitted', False)
+                            and not self.graph_unavailable)
+            self.active = self.recording_active = False
+            try:
+                self.calls.append({'ordinal': ordinal, 'profiled': profiled,
+                    'outcome': 'error' if original else 'returned',
+                    'exception_type': _safe_name(type(original).__name__) if original else None})
+            except BaseException as error:
+                self.record_error('call_record', error)
+                if original is None and not isinstance(error, Exception):
+                    raise
+            finally:
+                self.primary_error = None
 
     @contextmanager
     def call(self, phase, ordinal=None):
@@ -194,7 +423,9 @@ class CPUProfile:
         original = None
         enabled = False
         try:
-            if self.profiler is not None:
+            if self.engine == 'python-profile-owned':
+                self.graph_error('enable', UnsupportedProfileEngine())
+            elif self.profiler is not None:
                 if sys.getprofile() is not None:
                     raise RuntimeError('ExistingProfileHook')
                 self.profiler.enable()
@@ -328,14 +559,18 @@ class CPUProfile:
             try:
                 if self.profiler is not None and not self.graph_unavailable:
                     from pstats import Stats
-                    graph = sanitized_stats(Stats(self.profiler).stats)
+                    stats = Stats(self.profiler).stats
+                    graph = (sanitized_stats(stats, engine=self.engine) if self.engine == 'python-profile-owned'
+                             else sanitized_stats(stats))
             except BaseException as error:
                 # Preserve independently recorded owner-thread phases even if
                 # cProfile statistics cannot form a safe graph. Set the flag
                 # first: a broken error sink must never promote this evidence.
                 self.graph_unavailable = True
                 self.record_error('export', error)
-            value = {'schema_version': 1, **request_profile(True),
+                if self.engine == 'python-profile-owned' and not isinstance(error, Exception):
+                    raise
+            value = {'schema_version': 1, **request_profile(True, self.engine),
                 'python_version': sys.version.split()[0], 'pid': os.getpid(),
                 'thread_native_id': threading.get_native_id(),
                 'timer_resolution_seconds': time.get_clock_info('thread_time').resolution,
@@ -343,6 +578,13 @@ class CPUProfile:
                 'phase_scope': 'own thread; fixed phases recorded independently of function graph admission',
                 'coverage': self.summary(), 'calls': self.calls, 'phases': self.phases, **graph}
             value['function_graph_status'] = 'UNAVAILABLE' if self.graph_unavailable else 'COMPLETE'
+            if self.engine == 'python-profile-owned':
+                value.update(scope='own main thread; owned Python callback active only during callable scopes',
+                    callback_admission='sys.getprofile() is owned adapter', bias_seconds=0,
+                    builtin_identity_scope='name only; class distinctions unavailable',
+                    profiling_overhead_scope='command phases and workload include profiler overhead; function accounting follows profile.py and may exclude dispatch processing',
+                    function_cpu_and_phase_cpu_same_denominator=False,
+                    control_exception_policy='immediate propagation; simultaneous unwind collision may replace hidden body error')
             value['hook_source_sha256'] = self.hook_sources
             # Payload says persisted only if exclusive creation, flush/fsync
             # and atomic replacement succeed; completion is checked by readers.
@@ -360,4 +602,6 @@ class CPUProfile:
             self.persisted = True
         except BaseException as error:
             self.record_error('export', error)
+            if self.engine == 'python-profile-owned' and not isinstance(error, Exception):
+                raise
         return self.summary()

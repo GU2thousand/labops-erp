@@ -39,6 +39,11 @@ on:
         description: 'Own-thread CPU profiling only: an enabled run is never acceptance-admissible'
         type: boolean
         default: false
+      diagnostic_profile_engine:
+        description: 'Explicit diagnostic engine; python-profile-owned requires diagnostic_profile=true'
+        type: choice
+        options: [cprofile, python-profile-owned]
+        default: cprofile
 permissions:
   contents: read
 concurrency:
@@ -56,6 +61,7 @@ jobs:
       EVENTS_TIER: ${{ github.event.inputs.tier || 'smoke' }}
       RUNTIME_DIAGNOSTICS: ${{ github.event.inputs.runtime_diagnostics || 'false' }}
       DIAGNOSTIC_PROFILE: ${{ github.event.inputs.diagnostic_profile || 'false' }}
+      DIAGNOSTIC_PROFILE_ENGINE: ${{ github.event.inputs.diagnostic_profile_engine || 'cprofile' }}
       EVENTS_RUNNER_ARCH: ${{ github.event.inputs.runner_arch }}
       EVENTS_RUNNER_LABEL: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
       EVENTS_REPOSITORY_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
@@ -68,6 +74,11 @@ jobs:
       - name: Admit and freeze standard runner before services
         id: runner_profile
         run: |
+          case "$DIAGNOSTIC_PROFILE_ENGINE" in
+            cprofile) ;;
+            python-profile-owned) [ "$DIAGNOSTIC_PROFILE" = true ] || { echo 'Explicit Python engine requires profiling enabled'; exit 2; } ;;
+            *) echo 'Invalid diagnostic profile engine'; exit 2 ;;
+          esac
           RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
           echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
           python benchmarks/events/runner_profile.py --choice "$EVENTS_RUNNER_ARCH" --event-name "$GITHUB_EVENT_NAME" --requested-label "$EVENTS_RUNNER_LABEL" --runner-arch "$RUNNER_ARCH" --runner-environment "$RUNNER_ENVIRONMENT" --runner-os "$RUNNER_OS" --repository-visibility "$EVENTS_REPOSITORY_VISIBILITY" --source-sha "$GITHUB_SHA" --output "infra/events/validation/evidence/$RUN_ID/runner-profile.json"
@@ -115,7 +126,7 @@ jobs:
             *) echo 'Invalid runtime diagnostics boolean'; exit 2 ;;
           esac
           case "$DIAGNOSTIC_PROFILE" in
-            true) DIAGNOSTIC_ARGS+=(--diagnostic-profile) ;;
+            true) DIAGNOSTIC_ARGS+=(--diagnostic-profile --diagnostic-profile-engine "$DIAGNOSTIC_PROFILE_ENGINE") ;;
             false) ;;
             *) echo 'Invalid diagnostic profile boolean'; exit 2 ;;
           esac
