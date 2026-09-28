@@ -113,6 +113,7 @@ class CPUProfile:
         self.owner = threading.get_ident()
         self.profiler = None
         self.active = False
+        self.recording_active = False
         self.errors, self.phases, self.calls, self.hooks = [], [], [], []
         self.ordinal = None
         self.closed = False
@@ -154,7 +155,7 @@ class CPUProfile:
     def phase(self, name):
         if name not in PHASES:
             raise ValueError('Unknown fixed profile phase')
-        if not self.owning_thread() or not self.active:
+        if not self.owning_thread() or not self.recording_active:
             yield
             return
         start = None
@@ -185,7 +186,7 @@ class CPUProfile:
         if not self.owning_thread():
             yield
             return
-        if self.active:
+        if self.recording_active:
             with self.phase(phase):
                 yield
             return
@@ -209,6 +210,10 @@ class CPUProfile:
             # partial hook before business execution, without touching foreign
             # callbacks or replacing the business exception that follows.
             self.disable_owned()
+        # Fixed phases use clocks read on this owner thread, independently of
+        # whether cProfile can safely supply a function graph. Rejected engines
+        # have already been disabled before entering business work.
+        self.recording_active = True
         try:
             with self.phase(phase):
                 yield
@@ -219,6 +224,7 @@ class CPUProfile:
             if enabled:
                 self.disable_owned()
             self.active = False
+            self.recording_active = False
             try:
                 self.calls.append({'ordinal': ordinal, 'profiled': enabled,
                     'outcome': 'error' if original else 'returned',
@@ -244,8 +250,6 @@ class CPUProfile:
                 self.record_error('disable_cleanup', error)
 
     def hook(self, target, name, phase, *, expected=None, ordinal=False):
-        if self.profiler is None:
-            return
         try:
             original = getattr(target, name)
             same = (original is expected or (getattr(original, '__func__', None) is not None
@@ -267,7 +271,7 @@ class CPUProfile:
             def wrapper(*args, **kwargs):
                 nonlocal count
                 prior = self.ordinal
-                if ordinal and self.owning_thread() and self.active:
+                if ordinal and self.owning_thread() and self.recording_active:
                     count += 1
                     self.ordinal = count
                 try:
@@ -336,6 +340,7 @@ class CPUProfile:
                 'thread_native_id': threading.get_native_id(),
                 'timer_resolution_seconds': time.get_clock_info('thread_time').resolution,
                 'scope': 'own main thread; cProfile enabled only during recorded calls',
+                'phase_scope': 'own thread; fixed phases recorded independently of function graph admission',
                 'coverage': self.summary(), 'calls': self.calls, 'phases': self.phases, **graph}
             value['function_graph_status'] = 'UNAVAILABLE' if self.graph_unavailable else 'COMPLETE'
             value['hook_source_sha256'] = self.hook_sources

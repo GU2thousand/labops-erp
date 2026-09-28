@@ -14,8 +14,6 @@ def install_publisher_hooks(profile):
     from labops import events, worker_metrics
     from labops.management.commands import publish_events as command
     from labops.publisher_shards import PublisherShardOwner
-    if profile.profiler is None:
-        return
     try:
         if (command.publish_one is not events.publish_one
                 or command.database_statement_budget is not worker_metrics.database_statement_budget):

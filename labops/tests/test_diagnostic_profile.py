@@ -65,13 +65,13 @@ class CPUProfileControls(SimpleTestCase):
         self.addCleanup(temporary.cleanup)
         return Path(temporary.name)
 
-    @skipUnless(CLASSIC_ENGINE_AVAILABLE, 'Runtime cProfile has no owned classic thread callback')
     def test_real_own_thread_cpu_timer_excludes_sleep_with_separate_wall_clock(self):
         profile = CPUProfile('generator', lane=0)
         with profile.call('generator_command', 12):
             time.sleep(.03)
         result = profile.close(self.temporary() / 'profile.json')
-        self.assertTrue(result['complete'])
+        self.assertEqual(result['complete'], CLASSIC_ENGINE_AVAILABLE)
+        self.assertEqual(result['profiled_calls'], int(CLASSIC_ENGINE_AVAILABLE))
         row = profile.phases[0]
         self.assertGreater(row['wall_ns'], 25_000_000)
         self.assertLess(row['thread_cpu_ns'], row['wall_ns'] / 2)
@@ -376,7 +376,14 @@ class CPUProfileControls(SimpleTestCase):
                 self.assertEqual(coverage['profiled_calls'], 0)
                 self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
                 self.assertEqual(value['functions'], [])
-                self.assertEqual(value['phases'], [])
+                self.assertEqual(len(value['phases']), 1)
+                self.assertEqual(value['phases'][0]['phase'], 'generator_command')
+                self.assertEqual(value['phases'][0]['ordinal'], 0)
+                self.assertEqual(value['phases'][0]['outcome'], 'error' if failure else 'returned')
+                self.assertTrue(value['phases'][0]['complete'])
+                self.assertGreaterEqual(value['phases'][0]['wall_ns'], 0)
+                self.assertGreaterEqual(value['phases'][0]['thread_cpu_ns'], 0)
+                self.assertFalse(profile.recording_active)
                 if failure is None:
                     self.assertEqual(coverage['errors'], [
                         {'stage': 'enable', 'error_type': 'UnsupportedProfileEngine'}])
@@ -429,6 +436,8 @@ class CPUProfileControls(SimpleTestCase):
                 self.assertTrue(coverage['persisted'])
                 self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
                 self.assertEqual(value['functions'], [])
+                self.assertEqual(len(value['phases']), 1)
+                self.assertEqual(value['phases'][0]['ordinal'], 0)
                 self.assertNotIn('PRIVATE', path.read_text())
 
     def test_actual_runtime_engine_keeps_business_once_and_reports_its_real_capability(self):
@@ -442,6 +451,11 @@ class CPUProfileControls(SimpleTestCase):
         self.assertEqual(calls, [17])
         self.assertIsNone(sys.getprofile())
         self.assertTrue(coverage['persisted'])
+        self.assertEqual(len(value['phases']), 1)
+        self.assertEqual(value['phases'][0]['phase'], 'generator_command')
+        self.assertTrue(value['phases'][0]['complete'])
+        self.assertGreaterEqual(value['phases'][0]['wall_ns'], 0)
+        self.assertGreaterEqual(value['phases'][0]['thread_cpu_ns'], 0)
         if CLASSIC_ENGINE_AVAILABLE:
             self.assertTrue(coverage['complete'])
             self.assertEqual(coverage['profiled_calls'], 1)
@@ -452,8 +466,37 @@ class CPUProfileControls(SimpleTestCase):
             self.assertEqual(coverage['profiled_calls'], 0)
             self.assertEqual(coverage['errors'], [{'stage': 'enable', 'error_type': 'UnsupportedProfileEngine'}])
             self.assertEqual(value['functions'], [])
-            self.assertEqual(value['phases'], [])
             self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+
+    def test_unavailable_graph_keeps_nested_owner_phases_without_cross_thread_or_new_admission(self):
+        factory = Mock(return_value=None)
+        profile = CPUProfile('generator', lane=0, profiler_factory=factory)
+        calls = []
+        target = SimpleNamespace(call=lambda value: calls.append(value))
+        profile.hook(target, 'call', 'receipt_create', expected=target.call, ordinal=True)
+        with profile.call('generator_command', 7):
+            worker = threading.Thread(target=target.call, args=(2,))
+            worker.start()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            with profile.call('receipt_post', 999):
+                target.call(1)
+        path = self.temporary() / 'diagnostic-profile.json'
+        coverage = profile.close(path)
+        value = json.loads(path.read_text())
+        self.assertEqual(calls, [2, 1])
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(coverage['requested_calls'], 1)
+        self.assertEqual(coverage['profiled_calls'], 0)
+        self.assertFalse(coverage['complete'])
+        self.assertFalse(value['qualification_admissible'])
+        self.assertEqual(Counter(row['phase'] for row in value['phases']), Counter({
+            'generator_command': 1, 'receipt_post': 1, 'receipt_create': 1}))
+        self.assertEqual(next(row['ordinal'] for row in value['phases'] if row['phase'] == 'receipt_create'), 1)
+        self.assertEqual(next(row['ordinal'] for row in value['phases'] if row['phase'] == 'receipt_post'), 7)
+        self.assertEqual(value['calls'][0]['ordinal'], 7)
+        self.assertTrue(all(row['complete'] and row['wall_ns'] >= 0 and row['thread_cpu_ns'] >= 0
+                            for row in value['phases']))
 
 
 class DiagnosticProfileHarnessControls(SimpleTestCase):
@@ -973,3 +1016,56 @@ class PublisherProfileControlTests(SimpleTestCase):
                 self.assertTrue(coverage['persisted'])
                 self.assertFalse(coverage['complete'])
                 self.assertNotIn('PRIVATE', output.read_text())
+
+    def test_unavailable_publisher_graph_retains_all_pinned_phases_and_publish_ordinals(self):
+        class UnboundProfiler:
+            def __init__(self, **options):
+                self.enabled = False
+            def enable(self):
+                self.enabled = True
+            def disable(self):
+                self.enabled = False
+        for factory in (UnboundProfiler, lambda **options: None):
+            with self.subTest(constructor_failure=factory is not UnboundProfiler), \
+                 self.callbacks() as (probe, originals), TemporaryDirectory() as directory, \
+                 redirect_stderr(io.StringIO()):
+                profiles = []
+                def create_profile(role):
+                    profile = CPUProfile(role, profiler_factory=factory)
+                    profiles.append(profile)
+                    return profile
+                owner = PublisherShardOwner.__new__(PublisherShardOwner)
+                def management(*args, **kwargs):
+                    if profiles[0].profiler is not None:
+                        self.assertFalse(profiles[0].profiler.enabled)
+                    for _ in range(2):
+                        with publisher_command.database_statement_budget(2.5):
+                            self.assertIs(publisher_command.publish_one(object(), shard_index=0, shard_count=1,
+                                ownership_check=owner.assert_owned), probe.publish_result)
+                    publisher_metrics.StopController.wait(object(), .125)
+                    return probe.publish_result
+                output = Path(directory) / 'publisher-profile-fixture.json'
+                with patch('pstats.Stats', side_effect=AssertionError('Unavailable graph was read')) as stats:
+                    self.assertIs(run_publisher(output, {}, call_command=management,
+                                              profile_factory=create_profile), probe.publish_result)
+                stats.assert_not_called()
+                self.assert_restored(originals)
+                value = json.loads(output.read_text())
+                self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+                self.assertEqual(value['functions'], [])
+                self.assertFalse(value['coverage']['complete'])
+                self.assertTrue(value['coverage']['persisted'])
+                self.assertTrue(value['coverage']['hooks_restored'])
+                self.assertEqual(value['coverage']['profiled_calls'], 0)
+                self.assertEqual(value['coverage']['requested_calls'], 1)
+                self.assertFalse(value['qualification_admissible'])
+                self.assertEqual(Counter(row['phase'] for row in value['phases']), Counter({
+                    'publisher_lifecycle': 1, 'publish_one_composite': 2, 'claim_commit_composite': 2,
+                    'envelope_composite': 2, 'lease_check': 2, 'send_composite': 2,
+                    'shard_ownership': 2, 'idle_wait': 1, 'budget_setup_composite': 2,
+                    'budget_restore_composite': 2}))
+                self.assertEqual([row['ordinal'] for row in value['phases']
+                                  if row['phase'] == 'publish_one_composite'], [1, 2])
+                self.assertEqual(Counter(name for name, _args, _kwargs in probe.calls)['send'], 2)
+                self.assertTrue(all(row['complete'] and row['wall_ns'] >= 0 and row['thread_cpu_ns'] >= 0
+                                    for row in value['phases']))

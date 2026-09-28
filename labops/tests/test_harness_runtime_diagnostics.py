@@ -12,6 +12,201 @@ from django.test import SimpleTestCase
 from benchmarks.events.acceptance import Harness, main, write_json as persist_fixture_json
 from benchmarks.events.container_diagnostics import DEFAULT_SERVICES
 from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
+from benchmarks.events.origin_journal import CompositeGenerationJournal
+from benchmarks.events.process_resources import GENERATOR_ROLES, summarize_process_resources
+from labops.tests.test_process_resources import ProcessFixture
+
+
+class HarnessProcessCleanupCatalogTests(SimpleTestCase):
+    """Exercise Harness's real observer with exact-PID, resource-free fixtures."""
+
+    def run_observer(self, script):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        fixture = ProcessFixture(required_workers=())
+        h = object.__new__(Harness)
+        h.evidence = Path(directory.name)
+        h.args = SimpleNamespace(run_id='cleanup-catalog-control')
+        h._next_command_index = 0
+        h.events, h.workers, h.generation_topologies = [], {}, []
+        h.process_generation_enabled = h.runtime_diagnostics_enabled = True
+        h._active_process_catalog = fixture.catalog
+        h.generation = Mock(spec=CompositeGenerationJournal)
+        # Deliberately omit business accounting: resource completeness alone
+        # must never turn this lifecycle control into passing acceptance.
+        h.generation.summary.return_value = {'batches': []}
+        h.settings = SimpleNamespace(EVENT_TRANSPORT='kafka', KAFKA_TOPIC='control.inventory',
+            KAFKA_SOURCE_CLUSTER_ID='control.cluster', KAFKA_SOURCE_STREAM_GENERATION=1,
+            EVENT_MAX_PAYLOAD_BYTES=1048576)
+        h.connection = SimpleNamespace(settings_dict={'ENGINE': 'controlled-no-database',
+            'HOST': 'controlled', 'PORT': '0', 'NAME': 'controlled', 'USER': 'controlled'})
+        h.admin, h.source, h.target = [SimpleNamespace(id=name) for name in ('admin', 'source', 'target')]
+        h.business_lanes = [{**{name: SimpleNamespace(id=f'{name}-{lane}')
+            for name in ('task', 'project', 'order', 'order_line')},
+            'batch': None, 'cycle_issue': None} for lane in range(4)]
+        h.settle_process_sessions = Mock(return_value=True)
+        h.merge_origin_events = Mock()
+        h.restore_process_lane_state = Mock()
+        h.process_database_facts = Mock()
+
+        def driver(count, rate, worker, bootstrap, *, start_index, on_observation,
+                   on_process_started, on_process_ready):
+            for plan in bootstrap['plans']:
+                lane, role = plan['lane'], f'generator-{plan["lane"]}'
+                fixture.set(role)
+                on_process_started(lane, fixture.pids[role])
+                on_process_ready(lane, fixture.pids[role], {
+                    'backend_identity': {'database_name': bootstrap['database_config']['NAME'],
+                                         'application_name': plan['application_name']},
+                    'runtime_namespace': bootstrap['runtime_settings'],
+                    'process_snapshot': fixture.child(role)})
+            script(fixture, on_observation)
+            return []
+
+        with patch('benchmarks.events.process_generation.run_paced_processes', side_effect=driver):
+            try:
+                h._generate_processes(16, 'steady', rate=50)
+            except AssertionError:
+                raise
+            except Exception as error:
+                return h, fixture, error
+        self.fail('Control fixture lacks business accounting and must remain failed acceptance')
+
+    def cleanup(self, fixture, observe, lane):
+        role = f'generator-{lane}'
+        fixture.set(role, user=30, system=15)
+        metadata = {'connection_closed': True, 'process_snapshot': fixture.child(role),
+                    'lane_state': {'batch_id': None, 'cycle_issue_id': None}}
+        observe({'kind': 'cleanup_complete', 'lane': lane, 'pid': fixture.pids[role], 'metadata': metadata})
+        return metadata
+
+    def exit(self, fixture, observe, lane, code=0):
+        observe({'kind': 'process_exit', 'lane': lane, 'pid': fixture.pids[f'generator-{lane}'],
+                 'exitcode': code})
+
+    def finish_others(self, fixture, observe, target=2):
+        for lane in range(4):
+            if lane != target:
+                self.cleanup(fixture, observe, lane)
+                del fixture.files[f'/proc/{fixture.pids[f"generator-{lane}"]}/stat']
+                self.exit(fixture, observe, lane)
+
+    def test_cleanup_then_sample_skips_finished_child_but_requires_actual_successful_exits(self):
+        def script(fixture, observe):
+            live = fixture.clean()
+            receipt = self.cleanup(fixture, observe, 2)
+            path = f'/proc/{fixture.pids["generator-2"]}/stat'
+            del fixture.files[path]  # The child may disappear before its exit frame.
+            reads = len(fixture.reads)
+            between = fixture.clean()
+            row = between['processes'][2]
+            self.assertEqual((row['stage'], row['cleaned'], row['exitcode']), ('cleaned', True, None))
+            self.assertFalse(row['applicable'])
+            self.assertIsNone(row['value'])
+            self.assertEqual(row['final_snapshot'], receipt['process_snapshot'])
+            self.assertEqual(row['errors'], [])
+            self.assertNotIn(path, fixture.reads[reads:])
+            for lane in (0, 1, 3):
+                self.assertIn(f'/proc/{fixture.pids[f"generator-{lane}"]}/stat', fixture.reads[reads:])
+                self.cleanup(fixture, observe, lane)
+                del fixture.files[f'/proc/{fixture.pids[f"generator-{lane}"]}/stat']
+            cleaned = fixture.clean()
+            self.assertFalse(summarize_process_resources([live, between], cleaned)['collection_complete'])
+            self.assertTrue(all(row['exitcode'] is None for row in cleaned['processes'][:4]))
+            for lane in range(4):
+                self.exit(fixture, observe, lane)
+            final = fixture.clean()
+            self.assertTrue(summarize_process_resources([live, between], final)['collection_complete'])
+            self.assertTrue(all(row['stage'] == 'exited' and row['exitcode'] == 0
+                                for row in final['processes'][:4]))
+
+        h, fixture, error = self.run_observer(script)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(h.generation_topologies[-1]['passed'])
+        self.assertEqual(fixture.clean()['processes'][2]['errors'], [])
+
+    def test_missing_receipt_or_unclosed_connection_does_not_end_live_sampling(self):
+        for boundary in ('missing_metadata', 'missing_snapshot', 'unclosed', 'non_boolean_closed'):
+            with self.subTest(boundary=boundary):
+                def script(fixture, observe):
+                    live = fixture.clean()
+                    self.finish_others(fixture, observe)
+                    metadata = {'connection_closed': True, 'process_snapshot': fixture.child('generator-2'),
+                                'lane_state': {'batch_id': None, 'cycle_issue_id': None}}
+                    if boundary == 'missing_metadata':
+                        metadata = None
+                    elif boundary == 'missing_snapshot':
+                        metadata.pop('process_snapshot')
+                    else:
+                        metadata['connection_closed'] = False if boundary == 'unclosed' else 'true'
+                    observe({'kind': 'cleanup_complete', 'lane': 2, 'metadata': metadata})
+                    reads = len(fixture.reads)
+                    between = fixture.clean()
+                    row = between['processes'][2]
+                    self.assertEqual((row['stage'], row['cleaned'], row['exitcode']), ('running', False, None))
+                    self.assertTrue(row['applicable'])
+                    self.assertIn(f'/proc/{fixture.pids["generator-2"]}/stat', fixture.reads[reads:])
+                    self.exit(fixture, observe, 2)
+                    self.assertFalse(summarize_process_resources([live, between], fixture.clean())['collection_complete'])
+
+                _h, _fixture, error = self.run_observer(script)
+                self.assertIsInstance(error, RuntimeError)
+
+    def test_stale_foreign_or_invalid_receipt_retains_error_and_never_marks_cleaned(self):
+        changes = ({'pid': 9999}, {'start_time_ticks': 99}, {'source': 'kernel_proc_stat'},
+                   {'captured_monotonic': 99}, {'rss_bytes': None}, {'user_cpu_seconds': .01})
+        for change in changes:
+            with self.subTest(change=change):
+                def script(fixture, observe):
+                    receipt = fixture.child('generator-2') | change
+                    observe({'kind': 'cleanup_complete', 'lane': 2,
+                        'metadata': {'connection_closed': True, 'process_snapshot': receipt}})
+
+                _h, fixture, error = self.run_observer(script)
+                self.assertIsInstance(error, ValueError)
+                row = fixture.clean()['processes'][2]
+                self.assertEqual((row['stage'], row['cleaned'], row['exitcode']), ('running', False, None))
+                self.assertIsNone(row['final_snapshot'])
+                self.assertIn({'stage': 'final_receipt', 'error_type': 'ValueError', 'occurrences': 1}, row['errors'])
+
+    def test_real_live_read_failure_before_cleanup_is_not_erased_by_valid_receipt_and_exit(self):
+        def script(fixture, observe):
+            live = fixture.clean()
+            path = f'/proc/{fixture.pids["generator-2"]}/stat'
+            fixture.files[path] = ValueError('Controlled unavailable live process')
+            failed = fixture.clean()
+            self.assertEqual(failed['processes'][2]['stage'], 'running')
+            self.assertEqual(failed['processes'][2]['value']['status'], 'unavailable')
+            self.cleanup(fixture, observe, 2)
+            del fixture.files[path]
+            self.exit(fixture, observe, 2)
+            self.finish_others(fixture, observe)
+            final = fixture.clean()
+            self.assertFalse(summarize_process_resources([live, failed], final)['collection_complete'])
+            self.assertIn({'stage': 'live_sample', 'error_type': 'ValueError', 'occurrences': 1},
+                          final['processes'][2]['errors'])
+
+        _h, _fixture, error = self.run_observer(script)
+        self.assertIsInstance(error, RuntimeError)
+
+    def test_actual_negative_exit_stays_incomplete_with_or_without_cleanup_receipt(self):
+        for cleaned in (False, True):
+            with self.subTest(cleaned=cleaned):
+                def script(fixture, observe):
+                    live = fixture.clean()
+                    self.finish_others(fixture, observe)
+                    if cleaned:
+                        self.cleanup(fixture, observe, 2)
+                    del fixture.files[f'/proc/{fixture.pids["generator-2"]}/stat']
+                    self.exit(fixture, observe, 2, code=-9)
+                    final = fixture.clean()
+                    row = final['processes'][2]
+                    self.assertEqual((row['stage'], row['cleaned'], row['exitcode']), ('exited', cleaned, -9))
+                    self.assertEqual(row['final_snapshot'] is not None, cleaned)
+                    self.assertFalse(summarize_process_resources([live], final)['collection_complete'])
+
+                _h, _fixture, error = self.run_observer(script)
+                self.assertIsInstance(error, RuntimeError)
 
 
 class Clock:

@@ -933,6 +933,14 @@ class Harness:
                         started_indices[lane].add(value['global_index'])
                     elif value['kind'] == 'cleanup_complete':
                         records[lane]['cleanup_metadata'] = value.get('metadata')
+                        metadata = records[lane]['cleanup_metadata']
+                        if (catalog is not None and isinstance(metadata, dict)
+                                and metadata.get('connection_closed') is True
+                                and metadata.get('process_snapshot') is not None):
+                            # A validated child receipt ends its live sampling
+                            # span; only the later reaped exit qualifies success.
+                            catalog.finalize(f'generator-{lane}',
+                                final_snapshot=metadata['process_snapshot'], cleaned=True)
                     elif value['kind'] == 'process_exit':
                         records[lane]['exitcode'] = value.get('exitcode')
                         metadata = records[lane]['cleanup_metadata']
