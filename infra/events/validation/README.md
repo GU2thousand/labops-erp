@@ -27,6 +27,20 @@ python benchmarks/events/acceptance.py --run-id ci123 --tier smoke --events 60 -
 ```
 
 Generated credentials and private keys are excluded from Git and artifacts.
+The generated `KAFKA_ADMIN_TRUSTED_URLS` explicitly trusts the three HTTPS Admin
+origins, including the initial `KAFKA_ADMIN_URL`. User provisioning validates each
+307's trusted origin, unchanged path and single positive `redirect` counter before
+trying another configured endpoint. This handles the [Redpanda 26.2.2 redirect
+heuristic](https://github.com/redpanda-data/redpanda/blob/v26.2.2/src/v/redpanda/admin/server.cc#L937-L1113),
+which preserves the incoming port even when Docker maps each broker to a different
+host port. Automatic redirects and ambient proxy/CA/netrc settings stay disabled;
+TLS, authentication and other
+failures stop routing. Each operation attempts each configured origin at most
+once within a cumulative 15-second monotonic budget and reuses the last successful
+endpoint. Requests timeouts cannot forcibly preempt DNS or a trickling peer;
+the budget bounds new attempts and rejects late responses. Failed run evidence
+must remain retained independently of any later successful provisioning run.
+
 The generated env file freezes a validation retry schedule of `15,30` followed
 by twenty-two `60`-second delays and jitter in `[1,1.2]`. Natural broker recovery
 is measured under this recorded policy; default production retry timing is

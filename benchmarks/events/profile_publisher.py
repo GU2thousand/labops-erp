@@ -1,6 +1,7 @@
 """Owned validation bootstrap; the real production management command is intact."""
 from contextlib import contextmanager
 from functools import wraps
+import json
 import os
 from pathlib import Path
 import sys
@@ -57,12 +58,12 @@ def install_publisher_hooks(profile):
         command.database_statement_budget = budget
         profile.hooks.append((command, 'database_statement_budget', original, budget, True))
     except BaseException as error:
-        profile.error('publisher_hook_admission', error)
+        profile.record_error('publisher_hook_admission', error)
         profile.restore()
 
 
 def run_publisher(output, options, *, call_command=None, profile_factory=None):
-    from benchmarks.events.diagnostic_profile import CPUProfile
+    from benchmarks.events.diagnostic_profile import CPUProfile, _safe_name
     profile = (profile_factory or CPUProfile)('publisher')
     try:
         install_publisher_hooks(profile)
@@ -73,13 +74,27 @@ def run_publisher(output, options, *, call_command=None, profile_factory=None):
     finally:
         # close contains diagnostic failures; it cannot replace the real
         # management command's first error or stop its own normal shutdown.
+        coverage, close_error = None, None
         try:
-            profile.close(output)
+            coverage = profile.close(output)
         except BaseException as error:
+            close_error = error
             try:
                 profile.error('publisher_close', error)
             except BaseException:
                 pass  # Missing output remains incomplete in the coordinator.
+        try:
+            if close_error is not None or not isinstance(coverage, dict) or coverage.get('complete') is not True:
+                metadata = {'kind': 'publisher_diagnostic_profile', 'status': 'INCOMPLETE'}
+                if isinstance(coverage, dict):
+                    metadata['coverage'] = coverage
+                if close_error is not None:
+                    metadata['error_type'] = _safe_name(type(close_error).__name__)
+                # This bootstrap is used only for an enabled diagnostic run.
+                # Emit no exception text, paths, business data or raw stats.
+                print(json.dumps(metadata, sort_keys=True, allow_nan=False), file=sys.stderr, flush=True)
+        except BaseException:
+            pass  # A failed diagnostic log sink cannot replace business work.
 
 
 def main():

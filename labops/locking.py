@@ -18,7 +18,8 @@ def advisory(key, *, shared=False):
 
 
 def rows(model, ids):
-    return list(model.objects.filter(pk__in={x for x in ids if x}).order_by('pk').select_for_update())
+    """Lock existing keys eagerly; internal callers discard the returned PKs."""
+    return list(model.objects.filter(pk__in={x for x in ids if x}).order_by('pk').select_for_update().values_list('pk', flat=True))
 
 
 def command_locks(name, values):

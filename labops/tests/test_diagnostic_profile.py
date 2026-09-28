@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 from types import SimpleNamespace
+from unittest import skipUnless
 from unittest.mock import Mock, patch
 
 from django.test import SimpleTestCase
@@ -19,12 +20,52 @@ from labops.tests import test_harness_generation_accounting as accounting
 args = accounting.args
 
 
+def classic_engine_available():
+    from cProfile import Profile
+    if sys.getprofile() is not None:
+        return False
+    engine = Profile(timer=time.thread_time_ns, timeunit=1e-9)
+    try:
+        engine.enable()
+        return sys.getprofile() is engine
+    finally:
+        engine.disable()
+
+
+CLASSIC_ENGINE_AVAILABLE = classic_engine_available()
+
+
+class OwnedProfilerFixture:
+    """Deterministic control fixture with a real owned thread callback binding."""
+    def __init__(self, **kwargs):
+        self.arguments = kwargs
+        self.enabled = self.disabled = 0
+        self.stats = {}
+
+    def enable(self):
+        self.enabled += 1
+        sys.setprofile(self)
+
+    def disable(self):
+        self.disabled += 1
+        if sys.getprofile() is self:
+            sys.setprofile(None)
+
+    def __call__(self, *values):
+        pass
+
+    def create_stats(self):
+        self.disable()
+        self.stats = {('~', 0, 'fixture'): (1, 1, 0, 0, {})}
+
+
 class CPUProfileControls(SimpleTestCase):
     def temporary(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         return Path(temporary.name)
 
+    @skipUnless(CLASSIC_ENGINE_AVAILABLE, 'Runtime cProfile has no owned classic thread callback')
     def test_real_own_thread_cpu_timer_excludes_sleep_with_separate_wall_clock(self):
         profile = CPUProfile('generator', lane=0)
         with profile.call('generator_command', 12):
@@ -36,6 +77,7 @@ class CPUProfileControls(SimpleTestCase):
         self.assertLess(row['thread_cpu_ns'], row['wall_ns'] / 2)
         self.assertIsNone(sys.getprofile())
 
+    @skipUnless(CLASSIC_ENGINE_AVAILABLE, 'Runtime cProfile has no owned classic thread callback')
     def test_factory_uses_integer_current_thread_cpu_timer_and_one_profiler(self):
         from cProfile import Profile
         factory = Mock(side_effect=Profile)
@@ -62,15 +104,19 @@ class CPUProfileControls(SimpleTestCase):
                 returned = 7
             self.assertEqual(returned, 7)
             self.assertIs(sys.getprofile(), existing)
-            result = profile.close(self.temporary() / 'profile.json')
+            path = self.temporary() / 'profile.json'
+            result = profile.close(path)
             self.assertFalse(result['complete'])
+            self.assertEqual(profile.graph_unavailable, True)
+            self.assertEqual(result['function_graph_unavailable'], True)
+            self.assertEqual(json.loads(path.read_text())['function_graph_status'], 'UNAVAILABLE')
         finally:
             sys.setprofile(previous)
 
     def test_normal_result_args_and_first_base_exception_survive_clock_and_export_errors(self):
         target = SimpleNamespace(call=Mock(return_value=17))
         original = target.call
-        profile = CPUProfile('generator', lane=0)
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
         profile.hook(target, 'call', 'receipt_create', expected=original)
         with profile.call('generator_command', 4):
             self.assertEqual(target.call('PRIVATE', option='SECRET'), 17)
@@ -93,7 +139,7 @@ class CPUProfileControls(SimpleTestCase):
             def call(self, value):
                 return value
         target = Target()
-        profile = CPUProfile('generator', lane=0)
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
         profile.hook(target, 'call', 'provenance_journal', expected=target.call)
         self.assertIn('call', target.__dict__)
         with profile.call('generator_command', 4):
@@ -102,7 +148,7 @@ class CPUProfileControls(SimpleTestCase):
         self.assertNotIn('call', target.__dict__)
         prior = lambda value: value + 1
         target.call = prior
-        second = CPUProfile('generator', lane=0)
+        second = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
         second.hook(target, 'call', 'provenance_journal', expected=prior)
         second.close(self.temporary() / 'second.json')
         self.assertIs(target.call, prior)
@@ -110,7 +156,7 @@ class CPUProfileControls(SimpleTestCase):
     def test_cross_thread_wrapper_delegates_original_without_phase_or_cpu_attribution(self):
         calls = []
         target = SimpleNamespace(call=lambda value: calls.append(value))
-        profile = CPUProfile('generator', lane=0)
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
         profile.hook(target, 'call', 'receipt_create', expected=target.call)
         with profile.call('generator_command', 0):
             other = threading.Thread(target=target.call, args=(2,))
@@ -134,6 +180,7 @@ class CPUProfileControls(SimpleTestCase):
         self.assertIn(result['functions'][0]['id'], ids)
         self.assertEqual(sum(len(row['callers']) for row in result['functions']), 1)
 
+    @skipUnless(CLASSIC_ENGINE_AVAILABLE, 'Runtime cProfile has no owned classic thread callback')
     def test_export_is_json_only_exclusive_and_unsafe_statistics_fail_incomplete(self):
         directory = self.temporary()
         profile = CPUProfile('generator', lane=3)
@@ -182,7 +229,7 @@ class CPUProfileControls(SimpleTestCase):
     def test_restoration_is_idempotent_after_partial_admission_cleanup(self):
         target = SimpleNamespace(call=lambda: 1)
         original = target.call
-        profile = CPUProfile('generator', lane=0)
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
         profile.hook(target, 'call', 'receipt_create', expected=original)
         profile.restore()
         profile.close(self.temporary() / 'profile.json')
@@ -193,7 +240,7 @@ class CPUProfileControls(SimpleTestCase):
         class BrokenList(list):
             def append(self, value):
                 raise SystemExit('PRIVATE recording')
-        profile = CPUProfile('generator', lane=0)
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
         profile.calls, profile.errors = BrokenList(), BrokenList()
         original = KeyboardInterrupt('PRIVATE body')
         with self.assertRaises(KeyboardInterrupt) as raised:
@@ -214,6 +261,199 @@ class CPUProfileControls(SimpleTestCase):
         self.assertNotIn('PRIVATE', json.dumps(value))
         self.assertEqual(value['repository_source_sha256'], {})
         self.assertTrue(all(row['source'].startswith('unknown-sha256:') for row in value['functions']))
+
+    def test_graph_failures_persist_independent_phases_without_unsafe_graph_data(self):
+        private = ('/PRIVATE_DSN/SECRET_TOKEN.py', 1, 'PRIVATE_FUNCTION')
+        cases = [
+            ('stats', OSError('PRIVATE stats export'), None, 'OSError'),
+            ('negative', None, {private: (1, 1, -.1, .2, {})}, 'ValueError'),
+            ('nonfinite', None, {private: (1, 1, float('nan'), .2, {})}, 'ValueError'),
+            ('caller_schema', None, {private: (1, 1, .1, .2, {private: (1, 1, .1)})}, 'ValueError'),
+        ]
+        for name, failure, stats, error_type in cases:
+            with self.subTest(name=name):
+                profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
+                with profile.call('generator_command', 7):
+                    sum(range(10))
+                path = self.temporary() / 'diagnostic-profile.json'
+                with patch('pstats.Stats', side_effect=failure,
+                           return_value=SimpleNamespace(stats=stats)):
+                    coverage = profile.close(path)
+                value = json.loads(path.read_text())
+                self.assertTrue(coverage['persisted'])
+                self.assertFalse(coverage['complete'])
+                self.assertTrue(coverage['function_graph_unavailable'])
+                self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+                self.assertEqual(value['coverage'], coverage)
+                self.assertEqual(value['functions'], [])
+                self.assertEqual(value['function_identities'], [])
+                self.assertEqual(value['repository_source_sha256'], {})
+                self.assertEqual(value['calls'][0]['ordinal'], 7)
+                self.assertEqual(value['phases'][0]['phase'], 'generator_command')
+                self.assertGreaterEqual(value['phases'][0]['thread_cpu_ns'], 0)
+                self.assertEqual(coverage['errors'], [{'stage': 'export', 'error_type': error_type}])
+                self.assertNotIn('PRIVATE', path.read_text())
+                self.assertNotIn('SECRET', path.read_text())
+
+    def test_graph_unavailable_flag_precedes_failed_error_recording_and_stays_incomplete(self):
+        class BrokenErrors(list):
+            def append(self, value):
+                raise OSError('PRIVATE error sink')
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
+        profile.errors = BrokenErrors()
+        with profile.call('generator_command', 0):
+            sum(range(5))
+        path = self.temporary() / 'diagnostic-profile.json'
+        with patch('pstats.Stats', side_effect=ValueError('PRIVATE invalid statistic')):
+            coverage = profile.close(path)
+        value = json.loads(path.read_text())
+        self.assertEqual(coverage['errors'], [])
+        self.assertTrue(coverage['recording_failed'])
+        self.assertTrue(coverage['function_graph_unavailable'])
+        self.assertTrue(coverage['persisted'])
+        self.assertFalse(coverage['complete'])
+        self.assertEqual(value['coverage'], coverage)
+        self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+        self.assertNotIn('PRIVATE', path.read_text())
+
+    def test_graph_fallback_persists_when_error_method_itself_raises(self):
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
+        with profile.call('generator_command', 0):
+            sum(range(5))
+        path = self.temporary() / 'diagnostic-profile.json'
+        with patch('pstats.Stats', side_effect=ValueError('PRIVATE invalid statistic')), \
+             patch.object(profile, 'error', side_effect=SystemExit('PRIVATE error method')):
+            coverage = profile.close(path)
+        value = json.loads(path.read_text())
+        self.assertEqual(coverage['errors'], [])
+        self.assertTrue(coverage['recording_failed'])
+        self.assertTrue(coverage['function_graph_unavailable'])
+        self.assertTrue(coverage['persisted'])
+        self.assertFalse(coverage['complete'])
+        self.assertEqual(value['coverage'], coverage)
+        self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+        self.assertNotIn('PRIVATE', path.read_text())
+
+    def test_unbound_engine_is_disabled_before_business_and_never_exports_a_claimed_graph(self):
+        class UnboundProfiler:
+            def __init__(self, **options):
+                self.enabled = False
+                self.disabled = 0
+            def enable(self):
+                self.enabled = True
+            def disable(self):
+                self.enabled = False
+                self.disabled += 1
+        for failure in (None, KeyboardInterrupt('PRIVATE primary failure')):
+            with self.subTest(failure=failure is not None):
+                profile = CPUProfile('generator', lane=0, profiler_factory=UnboundProfiler)
+                calls = []
+                def business():
+                    self.assertFalse(profile.profiler.enabled)
+                    self.assertIsNone(sys.getprofile())
+                    calls.append(1)
+                    if failure is not None:
+                        raise failure
+                    return 17
+                if failure is None:
+                    with profile.call('generator_command', 0):
+                        self.assertEqual(business(), 17)
+                else:
+                    with patch.object(profile, 'error', side_effect=SystemExit('PRIVATE error sink')):
+                        with self.assertRaises(KeyboardInterrupt) as raised:
+                            with profile.call('generator_command', 0):
+                                business()
+                        self.assertIs(raised.exception, failure)
+                path = self.temporary() / 'diagnostic-profile.json'
+                with patch('pstats.Stats', side_effect=AssertionError('Unsupported graph was read')) as stats:
+                    coverage = profile.close(path)
+                stats.assert_not_called()
+                value = json.loads(path.read_text())
+                self.assertEqual(calls, [1])
+                self.assertEqual(profile.profiler.disabled, 1)
+                self.assertFalse(coverage['complete'])
+                self.assertTrue(coverage['persisted'])
+                self.assertEqual(coverage['profiled_calls'], 0)
+                self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+                self.assertEqual(value['functions'], [])
+                self.assertEqual(value['phases'], [])
+                if failure is None:
+                    self.assertEqual(coverage['errors'], [
+                        {'stage': 'enable', 'error_type': 'UnsupportedProfileEngine'}])
+                else:
+                    self.assertTrue(coverage['recording_failed'])
+                self.assertNotIn('PRIVATE', path.read_text())
+
+    def test_changed_hook_and_failed_error_sink_never_claim_restored_or_replace_primary_failure(self):
+        target = SimpleNamespace(call=lambda: 1)
+        replacement = lambda: 2
+        profile = CPUProfile('generator', lane=0, profiler_factory=OwnedProfilerFixture)
+        profile.hook(target, 'call', 'receipt_create', expected=target.call)
+        original = KeyboardInterrupt('PRIVATE business failure')
+        with patch.object(profile, 'error', side_effect=OSError('PRIVATE error sink')):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                with profile.call('generator_command', 0):
+                    target.call = replacement
+                    raise original
+            path = self.temporary() / 'diagnostic-profile.json'
+            coverage = profile.close(path)
+        self.assertIs(raised.exception, original)
+        self.assertIs(target.call, replacement)
+        self.assertFalse(coverage['hooks_restored'])
+        self.assertFalse(coverage['complete'])
+        self.assertTrue(coverage['recording_failed'])
+        self.assertTrue(coverage['persisted'])
+        self.assertFalse(json.loads(path.read_text())['coverage']['hooks_restored'])
+        profile.restore()
+        self.assertFalse(profile.hooks_restored)
+
+    def test_failed_or_none_factory_keeps_graph_unavailable_with_normal_business_return(self):
+        cases = [('failed', Mock(side_effect=OSError('PRIVATE admission failure'))),
+                 ('none', Mock(return_value=None))]
+        for name, factory in cases:
+            with self.subTest(name=name), \
+                 patch.object(CPUProfile, 'error', side_effect=SystemExit('PRIVATE recording failure')):
+                profile = CPUProfile('generator', lane=0, profiler_factory=factory)
+                calls = []
+                with profile.call('generator_command', 0):
+                    calls.append(17)
+                path = self.temporary() / 'diagnostic-profile.json'
+                with patch('pstats.Stats', side_effect=AssertionError('Unavailable graph was read')) as stats:
+                    coverage = profile.close(path)
+                stats.assert_not_called()
+                value = json.loads(path.read_text())
+                self.assertEqual(calls, [17])
+                self.assertTrue(coverage['function_graph_unavailable'])
+                self.assertTrue(coverage['recording_failed'])
+                self.assertFalse(coverage['complete'])
+                self.assertTrue(coverage['persisted'])
+                self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
+                self.assertEqual(value['functions'], [])
+                self.assertNotIn('PRIVATE', path.read_text())
+
+    def test_actual_runtime_engine_keeps_business_once_and_reports_its_real_capability(self):
+        profile = CPUProfile('generator', lane=0)
+        calls = []
+        with profile.call('generator_command', 0):
+            calls.append(17)
+        path = self.temporary() / 'diagnostic-profile.json'
+        coverage = profile.close(path)
+        value = json.loads(path.read_text())
+        self.assertEqual(calls, [17])
+        self.assertIsNone(sys.getprofile())
+        self.assertTrue(coverage['persisted'])
+        if CLASSIC_ENGINE_AVAILABLE:
+            self.assertTrue(coverage['complete'])
+            self.assertEqual(coverage['profiled_calls'], 1)
+            self.assertTrue(value['functions'])
+            self.assertEqual(value['function_graph_status'], 'COMPLETE')
+        else:
+            self.assertFalse(coverage['complete'])
+            self.assertEqual(coverage['profiled_calls'], 0)
+            self.assertEqual(coverage['errors'], [{'stage': 'enable', 'error_type': 'UnsupportedProfileEngine'}])
+            self.assertEqual(value['functions'], [])
+            self.assertEqual(value['phases'], [])
+            self.assertEqual(value['function_graph_status'], 'UNAVAILABLE')
 
 
 class DiagnosticProfileHarnessControls(SimpleTestCase):
@@ -241,7 +481,8 @@ class DiagnosticProfileHarnessControls(SimpleTestCase):
         h.spawn = Mock(return_value=Mock())
         h.sync_metrics_targets = Mock()
         with patch('benchmarks.events.diagnostic_profile.CPUProfile') as factory, \
-             patch('pathlib.Path.read_text', side_effect=AssertionError('Profile I/O when OFF')):
+             patch('pathlib.Path.read_text', side_effect=AssertionError('Profile I/O when OFF')), \
+             patch('pathlib.Path.open', side_effect=AssertionError('Profile I/O when OFF')):
             h.start_publisher()
             result = h.diagnostic_profile_evidence()
         factory.assert_not_called()
@@ -371,7 +612,8 @@ class DiagnosticProfileHarnessControls(SimpleTestCase):
 
 
 from collections import Counter
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stderr
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -399,9 +641,15 @@ class PublisherProfilerFixture:
 
     def enable(self):
         self.enabled += 1
+        sys.setprofile(self)
 
     def disable(self):
         self.disabled += 1
+        if sys.getprofile() is self:
+            sys.setprofile(None)
+
+    def __call__(self, *values):
+        pass
 
 
 class PublisherProfileControlTests(SimpleTestCase):
@@ -635,8 +883,93 @@ class PublisherProfileControlTests(SimpleTestCase):
             raise original
         with patch('benchmarks.events.profile_publisher.install_publisher_hooks'), \
              patch.object(profile, 'close', side_effect=SystemExit('PRIVATE close')), \
-             patch.object(profile, 'error', side_effect=OSError('PRIVATE error sink')):
+             patch.object(profile, 'error', side_effect=OSError('PRIVATE error sink')), \
+             patch('builtins.print', side_effect=OSError('PRIVATE stderr sink')):
             with self.assertRaises(KeyboardInterrupt) as raised:
                 run_publisher(Path('/not-written/publisher-profile-000.json'), {},
                     call_command=management, profile_factory=lambda role: profile)
         self.assertIs(raised.exception, original)
+
+    def test_failed_graph_export_keeps_return_and_hooks_with_safe_incomplete_stderr(self):
+        originals = [(target, name, getattr(target, name)) for target, name in self.bindings()]
+        sink = io.StringIO()
+        result = object()
+        with TemporaryDirectory() as directory, redirect_stderr(sink), \
+             self.deterministic_export(failure=OSError('PRIVATE graph export')):
+            output = Path(directory) / 'publisher-profile-fixture.json'
+            observed = run_publisher(output, {}, call_command=lambda *a, **kw: result,
+                                     profile_factory=self.profile)
+            document = json.loads(output.read_text())
+        self.assertIs(observed, result)
+        self.assert_restored(originals)
+        metadata = json.loads(sink.getvalue())
+        self.assertEqual(metadata['kind'], 'publisher_diagnostic_profile')
+        self.assertEqual(metadata['status'], 'INCOMPLETE')
+        self.assertEqual(metadata['coverage'], document['coverage'])
+        self.assertTrue(metadata['coverage']['persisted'])
+        self.assertFalse(metadata['coverage']['complete'])
+        self.assertEqual(document['function_graph_status'], 'UNAVAILABLE')
+        self.assertEqual(document['functions'], [])
+        self.assertEqual([row['phase'] for row in document['phases']], ['publisher_lifecycle'])
+        self.assertNotIn('PRIVATE', sink.getvalue())
+        self.assertNotIn(str(output), sink.getvalue())
+
+    def test_first_business_failure_survives_graph_and_stderr_failures_with_restored_hooks(self):
+        original = PublisherPrimaryFailure('PRIVATE business failure')
+        with self.callbacks() as (probe, originals), TemporaryDirectory() as directory, \
+             self.deterministic_export(failure=ValueError('PRIVATE graph failure')), \
+             patch('builtins.print', side_effect=OSError('PRIVATE stderr failure')):
+            probe.send_error = original
+            owner = PublisherShardOwner.__new__(PublisherShardOwner)
+            def management(*args, **kwargs):
+                with publisher_command.database_statement_budget(2.5):
+                    return publisher_command.publish_one(object(), shard_index=0, shard_count=1,
+                                                         ownership_check=owner.assert_owned)
+            output = Path(directory) / 'publisher-profile-fixture.json'
+            with self.assertRaises(PublisherPrimaryFailure) as raised:
+                run_publisher(output, {}, call_command=management, profile_factory=self.profile)
+            coverage = json.loads(output.read_text())['coverage']
+            self.assertIs(raised.exception, original)
+            self.assert_restored(originals)
+            self.assertIs(probe.budget_exits[0][1], original)
+            self.assertFalse(coverage['complete'])
+            self.assertTrue(coverage['persisted'])
+            self.assertTrue(coverage['function_graph_unavailable'])
+
+    def test_alias_admission_and_broken_error_sink_preserve_management_once_and_first_failure(self):
+        event_publish = publisher_events.publish_one
+        unexpected = lambda *args, **kwargs: 'unexpected'
+        for failure in (None, PublisherPrimaryFailure('PRIVATE primary failure')):
+            with self.subTest(failure=failure is not None), \
+                 patch.object(publisher_command, 'publish_one', unexpected), \
+                 TemporaryDirectory() as directory, self.deterministic_export(), redirect_stderr(io.StringIO()):
+                originals = [(target, name, getattr(target, name)) for target, name in self.bindings()]
+                calls = []
+                returned = object()
+                def factory(role):
+                    profile = self.profile(role)
+                    profile.error = Mock(side_effect=SystemExit('PRIVATE recording failure'))
+                    return profile
+                def management(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    self.assertIs(publisher_command.publish_one, unexpected)
+                    self.assertIs(publisher_events.publish_one, event_publish)
+                    if failure is not None:
+                        raise failure
+                    return returned
+                output = Path(directory) / 'publisher-profile-fixture.json'
+                if failure is None:
+                    self.assertIs(run_publisher(output, {'limit': 2}, call_command=management,
+                                                profile_factory=factory), returned)
+                else:
+                    with self.assertRaises(PublisherPrimaryFailure) as raised:
+                        run_publisher(output, {'limit': 2}, call_command=management, profile_factory=factory)
+                    self.assertIs(raised.exception, failure)
+                self.assertEqual(calls, [(('publish_events',), {'limit': 2})])
+                self.assert_restored(originals)
+                coverage = json.loads(output.read_text())['coverage']
+                self.assertTrue(coverage['recording_failed'])
+                self.assertTrue(coverage['hooks_restored'])
+                self.assertTrue(coverage['persisted'])
+                self.assertFalse(coverage['complete'])
+                self.assertNotIn('PRIVATE', output.read_text())

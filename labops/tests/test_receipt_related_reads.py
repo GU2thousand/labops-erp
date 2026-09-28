@@ -57,8 +57,9 @@ class ReceiptRelatedReadTests(Fixture, TestCase):
         order_locks = [sql for sql in order_reads if 'JOIN "labops_supplier"' not in sql]
         self.assertEqual(len(order_locks), 1)
         request_locks = [sql for sql in table_reads(queries, 'labops_purchaserequest')
-            if '"labops_purchaserequest"."request_no"' in sql]
+            if sql.split(' FROM ', 1)[0] == 'SELECT "labops_purchaserequest"."id" AS "pk"']
         self.assertEqual(len(request_locks), 1)
+        self.assertNotIn('JOIN', request_locks[0])
         if connection.vendor == 'postgresql':
             self.assertIn('FOR UPDATE', order_locks[0])
             self.assertIn('FOR UPDATE', request_locks[0])

@@ -88,6 +88,22 @@ the projection with one locked `get_or_create` under its existing advisory lock.
 Original envelopes still validate and initialize or verify their immutable hash
 before comparing that checksum with the incoming hash.
 
+The internal `locking.rows` helper now eagerly selects only primary keys. Its
+two command-lock callers discard the result; truthy-key filtering, deduplication,
+primary-key ordering, `FOR UPDATE`, ancestor lock order and transaction lifetime
+remain the same. The focused PostgreSQL regression scope includes two independent
+backend sessions that observe blocking through `pg_blocking_pids` until the
+holder commits or rolls back, plus the existing receipt, inventory, allocation,
+draft-posting and rollback checks. SQLite checks query shape and compatibility;
+it cannot establish PostgreSQL row-lock behavior. The observed writer profile
+motivates removing model hydration, but does not predict CPU savings or 50/s
+capacity. A separate unprofiled acceptance run is still required.
+
+Function profiling remains disabled by default. Own-thread diagnostic attribution
+requires the classic callback profiler engine to be observed on the actual host;
+the configured CPU timer is unchanged. An unsupported engine yields incomplete
+profiling evidence while business execution continues without profiling.
+
 Notification eligibility is one event-local active-user query snapshot
 (PostgreSQL's configured default is READ COMMITTED). Missing and inactive users
 are excluded. Existing notifications retain their UUID, title, body and read

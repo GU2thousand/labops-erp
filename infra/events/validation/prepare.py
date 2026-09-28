@@ -102,7 +102,9 @@ def main():
         'KAFKA_SASL_MECHANISM': 'SCRAM-SHA-256', 'KAFKA_SSL_CA_LOCATION': str(tls_directory / 'ca.crt'),
         'KAFKA_SASL_USERNAME': 'publisher', 'KAFKA_SASL_PASSWORD': passwords['publisher'],
         'KAFKA_ADMIN_USERNAME': 'admin', 'KAFKA_ADMIN_PASSWORD': passwords['admin'],
-        'KAFKA_ADMIN_URL': 'https://127.0.0.1:19644', 'KAFKA_EXPORTER_PASSWORD': passwords['exporter'],
+        'KAFKA_ADMIN_URL': 'https://127.0.0.1:19644',
+        'KAFKA_ADMIN_TRUSTED_URLS': 'https://127.0.0.1:19644,https://127.0.0.1:29644,https://127.0.0.1:39644',
+        'KAFKA_EXPORTER_PASSWORD': passwords['exporter'],
         'METRICS_TOKEN': secrets.token_urlsafe(32), 'REDIS_URL': '', 'OTEL_EXPORTER_OTLP_ENDPOINT': ''}
     (output / 'client.env').write_text(''.join(f'{key}={value}\n' for key, value in values.items()))
     metrics_directory = output / 'metrics'

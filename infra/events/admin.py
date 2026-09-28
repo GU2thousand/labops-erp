@@ -15,7 +15,7 @@ import re
 import stat
 import sys
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from confluent_kafka import KafkaError, KafkaException
 from confluent_kafka.admin import (
@@ -30,6 +30,101 @@ class ReconcileError(RuntimeError):
 
 NAME = re.compile(r"^[a-zA-Z0-9._-]{1,249}$")
 ROLES = ("publisher", "notification", "analytics", "dlq", "replay", "exporter")
+ADMIN_OPERATION_SECONDS = 15
+MAX_ADMIN_ENDPOINTS = 10
+
+
+def admin_origin(value: str) -> str:
+    """Validate and canonicalize an explicitly trusted bare HTTPS origin."""
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        if (not value.isascii() or re.search(r"[\s\\?#]", value)
+                or parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
+                or not parsed.hostname or not re.fullmatch(r"[a-zA-Z0-9_.:-]+", parsed.hostname)
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+                or port is not None and not 1 <= port <= 65535):
+            raise ValueError
+        host = parsed.hostname.lower()
+        if ":" in host:
+            host = "[" + host + "]"
+        return "https://" + host + (f":{port}" if port not in (None, 443) else "")
+    except ValueError:
+        # Never include input URLs: embedded credentials and queries may be secret.
+        raise ReconcileError("Admin endpoints must be bare HTTPS origins without credentials") from None
+
+
+def admin_endpoints() -> list[str]:
+    primary = admin_origin(os.environ.get("KAFKA_ADMIN_URL", ""))
+    configured = os.environ.get("KAFKA_ADMIN_TRUSTED_URLS")
+    endpoints = [admin_origin(value) for value in configured.split(",")] if configured else [primary]
+    if len(endpoints) > MAX_ADMIN_ENDPOINTS or len(set(endpoints)) != len(endpoints):
+        raise ReconcileError("Admin endpoint allowlist requires at most ten unique origins")
+    if primary not in endpoints:
+        raise ReconcileError("KAFKA_ADMIN_URL must appear in KAFKA_ADMIN_TRUSTED_URLS")
+    return [primary, *(endpoint for endpoint in endpoints if endpoint != primary)]
+
+
+class AdminUserAPI:
+    """Route leader-only writes through a bounded, operator-declared allowlist.
+
+    Redpanda 26.2.2 preserves the request's Host port in leader redirects;
+    distinct Docker host-mapped ports can therefore produce a self redirect.
+    https://github.com/redpanda-data/redpanda/blob/v26.2.2/src/v/redpanda/admin/server.cc#L937-L1113
+    """
+
+    def __init__(self, session, endpoints: list[str]):
+        self.session = session
+        self.endpoints = endpoints
+        self.active = endpoints[0]
+
+    def request(self, method: str, path: str, **kwargs):
+        import requests
+        from urllib3.util import Timeout
+
+        deadline = time.monotonic() + ADMIN_OPERATION_SECONDS
+        pending = [self.active, *(endpoint for endpoint in self.endpoints if endpoint != self.active)]
+        attempted = set()
+        while pending:
+            endpoint = pending.pop(0)
+            attempted.add(endpoint)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReconcileError("Admin API operation deadline exceeded")
+            try:
+                response = self.session.request(
+                    method, endpoint + path, allow_redirects=False,
+                    timeout=Timeout(total=remaining, connect=min(5, remaining), read=remaining), **kwargs)
+            except requests.RequestException as exc:
+                # TLS/auth/network failures never authorize another destination.
+                raise ReconcileError("Admin API request failed: " + type(exc).__name__) from None
+            # Requests timeouts cannot forcibly preempt DNS or a trickling peer.
+            # The cumulative budget limits scheduling and rejects late responses.
+            if time.monotonic() >= deadline:
+                response.close()
+                raise ReconcileError("Admin API operation deadline exceeded")
+            if response.status_code != 307:
+                if 200 <= response.status_code < 300:
+                    self.active = endpoint
+                return response
+            location = response.headers.get("Location", "")
+            try:
+                target = urlsplit(location)
+                origin = admin_origin(urlunsplit((target.scheme, target.netloc, "", "", "")))
+                valid = (not re.search(r"[\s\\#]", location) and origin in self.endpoints
+                         and target.path == path and not target.fragment
+                         and re.fullmatch(r"redirect=[1-9][0-9]*", target.query))
+            except (ValueError, ReconcileError):
+                valid = False
+            response.close()
+            if not valid:
+                raise ReconcileError("Admin API redirect destination is not trusted")
+            # Only reconstruct requests from configured origins and our own path;
+            # never replay credentials/passwords to the response's raw Location.
+            if origin not in attempted:
+                pending.remove(origin)
+                pending.insert(0, origin)
+        raise ReconcileError("Admin API leader routing exhausted trusted endpoints")
 
 
 def load_env(path: str | None) -> None:
@@ -316,16 +411,14 @@ def users_reconcile(args: argparse.Namespace, report: dict) -> None:
     users = load_identities(args.identities)
     # Validate shared TLS/SCRAM configuration even though user creation uses HTTP.
     config = client_config(args)
-    url = os.environ.get("KAFKA_ADMIN_URL", "").rstrip("/")
-    parsed = urlparse(url)
-    if (parsed.scheme != "https" or parsed.username or parsed.password or not parsed.hostname
-            or parsed.query or parsed.fragment):
-        raise ReconcileError("KAFKA_ADMIN_URL must be HTTPS without embedded credentials")
+    endpoints = admin_endpoints()
     session = requests.Session()
+    session.trust_env = False  # Do not override declared CA/auth/routing with ambient proxy, CA or netrc settings.
     session.auth = (config["sasl.username"], config["sasl.password"])
     session.verify = config.get("ssl.ca.location", True)
     session.headers["Content-Type"] = "application/json"
-    response = session.get(url + "/v1/security/users", timeout=15, allow_redirects=False)
+    api = AdminUserAPI(session, endpoints)
+    response = api.request("GET", "/v1/security/users")
     if not 200 <= response.status_code < 300:
         raise ReconcileError(f"Admin user listing failed with HTTP {response.status_code}")
     existing = response.json()
@@ -346,18 +439,16 @@ def users_reconcile(args: argparse.Namespace, report: dict) -> None:
             continue
         body = {"password": password, "algorithm": config["sasl.mechanism"]}
         if exists:
-            response = session.put(url + "/v1/security/users/" + quote(username, safe=""), json=body,
-                                   timeout=15, allow_redirects=False)
+            response = api.request("PUT", "/v1/security/users/" + quote(username, safe=""), json=body)
         else:
-            response = session.post(url + "/v1/security/users", json={"username": username, **body},
-                                    timeout=15, allow_redirects=False)
+            response = api.request("POST", "/v1/security/users", json={"username": username, **body})
         if not 200 <= response.status_code < 300:
             # Never log the response body: upstream error responses can echo input.
             raise ReconcileError(f"Admin user operation failed for {username}: HTTP {response.status_code}")
         report["rotated" if exists else "created"].append(username)
         if username == config["sasl.username"]:
             session.auth = (username, password)
-    final = session.get(url + "/v1/security/users", timeout=15, allow_redirects=False)
+    final = api.request("GET", "/v1/security/users")
     if not 200 <= final.status_code < 300 or not set(users).issubset(set(final.json())):
         raise ReconcileError("Admin API user existence verification failed")
     report["credentials_verified"] = False

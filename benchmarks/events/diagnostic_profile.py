@@ -100,6 +100,10 @@ def sanitized_stats(stats):
         'repository_source_sha256': sources}
 
 
+class UnsupportedProfileEngine(RuntimeError):
+    """The engine did not bind its callback to the owning thread."""
+
+
 class CPUProfile:
     """One profiler on one owning thread; diagnostic failure never changes work."""
     def __init__(self, role, *, lane=None, profiler_factory=None):
@@ -114,8 +118,10 @@ class CPUProfile:
         self.closed = False
         self.persisted = False
         self.hooks_restored = False
+        self.hook_restoration_failed = False
         self.hook_sources = {}
         self.recording_failed = False
+        self.graph_unavailable = False
         try:
             if sys.getprofile() is not None:
                 raise RuntimeError('ExistingProfileHook')
@@ -123,12 +129,21 @@ class CPUProfile:
                 from cProfile import Profile
                 profiler_factory = Profile
             self.profiler = profiler_factory(timer=time.thread_time_ns, timeunit=1e-9)
+            if self.profiler is None:
+                raise UnsupportedProfileEngine()
         except BaseException as error:
-            self.error('admission', error)
+            self.graph_unavailable = True
+            self.record_error('admission', error)
 
     def error(self, stage, error):
         try:
             self.errors.append({'stage': stage, 'error_type': _safe_name(type(error).__name__)})
+        except BaseException:
+            self.recording_failed = True
+
+    def record_error(self, stage, error):
+        try:
+            self.error(stage, error)
         except BaseException:
             self.recording_failed = True
 
@@ -147,7 +162,7 @@ class CPUProfile:
         try:
             start = (time.perf_counter_ns(), time.thread_time_ns())
         except BaseException as error:
-            self.error('phase_clock_start', error)
+            self.record_error('phase_clock_start', error)
         try:
             yield
         except BaseException as error:
@@ -163,7 +178,7 @@ class CPUProfile:
                     'exception_type': _safe_name(type(original).__name__) if original else None,
                     'complete': start is not None})
             except BaseException as error:
-                self.error('phase_clock_end', error)
+                self.record_error('phase_clock_end', error)
 
     @contextmanager
     def call(self, phase, ordinal=None):
@@ -182,9 +197,14 @@ class CPUProfile:
                 if sys.getprofile() is not None:
                     raise RuntimeError('ExistingProfileHook')
                 self.profiler.enable()
+                if sys.getprofile() is not self.profiler:
+                    # A global monitoring engine can collect other threads,
+                    # whose thread CPU clocks cannot form this own-thread graph.
+                    self.graph_unavailable = True
+                    raise UnsupportedProfileEngine()
                 self.active = enabled = True
         except BaseException as error:
-            self.error('enable', error)
+            self.record_error('enable', error)
             # enable can install its callback before raising. Remove an owned
             # partial hook before business execution, without touching foreign
             # callbacks or replacing the business exception that follows.
@@ -204,24 +224,24 @@ class CPUProfile:
                     'outcome': 'error' if original else 'returned',
                     'exception_type': _safe_name(type(original).__name__) if original else None})
             except BaseException as error:
-                self.error('call_record', error)
+                self.record_error('call_record', error)
 
     def disable_owned(self):
         try:
             current = sys.getprofile()
             if current is not None and current is not self.profiler:
-                self.error('disable', RuntimeError('ForeignProfileHook'))
+                self.record_error('disable', RuntimeError('ForeignProfileHook'))
                 return
             if self.profiler is not None:
                 self.profiler.disable()
         except BaseException as error:
-            self.error('disable', error)
+            self.record_error('disable', error)
         finally:
             try:
                 if self.profiler is not None and sys.getprofile() is self.profiler:
                     sys.setprofile(None)
             except BaseException as error:
-                self.error('disable_cleanup', error)
+                self.record_error('disable_cleanup', error)
 
     def hook(self, target, name, phase, *, expected=None, ordinal=False):
         if self.profiler is None:
@@ -259,7 +279,7 @@ class CPUProfile:
             setattr(target, name, wrapper)
             self.hooks.append((target, name, previous, wrapper, locally_defined))
         except BaseException as error:
-            self.error('hook_install', error)
+            self.record_error('hook_install', error)
 
     def restore(self):
         for target, name, previous, wrapper, locally_defined in reversed(self.hooks):
@@ -271,9 +291,11 @@ class CPUProfile:
                 else:
                     delattr(target, name)
             except BaseException as error:
-                self.error('hook_restore', error)
+                self.hook_restoration_failed = True
+                self.record_error('hook_restore', error)
         self.hooks.clear()
-        self.hooks_restored = not any(row['stage'] == 'hook_restore' for row in self.errors)
+        self.hooks_restored = (not self.hook_restoration_failed
+            and not any(row['stage'] == 'hook_restore' for row in self.errors))
 
     def summary(self):
         return {'role': self.role, 'lane': self.lane, 'requested_calls': len(self.calls),
@@ -283,34 +305,45 @@ class CPUProfile:
             'closed': self.closed, 'persisted': self.persisted,
             'hooks_restored': self.hooks_restored, 'errors': list(self.errors),
             'recording_failed': self.recording_failed,
+            'function_graph_unavailable': self.graph_unavailable,
             'complete': self.closed and self.persisted and self.hooks_restored and bool(self.calls)
-                and all(row['profiled'] for row in self.calls) and not self.errors and not self.recording_failed}
+                and all(row['profiled'] for row in self.calls) and not self.errors
+                and not self.recording_failed and not self.graph_unavailable}
 
     def close(self, path):
         """Export once on owner after all work; preserve every primary failure."""
         if self.closed:
             return self.summary()
         if not self.owning_thread():
-            self.error('close', RuntimeError('WrongProfileOwner'))
+            self.record_error('close', RuntimeError('WrongProfileOwner'))
             return self.summary()
         self.restore()
         self.closed = True
         try:
-            from pstats import Stats
-            graph = sanitized_stats(Stats(self.profiler).stats) if self.profiler is not None else {
-                'functions': [], 'function_identities': [], 'repository_source_sha256': {}}
+            graph = {'functions': [], 'function_identities': [], 'repository_source_sha256': {}}
+            try:
+                if self.profiler is not None and not self.graph_unavailable:
+                    from pstats import Stats
+                    graph = sanitized_stats(Stats(self.profiler).stats)
+            except BaseException as error:
+                # Preserve independently recorded owner-thread phases even if
+                # cProfile statistics cannot form a safe graph. Set the flag
+                # first: a broken error sink must never promote this evidence.
+                self.graph_unavailable = True
+                self.record_error('export', error)
             value = {'schema_version': 1, **request_profile(True),
                 'python_version': sys.version.split()[0], 'pid': os.getpid(),
                 'thread_native_id': threading.get_native_id(),
                 'timer_resolution_seconds': time.get_clock_info('thread_time').resolution,
                 'scope': 'own main thread; cProfile enabled only during recorded calls',
                 'coverage': self.summary(), 'calls': self.calls, 'phases': self.phases, **graph}
+            value['function_graph_status'] = 'UNAVAILABLE' if self.graph_unavailable else 'COMPLETE'
             value['hook_source_sha256'] = self.hook_sources
             # Payload says persisted only if exclusive creation, flush/fsync
             # and atomic replacement succeed; completion is checked by readers.
             value['coverage'].update(persisted=True, complete=bool(self.calls)
                 and all(row['profiled'] for row in self.calls) and self.hooks_restored
-                and not self.errors and not self.recording_failed)
+                and not self.errors and not self.recording_failed and not self.graph_unavailable)
             path = Path(path)
             temporary = path.with_suffix('.tmp')
             with temporary.open('x') as stream:
@@ -321,5 +354,5 @@ class CPUProfile:
             temporary.replace(path)
             self.persisted = True
         except BaseException as error:
-            self.error('export', error)
+            self.record_error('export', error)
         return self.summary()
