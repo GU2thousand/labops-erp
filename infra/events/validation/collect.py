@@ -7,9 +7,48 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import time
 import requests
 from wait_ready import load_env
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from benchmarks.events.runner_profile import selected_image_profile
+
+
+def selected_service_images(command, run, project):
+    """Read already-selected image IDs once; never pull images or inspect Env."""
+    container_format = ('{"container_id":{{json .Id}},"image_id":{{json .Image}},'
+        '"declared_image_ref":{{json .Config.Image}},'
+        '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
+        '"service":{{json (index .Config.Labels "com.docker.compose.service")}}}')
+    image_format = ('{"image_id":{{json .Id}},"repo_digests":{{json .RepoDigests}},'
+        '"architecture":{{json .Architecture}},"os":{{json .Os}},'
+        '"image_version_label":{{json (index .Config.Labels "org.opencontainers.image.version")}}}')
+    cache = {}
+    result = {}
+    for service in ('redpanda-0', 'redpanda-1', 'redpanda-2', 'postgres', 'kafka-exporter', 'prometheus'):
+        try:
+            ids = run([*command, 'ps', '--all', '--quiet', service])
+            rows = ids['output'].splitlines() if ids['exit_code'] == 0 else []
+            if len(rows) != 1 or not re.fullmatch(r'[a-f0-9]{64}', rows[0]):
+                raise ValueError('Expected one owned service container')
+            inspected = run(['docker', 'container', 'inspect', rows[0], '--format', container_format])
+            if inspected['exit_code'] != 0:
+                raise ValueError('Container identity inspection unavailable')
+            container = json.loads(inspected['output'])
+            image_id = container.get('image_id')
+            if container.get('project') != project or container.get('service') != service \
+                    or not isinstance(image_id, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', image_id):
+                raise ValueError('Container/image outside expected evidence scope')
+            if image_id not in cache:
+                raw = run(['docker', 'image', 'inspect', image_id, '--format', image_format])
+                if raw['exit_code'] != 0:
+                    raise ValueError('Selected image inspection unavailable')
+                cache[image_id] = json.loads(raw['output'])
+            result[service] = selected_image_profile(container, cache[image_id], project, service)
+        except Exception as error:
+            result[service] = {'status': 'unavailable', 'error_type': type(error).__name__}
+    return result
 
 
 def network_identity(command, project):
@@ -85,12 +124,18 @@ def main():
     if args.network_snapshot_only:
         print(json.dumps({'run_id': args.run_id, 'network_evidence': str(network_path)}))
         return
-    # Only image IDs and repo digests are inspected, never container Env.
-    image = run(['docker', 'image', 'inspect', env['REDPANDA_IMAGE'], '--format', '{{json .RepoDigests}}'])
+    # The actual container's immutable selected image wins over a tag/index
+    # reference, including on ARM. RepoDigests kind is not silently inferred.
+    selected_images = selected_service_images(command, run, env['LABOPS_VALIDATION_PROJECT'])
+    broker_image = selected_images['redpanda-0']
+    image = {'exit_code': 0 if broker_image['status'] == 'available' else 1,
+             'output': json.dumps(broker_image.get('repo_digests')),
+             'stderr': '', 'source': 'owned redpanda-0 selected image inspection'}
     commit = run(['git', 'rev-parse', 'HEAD'])['output'].strip()
     manifest = {'run_id': args.run_id, 'commit': commit, 'github_run_id': os.getenv('GITHUB_RUN_ID'),
         'github_run_attempt': os.getenv('GITHUB_RUN_ATTEMPT'), 'github_run_url': f'https://github.com/{os.getenv("GITHUB_REPOSITORY")}/actions/runs/{os.getenv("GITHUB_RUN_ID")}' if os.getenv('GITHUB_RUN_ID') else None,
         'broker_image': env['REDPANDA_IMAGE'], 'actual_image_digests': image,
+        'selected_service_images': selected_images,
         'python': platform.python_version(), 'platform': platform.platform(),
         'host_cpu_count': os.cpu_count(), 'docker_resources': run(['docker', 'info', '--format', '{{json .NCPU}} {{json .MemTotal}}']),
         'scope': 'three broker processes on one host; independent AZ and production unverified',

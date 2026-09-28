@@ -39,6 +39,27 @@ duration and one crash repetition); manual full inputs request 90,000 events,
 requesting full inputs does not prove every broker/consumer outage lasted the
 plan's five/ten minutes or every acceptance scenario was executed.
 
+Automatic jobs and the manual default use `runner_arch=x64` on
+`ubuntu-24.04`. The manual comparison permits only `arm64` on
+`ubuntu-24.04-arm`; arbitrary labels, architecture mismatches and private or
+self-hosted runner contexts fail admission before Docker. GitHub documents both
+as [standard runners for public repositories](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories),
+whose standard usage is free. This comparison keeps the same application,
+workload, four lanes and acceptance gates. It does not establish independent-host
+HA or explain performance differences by architecture alone.
+
+Before dependencies and services, `runner-profile.json` freezes the selected
+label, actual `RUNNER_ARCH` and platform architecture, Python version, source
+revision, logical CPU count, affinity and visible own-process cgroup CPU limits.
+Missing counters remain unknown. Logical CPUs and runner specifications do not
+prove physical core count; that field remains unmeasured. After execution, the
+collector records the IDs, architectures and repository digests of the images
+actually selected by the six validation services, without an additional pull.
+Architecture-specific child digests may differ beneath a shared image manifest.
+The planned ARM 3,000-event/50-per-second/60-second comparison explicitly enables
+diagnostics; its inclusive elapsed and latency gates remain unchanged. The prior
+x64 rate and latency failure remains a separate retained result.
+
 Runtime diagnostics are an explicit opt-in with `--runtime-diagnostics`.
 The default CLI and automatic 60-event smoke leave diagnostics disabled. The
 manual workflow's `runtime_diagnostics` boolean also defaults to `false`; the
@@ -131,8 +152,11 @@ capacity-scenario batches of **512 or more commands** use exactly four fresh
 `spawn` children (`spawn-lanes-v1`); smaller capacity batches use the existing
 four thread lanes (`parallel-lanes-v1`). Thus 512/3,000-command probes and full
 90,000 steady/30,000 fault inputs select spawn; default 60-command steady and
-20-command fault inputs retain threads. The approved spawn experiment has no
-claimed hosted acceptance result yet. Both modes have four FIFO worker lanes,
+20-command fault inputs retain threads. The hosted spawn probe at `605c9d3`
+failed: 3,000 commands took 93.519 seconds (32.079/s), with analytics p99
+18.297 seconds and notification p99 25.105 seconds. All 3,000 original events
+and both consumers completed with exact effects and no ledger mismatch; this
+does not satisfy the rate or latency gates. Both modes have four FIFO worker lanes,
 each with queue capacity four. Assign an entire
 four-command cycle to lane `(global_index//4)%4`; command kind follows
 `global_index%4` as receipt, issue, transfer, reversal. Each complete cycle retains

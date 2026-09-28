@@ -5,6 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      runner_arch:
+        description: 'Standard hosted runner architecture (workload and acceptance gates stay fixed)'
+        type: choice
+        options: [x64, arm64]
+        default: x64
       tier:
         description: 'full freezes the plan targets; smoke permits smaller integration inputs'
         type: choice
@@ -37,7 +42,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   same-host-rf3:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 240
     env:
       EVENTS_COUNT: ${{ github.event.inputs.events || '60' }}
@@ -46,12 +51,21 @@ jobs:
       FAULT_REPETITIONS: ${{ github.event.inputs.fault_repetitions || '1' }}
       EVENTS_TIER: ${{ github.event.inputs.tier || 'smoke' }}
       RUNTIME_DIAGNOSTICS: ${{ github.event.inputs.runtime_diagnostics || 'false' }}
+      EVENTS_RUNNER_ARCH: ${{ github.event.inputs.runner_arch }}
+      EVENTS_RUNNER_LABEL: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+      EVENTS_REPOSITORY_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
+      - name: Admit and freeze standard runner before services
+        id: runner_profile
+        run: |
+          RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
+          echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          python benchmarks/events/runner_profile.py --choice "$EVENTS_RUNNER_ARCH" --event-name "$GITHUB_EVENT_NAME" --requested-label "$EVENTS_RUNNER_LABEL" --runner-arch "$RUNNER_ARCH" --runner-environment "$RUNNER_ENVIRONMENT" --runner-os "$RUNNER_OS" --repository-visibility "$EVENTS_REPOSITORY_VISIBILITY" --source-sha "$GITHUB_SHA" --output "infra/events/validation/evidence/$RUN_ID/runner-profile.json"
       - name: Install fixed clients
         run: pip install -r requirements.txt
       - name: Verify events monitoring rules and firing/recovery behavior
@@ -60,10 +74,8 @@ jobs:
           docker run --rm --entrypoint /bin/promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" -w /etc/prometheus prom/prometheus:v3.3.0 test rules /etc/prometheus/events-alerts.test.yml
       - name: Create isolated secrets and configuration
         run: |
-          RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
-          echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          python infra/events/validation/prepare.py --run-id "$RUN_ID"
-          mkdir -p "infra/events/validation/evidence/$RUN_ID/logs"
+          python infra/events/validation/prepare.py --run-id "$EVENTS_RUN_ID"
+          mkdir -p "infra/events/validation/evidence/$EVENTS_RUN_ID/logs"
           docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml config --quiet
       - name: Start three brokers and PostgreSQL
         run: |
@@ -99,11 +111,11 @@ jobs:
           esac
           python benchmarks/events/acceptance.py --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
       - name: Verify actual offsets topic replication and topic configuration
-        if: always()
+        if: ${{ always() && steps.runner_profile.outcome == 'success' }}
         run: |
           python infra/events/admin.py topics --env-file infra/events/validation/generated/client.env --verify-only --verify-offsets --report "infra/events/validation/evidence/$EVENTS_RUN_ID/topics-after.json"
       - name: Collect bounded evidence without secrets
-        if: always()
+        if: ${{ always() && steps.runner_profile.outcome == 'success' }}
         run: |
           python infra/events/validation/collect.py --env-file infra/events/validation/generated/client.env --run-id "$EVENTS_RUN_ID" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
       - uses: actions/upload-artifact@v4
@@ -114,5 +126,5 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Remove only this disposable project after evidence upload
-        if: always()
+        if: ${{ always() && steps.runner_profile.outcome == 'success' }}
         run: docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics down --volumes
