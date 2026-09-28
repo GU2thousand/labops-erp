@@ -1,5 +1,6 @@
 """Real, isolated PostgreSQL / RF3 SASL_SSL acceptance; see README.md."""
 import argparse
+import copy
 from collections import Counter
 import csv
 from datetime import timedelta
@@ -53,11 +54,15 @@ def load_environment(path):
 
 
 def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False):
-    from benchmarks.events.concurrent_generation import frozen_generation_profile
+    from benchmarks.events.process_generation import frozen_process_profile
     from benchmarks.events.runtime_diagnostics import diagnostics_profile
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
-        json.dump({'run_id': run_id, **frozen_generation_profile(),
+        json.dump({'run_id': run_id, **frozen_process_profile(),
+            'selection_policy': {'mode': 'automatic', 'spawn_minimum_batch_count': 512,
+                'smaller_capacity_batches': 'four FIFO thread lanes',
+                'capacity_batches_at_or_above_threshold': 'four fresh spawn clients',
+                'test_only_force_override': False},
             'runtime_diagnostics': {**diagnostics_profile(),
                 'enabled': runtime_diagnostics, 'applicable': runtime_diagnostics,
                 'request_status': 'REQUESTED' if runtime_diagnostics else 'NOT_REQUESTED',
@@ -157,6 +162,8 @@ class Harness:
         self._event_lock = threading.Lock()
         self._next_command_index = 0
         self.generation_topologies = []
+        self.process_generation_enabled = None  # automatic, frozen count threshold
+        self.process_batches = []
         self.cases = []
         self.delivery_proofs = []
         self.logs = []
@@ -561,10 +568,17 @@ class Harness:
             frozen_resources = resource_profile['containers']
             stopped_roles = tuple(role for role, row in frozen_resources.items()
                                   if role in DEFAULT_SERVICES and row.get('status') == 'known_stopped')
+            process_options = {}
+            if self.use_process_generation(count):
+                self._active_process_catalog = self.create_process_catalog(label)
+                process_options['managed_process_sampler'] = self._active_process_catalog.sample
+                write_json(self.evidence / f'process-resource-profile-{number:03d}.json',
+                           self._active_process_catalog.profile())
             observer = RuntimeDiagnostics(path, scenario=label,
                 resource_sampler=resources.snapshot,
                 known_stopped_roles=stopped_roles,
-                expected_resource_roles=tuple(role for role in DEFAULT_SERVICES if role not in stopped_roles))
+                expected_resource_roles=tuple(role for role in DEFAULT_SERVICES if role not in stopped_roles),
+                **process_options)
         except BaseException as startup_error:
             self.runtime_diagnostic_errors.append(type(startup_error).__name__)
             self.runtime_diagnostics.append({'scenario': label, 'artifact': path.name,
@@ -703,6 +717,15 @@ class Harness:
                      'generator_topology': 'serial_fault_fixture', 'lane_assignment': '(global_index//4)%4'}
 
     def _generate_concurrent(self, count, label, *, rate):
+        if self.use_process_generation(count):
+            return self._generate_processes(count, label, rate=rate)
+        return self._generate_concurrent_threads(count, label, rate=rate)
+
+    def use_process_generation(self, count):
+        selection = getattr(self, 'process_generation_enabled', False)
+        return count >= 512 if selection is None else selection is True
+
+    def _generate_concurrent_threads(self, count, label, *, rate):
         from benchmarks.events.concurrent_generation import allocate_lane_indices, run_paced_lanes
         began = time.monotonic()
         start_index = self._next_command_index
@@ -780,6 +803,372 @@ class Harness:
             'queue_capacity_per_lane': 4, 'topology_artifact': f'generation-topology-{number:03d}.json',
             'elapsed_boundary': 'before lane batch setup through all worker commits/observations and joined connection cleanup'}
 
+    def create_process_catalog(self, label):
+        from benchmarks.events.process_resources import ProcessResources, GENERATOR_ROLES, WORKER_ROLES
+        required = tuple(name for name in self.workers if name in WORKER_ROLES)
+        stopped = ('analytics',) if label == 'analytics_outage' else ()
+        catalog = ProcessResources(required_roles=GENERATOR_ROLES + required,
+                                   known_stopped_roles=stopped)
+        for name in required:
+            process = self.workers[name]
+            if process.poll() is not None:
+                raise AssertionError('Managed Kafka worker exited before process workload')
+            catalog.register(name, process.pid)
+            catalog.ready(name)
+        return catalog
+
+    def _generate_processes(self, count, label, *, rate):
+        from benchmarks.events.concurrent_generation import allocate_lane_indices
+        from benchmarks.events.process_generation import run_paced_processes
+        from benchmarks.events.business_commands import inventory_process_worker
+        from benchmarks.events.origin_journal import CompositeGenerationJournal
+        began = time.monotonic()
+        start_index = self._next_command_index
+        self._next_command_index += count
+        allocation = allocate_lane_indices(count, start_index=start_index)
+        number = len(self.generation_topologies) + 1
+        path = self.evidence / f'generation-topology-{number:03d}.json'
+        schedule_path = self.evidence / f'generation-schedule-{number:03d}.jsonl'
+        topology = {'scenario': label, 'generator_topology': 'spawn-lanes-v1',
+            'requested': count, 'global_target_rate': rate, 'start_global_index': start_index,
+            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'result_capacity_total': 16, 'assignment': '(global_index//4)%4',
+            'position': 'global_index%4', 'nominal_per_lane_average_rate': rate / 4,
+            'origin_plans': [], 'passed': False, 'secondary_errors': [],
+            'selection': 'test-only forced' if self.process_generation_enabled is True else 'automatic count>=512'}
+        self.generation_topologies.append(topology)
+        if not hasattr(self, 'process_batches'):
+            self.process_batches = []
+        self.process_batches.append(topology)
+        plans, items = [], []
+        records = {lane: {'lane': lane, 'pid': None, 'ready_metadata': None,
+                         'cleanup_metadata': None, 'exitcode': None} for lane in range(4)}
+        started_indices = {lane: set() for lane in range(4)}
+        original = None
+        driver_entered = False
+
+        def secondary(stage, error):
+            nonlocal original
+            topology['secondary_errors'].append({'stage': stage, 'error_type': type(error).__name__})
+            original = original or error
+            self._generation_accounting_error = type(error).__name__
+
+        try:
+            if not isinstance(self.generation, CompositeGenerationJournal):
+                self.generation = CompositeGenerationJournal(self.generation)
+            namespace_names = ('EVENT_TRANSPORT', 'KAFKA_TOPIC', 'KAFKA_SOURCE_CLUSTER_ID',
+                               'KAFKA_SOURCE_STREAM_GENERATION', 'EVENT_MAX_PAYLOAD_BYTES')
+            runtime_settings = {name: getattr(self.settings, name) for name in namespace_names}
+            if runtime_settings['EVENT_TRANSPORT'] != 'kafka':
+                raise ValueError('Spawn workload requires the caller frozen Kafka transport')
+            database_config = copy.deepcopy(self.connection.settings_dict)
+            safe_database = {name: str(database_config.get(name, ''))
+                             for name in ('ENGINE', 'HOST', 'PORT', 'NAME', 'USER')}
+            database_scope_digest = canonical_hash(safe_database)
+            for lane, indices in enumerate(allocation):
+                data = self.business_lanes[lane]
+                context = {'actor_id': str(self.admin.id), 'source_warehouse_id': str(self.source.id),
+                    'target_warehouse_id': str(self.target.id), 'task_id': str(data['task'].id),
+                    'project_id': str(data['project'].id), 'order_id': str(data['order'].id),
+                    'order_line_id': str(data['order_line'].id),
+                    'batch_id': str(data['batch'].id) if data['batch'] else None,
+                    'cycle_issue_id': str(data['cycle_issue'].id) if data['cycle_issue'] else None,
+                    'source_cluster': runtime_settings['KAFKA_SOURCE_CLUSTER_ID'],
+                    'source_generation': runtime_settings['KAFKA_SOURCE_STREAM_GENERATION'],
+                    'topic': runtime_settings['KAFKA_TOPIC'], 'database_scope_digest': database_scope_digest,
+                    'source_context_digest': canonical_hash(runtime_settings)}
+                origin_id = f'process_batch_{number:03d}_lane_{lane}'
+                application = 'labops.generator.' + hashlib.sha256(
+                    (self.args.run_id + ':' + origin_id).encode()).hexdigest()[:32]
+                directory = self.evidence / 'origins' / origin_id
+                plan = {'origin_id': origin_id, 'run_id': self.args.run_id, 'lane': lane,
+                    'label': label, 'indices': list(indices), 'rate': rate / 4,
+                    'context': context, 'database_name': database_config['NAME'],
+                    'application_name': application, 'directory': str(directory), 'path': str(directory)}
+                self.generation.add_origin_plan(plan)
+                plans.append(plan)
+            topology.update(origin_plans=plans, runtime_namespace=runtime_settings)
+            write_json(path, topology)
+            write_json(self.evidence / f'process-generation-plan-{number:03d}.json', {
+                'scenario': label, 'plans': plans, 'runtime_namespace': runtime_settings,
+                'database_scope_digest': database_scope_digest, 'private_database_config_included': False})
+            bootstrap = {'plans': plans, 'profile': self.generation.profile, 'rate': rate,
+                'database_config': database_config, 'runtime_settings': runtime_settings,
+                'runtime_diagnostics_enabled': getattr(self, 'runtime_diagnostics_enabled', False)}
+            catalog = getattr(self, '_active_process_catalog', None) if bootstrap['runtime_diagnostics_enabled'] else None
+
+            def started(lane, pid):
+                records[lane]['pid'] = pid
+                if catalog is not None:
+                    catalog.register(f'generator-{lane}', pid)
+
+            def ready(lane, pid, metadata):
+                identity = metadata['backend_identity']
+                if (identity['database_name'] != database_config['NAME']
+                        or identity['application_name'] != plans[lane]['application_name']
+                        or metadata['runtime_namespace'] != runtime_settings):
+                    raise ValueError('Child runtime handshake differs from frozen caller namespace')
+                records[lane]['ready_metadata'] = metadata
+                if catalog is not None:
+                    catalog.ready(f'generator-{lane}', child_snapshot=metadata['process_snapshot'])
+
+            def observe(value):
+                with schedule_path.open('a') as output:
+                    output.write(json.dumps(value, sort_keys=True) + '\n')
+                lane = value.get('lane')
+                if lane in records:
+                    if value['kind'] == 'started':
+                        started_indices[lane].add(value['global_index'])
+                    elif value['kind'] == 'cleanup_complete':
+                        records[lane]['cleanup_metadata'] = value.get('metadata')
+                    elif value['kind'] == 'process_exit':
+                        records[lane]['exitcode'] = value.get('exitcode')
+                        metadata = records[lane]['cleanup_metadata']
+                        if catalog is not None:
+                            catalog.finalize(f'generator-{lane}',
+                                final_snapshot=metadata.get('process_snapshot') if metadata else None,
+                                exitcode=value['exitcode'], cleaned=metadata is not None
+                                    and metadata.get('connection_closed') is True)
+                    elif value['kind'] == 'completed' and value.get('result') is not None:
+                        self.record_generated_event(value['result'])
+                if value['kind'] == 'summary':
+                    topology['driver_summary'] = value
+                for name, process in self.workers.items():
+                    if process.poll() is not None:
+                        raise AssertionError(f'Managed Kafka worker exited during process generation: {name}')
+
+            driver_entered = True
+            items = run_paced_processes(count, rate, inventory_process_worker, bootstrap,
+                start_index=start_index, on_observation=observe,
+                on_process_started=started, on_process_ready=ready)
+        except BaseException as exc:
+            original = exc
+        finally:
+            topology['children'] = list(records.values())
+            planned_lanes = {plan['lane'] for plan in plans}
+            # A failure while preparing a prefix of plans retains every other
+            # requested input as unattempted, rather than losing denominators.
+            for lane in set(range(4)) - planned_lanes:
+                try:
+                    batch = self.generation.begin_batch(len(allocation[lane]), rate / 4, label)
+                    self.generation.finish_failure(batch, 'process_plan_startup',
+                        type(original).__name__ if original else 'IncompleteProcessPlan')
+                except BaseException as error:
+                    secondary('startup_denominator', error)
+            settled = not driver_entered
+            if driver_entered:
+                try:
+                    settled = self.settle_process_sessions(plans, records)
+                    if not settled:
+                        raise RuntimeError('Owned child PostgreSQL sessions did not settle')
+                except BaseException as error:
+                    secondary('session_settlement', error)
+            topology['owned_sessions_settled'] = settled
+            if original is not None:
+                for plan in plans:
+                    try:
+                        self.generation.note_transport(plan['origin_id'],
+                            started_indices=started_indices[plan['lane']], stage='process_transport',
+                            error_type=type(original).__name__, execution_permitted=driver_entered)
+                        if driver_entered:
+                            self.generation.reconcile_origin(plan['origin_id'],
+                                settled=settled, query_callback=self.process_database_facts)
+                    except BaseException as error:
+                        secondary('origin_reconciliation', error)
+            try:
+                self.merge_origin_events(plans)
+                for lane, record in records.items():
+                    metadata = record['cleanup_metadata']
+                    if metadata and record['exitcode'] == 0:
+                        self.restore_process_lane_state(lane, metadata['lane_state'])
+            except BaseException as error:
+                secondary('origin_closeout', error)
+            try:
+                topology['batches'] = [batch for batch in self.generation.summary()['batches']
+                    if batch.get('origin_id') in {plan['origin_id'] for plan in plans}]
+                driver = topology.get('driver_summary', {})
+                complete = (driver.get('lifecycle_complete') is True and driver.get('channels_closed') is True
+                    and driver.get('worker_processes_joined') is True
+                    and driver.get('worker_completion_observed') is True
+                    and all(record['exitcode'] == 0 and record['cleanup_metadata']
+                        and record['cleanup_metadata'].get('connection_closed') is True
+                        for record in records.values())
+                    and len(topology['batches']) == 4
+                    and all(batch['status'] == 'succeeded'
+                        and batch['requested'] == batch['committed'] == batch['identified_events']
+                        and not any(batch.get(key, 0) for key in ('commit_unknown', 'attempted_unknown', 'integrity_failed'))
+                        for batch in topology['batches']))
+                topology.update(passed=original is None and settled and complete,
+                    error_type=type(original).__name__ if original else None)
+                if not topology['passed'] and original is None:
+                    raise RuntimeError('Process lifecycle or original accounting did not qualify')
+                write_json(path, topology)
+            except BaseException as error:
+                secondary('topology_persistence', error)
+                topology['passed'] = False
+            elapsed = None
+            try:
+                # Include required final topology persistence in measured time.
+                elapsed = time.monotonic() - began
+                topology['elapsed_seconds'] = elapsed
+                topology['final_elapsed_metadata_rewrite'] = 'after required measured evidence persistence'
+                write_json(path, topology)
+            except BaseException as error:
+                secondary('elapsed_metadata', error)
+                topology['passed'] = False
+        if original is not None:
+            raise original
+        self.events.sort(key=lambda item: item['global_index'])
+        last = self.business_lanes[((start_index + count - 1) // 4) % 4]
+        self.batch, self.cycle_issue = last['batch'], last['cycle_issue']
+        return [item['event_id'] for item in items], {'input': count, 'completed_commands': len(items),
+            'elapsed_seconds': elapsed, 'target_rate': rate,
+            'actual_command_rate': len(items) / elapsed if elapsed else None,
+            'schedule_lateness_seconds': max(0, elapsed - count / rate),
+            'generator_topology': 'spawn-lanes-v1', 'lane_count': 4, 'queue_capacity_per_lane': 4,
+            'topology_artifact': path.name,
+            'elapsed_boundary': 'before plan/spawn/init through all commits, origin observations, owning cleanup/reap, session settlement and required evidence'}
+
+    def restore_process_lane_state(self, lane, state):
+        data = self.business_lanes[lane]
+        batch = self.models.Batch.objects.get(pk=state['batch_id']) if state['batch_id'] else None
+        issue = self.models.StockMovement.objects.get(pk=state['cycle_issue_id']) if state['cycle_issue_id'] else None
+        if batch is not None and not self.models.ReceiptLine.objects.filter(
+                batch=batch, order_line=data['order_line']).exists():
+            raise ValueError('Child returned a batch outside its frozen business lane')
+        if issue is not None and (issue.type != 'ISSUE' or issue.status != 'POSTED'
+                or not issue.lines.filter(batch=batch, task=data['task']).exists()
+                or not issue.idempotency_key.startswith(self.args.run_id + ':')):
+            raise ValueError('Child returned an issue outside its frozen business lane')
+        data['batch'], data['cycle_issue'] = batch, issue
+
+    def merge_origin_events(self, plans):
+        known = {item['event_id']: item for item in self.events}
+        for plan in plans:
+            indices = frozenset(plan['indices'])
+            path = Path(plan['directory']) / 'events.jsonl'
+            if not path.exists():
+                continue
+            for line in path.read_text().splitlines():
+                item = json.loads(line)
+                if item['global_index'] not in indices or item['business_lane'] != plan['lane']:
+                    raise ValueError('Origin event is outside its frozen lane reservation')
+                if item['event_id'] in known:
+                    if known[item['event_id']] != item:
+                        raise ValueError('Origin and IPC event observations conflict')
+                else:
+                    self.record_generated_event(item)
+                    known[item['event_id']] = item
+
+    def settle_process_sessions(self, plans, records, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with self.connection.cursor() as cursor:
+                    cursor.execute('SELECT pid,backend_start FROM pg_stat_activity '
+                        'WHERE datname = %s AND application_name = ANY(%s)',
+                        [self.connection.settings_dict['NAME'], [plan['application_name'] for plan in plans]])
+                    remaining = cursor.fetchall()
+                if not remaining and time.monotonic() <= deadline:
+                    return True
+            except Exception:
+                return False
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+        return False
+
+    def process_database_facts(self, plan, command):
+        """Read exact original ledger/outbox identities after owned sessions settle.
+
+        No broker record, child acknowledgement or reconstructed timestamp can
+        manufacture a command. Query failures remain unknown in the composite.
+        """
+        from labops.event_schema import canonical_payload_hash, validate_inventory_envelope
+        context = plan['context']
+        namespace = {name: getattr(self.settings, name) for name in (
+            'EVENT_TRANSPORT', 'KAFKA_TOPIC', 'KAFKA_SOURCE_CLUSTER_ID',
+            'KAFKA_SOURCE_STREAM_GENERATION', 'EVENT_MAX_PAYLOAD_BYTES')}
+        safe_database = {name: str(self.connection.settings_dict.get(name, ''))
+                         for name in ('ENGINE', 'HOST', 'PORT', 'NAME', 'USER')}
+        facts = {'database_observed': True, 'command_key': command['command_key'],
+            'session_settled': True,
+            'database_scope_matches': canonical_hash(safe_database) == context['database_scope_digest'],
+            'source_context_matches': canonical_hash(namespace) == context['source_context_digest'],
+            'movement_rows': [], 'outbox_rows': [], 'marker_hashes': []}
+        movements = list(self.models.StockMovement.objects.filter(
+            idempotency_key=command['command_key']).select_related('receipt', 'reversal_of'))
+        for movement in movements:
+            lines = list(movement.lines.select_related('batch', 'receipt_line', 'task').order_by('line_no'))
+            batch_ids = {line.batch_id for line in lines}
+            batch_context = bool(lines) and len(batch_ids) == 1 and self.models.ReceiptLine.objects.filter(
+                batch_id=next(iter(batch_ids)), order_line_id=context['order_line_id'],
+                receipt__order_id=context['order_id']).exists()
+            actor_matches = str(movement.posted_by_id) == context['actor_id']
+            line_shape = False
+            input_data = None
+            if command['kind'] == 'RECEIPT':
+                line_shape = (len(lines) == 1 and lines[0].delta_qty == Decimal('4')
+                    and str(lines[0].warehouse_id) == context['source_warehouse_id']
+                    and movement.receipt_id is not None
+                    and str(movement.receipt.order_id) == context['order_id']
+                    and lines[0].receipt_line_id is not None
+                    and str(lines[0].receipt_line.order_line_id) == context['order_line_id'])
+                if movement.receipt_id:
+                    input_data = {'expected_version': movement.receipt.version - 1,
+                                  'receipt_id': str(movement.receipt_id)}
+            elif command['kind'] == 'ISSUE':
+                line_shape = (len(lines) == 1 and lines[0].delta_qty == Decimal('-1')
+                    and str(lines[0].warehouse_id) == context['source_warehouse_id']
+                    and str(lines[0].task_id) == context['task_id'])
+                if lines:
+                    input_data = {'task_id': context['task_id'], 'lines': [{'batch_id': str(lines[0].batch_id),
+                        'warehouse_id': context['source_warehouse_id'], 'qty': '1'}]}
+            elif command['kind'] == 'TRANSFER':
+                line_shape = (len(lines) == 2 and [(str(line.warehouse_id), line.delta_qty) for line in lines]
+                    == [(context['source_warehouse_id'], Decimal('-1')),
+                        (context['target_warehouse_id'], Decimal('1'))]
+                    and all(line.transfer_pair_no == 1 for line in lines))
+                if lines:
+                    input_data = {'batch_id': str(lines[0].batch_id),
+                        'from_warehouse_id': context['source_warehouse_id'],
+                        'to_warehouse_id': context['target_warehouse_id'], 'qty': '1'}
+            elif command['kind'] == 'REVERSAL':
+                line_shape = (len(lines) == 1 and lines[0].delta_qty == Decimal('1')
+                    and str(lines[0].warehouse_id) == context['source_warehouse_id']
+                    and str(lines[0].task_id) == context['task_id']
+                    and movement.reversal_of_id is not None
+                    and movement.reversal_of.type == 'ISSUE'
+                    and movement.reversal_of.idempotency_key == f"{plan['run_id']}:{command['global_index'] - 2}"
+                    and lines[0].reversal_of_line_id is not None)
+                input_data = {'reason': 'Synthetic acceptance reversal'}
+            row = {'id': str(movement.id), 'idempotency_key': movement.idempotency_key,
+                'status': movement.status, 'type': movement.type, 'actor_id': str(movement.posted_by_id),
+                'version': movement.version, 'request_hash': movement.request_hash,
+                'context_matches': batch_context and actor_matches and line_shape}
+            if input_data is not None:
+                row['expected_request_hash'] = self.services.movement_hash(self.admin, command['kind'], input_data)
+            facts['movement_rows'].append(row)
+            for event in self.models.OutboxEvent.objects.filter(aggregate_id=movement.id):
+                value = self.api.raw_envelope(event)
+                valid = True
+                try:
+                    validate_inventory_envelope(value, max_bytes=self.settings.EVENT_MAX_PAYLOAD_BYTES)
+                    digest = canonical_payload_hash(value)
+                except Exception:
+                    valid, digest = False, None
+                expected_lines = [{'batch_id': str(line.batch_id), 'warehouse_id': str(line.warehouse_id),
+                    'delta_qty': str(line.delta_qty), 'unit_cost': str(line.unit_cost)} for line in lines]
+                payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+                facts['outbox_rows'].append({'id': str(event.id), 'aggregate_type': event.aggregate_type,
+                    'aggregate_id': str(event.aggregate_id), 'aggregate_version': event.aggregate_version,
+                    'event_type': event.event_type, 'transport': event.transport,
+                    'schema_version': event.schema_version, 'dedupe_key': event.dedupe_key,
+                    'payload_hash': event.payload_hash, 'computed_payload_hash': digest, 'schema_valid': valid,
+                    'ledger_links_valid': payload.get('movement_id') == str(movement.id)
+                        and payload.get('movement_type') == movement.type and payload.get('lines') == expected_lines})
+                facts['marker_hashes'].extend(self.models.ProcessedEvent.objects.filter(event_id=event.id)
+                    .values_list('payload_hash', flat=True))
+        return facts
+
     def _execute_inventory_command(self, seq, label, batch, state, data, *, lane, scheduled_at):
         if not getattr(self, 'runtime_diagnostics_enabled', False):
             return self._execute_inventory_command_body(seq, label, batch, state, data,
@@ -821,66 +1210,13 @@ class Harness:
                 if original is None:
                     raise
 
-    def _execute_inventory_command_body(self, seq, label, batch, state, data, *, lane, scheduled_at):
-        from django.utils import timezone
-        from labops.purchasing.services import create_receipt
-        from django.db import transaction
-        key = f'{self.args.run_id}:{seq}'
-        rid = f'acceptance-{seq}'
-        before = time.time()
-        attempt = self.generation.attempt(batch)
-        state.update(attempt=attempt, stage='business_transaction')
-        with transaction.atomic():
-            with self.connection.cursor() as cursor:
-                cursor.execute('SELECT txid_current()::text')
-                inserted_xid = cursor.fetchone()[0]
-            position = seq % 4
-            if position == 0:
-                receipt = create_receipt(self.admin, {'order_id': str(data['order'].id), 'lines': [{
-                    'order_line_id': str(data['order_line'].id), 'warehouse_id': str(self.source.id),
-                    'qty': '4', 'batch_no': f'ACCEPTANCE-{self.args.run_id[:24]}-{seq}',
-                    'supplier_lot': 'SYNTHETIC', 'expires_on': str(timezone.localdate() + timedelta(days=365))}]}, rid)
-                data['batch'] = receipt.lines.first().batch
-                movement = self.services.post_receipt(self.admin, receipt.id,
-                    {'expected_version': receipt.version, 'receipt_id': str(receipt.id)}, key, rid)
-            elif position == 1:
-                movement = self.services.issue(self.admin, {'task_id': str(data.get('task', self.task).id), 'lines': [{
-                    'batch_id': str(data['batch'].id), 'warehouse_id': str(self.source.id), 'qty': '1'}]}, key, rid)
-                data['cycle_issue'] = movement
-            elif position == 2:
-                movement = self.services.transfer(self.admin, {'batch_id': str(data['batch'].id),
-                    'from_warehouse_id': str(self.source.id), 'to_warehouse_id': str(self.target.id), 'qty': '1'}, key, rid)
-            else:
-                assert data['cycle_issue'] is not None, 'Business lane lost its original issue before reversal'
-                movement = self.services.reverse(self.admin, data['cycle_issue'].id,
-                    {'reason': 'Synthetic acceptance reversal'}, key, rid)
-                data['cycle_issue'] = None
-        # Commit accounting precedes every optional timestamp/outbox/log
-        # observation, so an observation failure cannot erase a DB commit.
-        state['stage'] = 'commit_accounting'
+    def commit_generated_movement(self, batch, attempt, movement):
         self.generation.commit(batch, attempt, movement_id=str(movement.id))
-        transaction_return = time.time()
-        state['stage'] = 'commit_timestamp_observation'
-        with self.connection.cursor() as cursor:
-            cursor.execute('SHOW track_commit_timestamp')
-            enabled = cursor.fetchone()[0] == 'on'
-            if enabled:
-                cursor.execute('SELECT pg_xact_commit_timestamp(%s::xid)', [inserted_xid])
-                committed_at = cursor.fetchone()[0]
-            else:
-                committed_at = None
-        state['stage'] = 'outbox_observation'
-        event = self.models.OutboxEvent.objects.get(aggregate_id=movement.id)
+
+    def identify_generated_event(self, batch, attempt, event):
         self.generation.identify_event(batch, attempt, str(event.id))
-        item = {'event_id': str(event.id), 'movement_id': str(movement.id), 'kind': movement.type,
-                    'global_index': seq, 'business_lane': lane, 'scheduled_at_monotonic': scheduled_at,
-                    'scenario': label, 'command_started_at': before,
-                    'transaction_return_observed_at': transaction_return,
-                    'insert_transaction_xid': inserted_xid,
-                    'outbox_transaction_commit_at': committed_at.timestamp() if committed_at else None,
-                    'outbox_created_at': event.created_at.timestamp(),
-                    'payload_bytes': len(json.dumps(self.api.envelope(event)).encode())}
-        state['stage'] = 'event_log_observation'
+
+    def record_generated_event(self, item):
         with getattr(self, '_event_lock', threading.Lock()):
             self.events.append(item)
             with (self.evidence / 'events.jsonl').open('a') as out:
@@ -888,8 +1224,11 @@ class Harness:
         for name, process in self.workers.items():
             if process.poll() is not None:
                 raise AssertionError(f'Worker exited during generation: {name} ({process.returncode})')
-        state['attempt'] = None
-        return item
+
+    def _execute_inventory_command_body(self, seq, label, batch, state, data, *, lane, scheduled_at):
+        from benchmarks.events.business_commands import execute_inventory_command
+        return execute_inventory_command(self, seq, label, batch, state, data,
+                                         lane=lane, scheduled_at=scheduled_at)
 
     def offsets(self, timeout=30):
         def retry(code, attempt):
@@ -2145,6 +2484,7 @@ class Harness:
         generation_complete = (all(batch['status'] == 'succeeded' for batch in generation['batches'])
             and generation['totals']['requested'] == generation['totals']['committed']
             == generation['totals']['identified_events']
+            and not any(generation['totals'].get(key, 0) for key in ('commit_unknown', 'attempted_unknown', 'integrity_failed'))
             and not getattr(self, '_generation_accounting_error', None))
         topologies_complete = all(topology.get('passed') is True
                                   for topology in getattr(self, 'generation_topologies', []))

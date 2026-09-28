@@ -562,7 +562,8 @@ class RuntimeDiagnostics:
     def __init__(self, path, *, scenario, database_alias='default', resource_sampler=None,
                  interval_seconds=INTERVAL_SECONDS, max_samples=MAX_SAMPLES,
                  expected_resource_roles=None, known_stopped_roles=(),
-                 database_sampler=None, process_reader=None, host_reader=None, facts_reader=None):
+                 database_sampler=None, process_reader=None, host_reader=None, facts_reader=None,
+                 managed_process_sampler=None):
         if not isinstance(scenario, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,95}', scenario):
             raise ValueError('Expected an authored diagnostic scenario')
         if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, (int, float)) or not math.isfinite(interval_seconds) or interval_seconds <= 0:
@@ -572,6 +573,9 @@ class RuntimeDiagnostics:
         self.path, self.scenario = Path(path), scenario
         self.interval, self.max_samples = interval_seconds, max_samples
         self.resource_sampler = resource_sampler
+        if managed_process_sampler is not None and not callable(managed_process_sampler):
+            raise ValueError('Expected an owned process sampling callback')
+        self.managed_process_sampler = managed_process_sampler
         self.expected_resource_roles = tuple(sorted(CONTAINER_ROLES if expected_resource_roles is None else expected_resource_roles))
         self.known_stopped_roles = tuple(sorted(known_stopped_roles))
         if (not set(self.expected_resource_roles).issubset(CONTAINER_ROLES)
@@ -636,9 +640,13 @@ class RuntimeDiagnostics:
                     'process': self._safe_read(self.process_reader, 'process_sample'),
                     'host': self._safe_read(self.host_reader, 'host_sample'),
                     'database': self._safe_read(self.database_sampler.snapshot, 'database_sample'),
-                    'resources': None}
+                    'resources': None, 'managed_processes': None}
                 if self.resource_sampler is not None:
                     sample['resources'] = self._safe_read(lambda: sanitize_resources(self.resource_sampler()), 'container_sample')
+                if self.managed_process_sampler is not None:
+                    from benchmarks.events.process_resources import sanitize_process_resources
+                    sample['managed_processes'] = self._safe_read(
+                        lambda: sanitize_process_resources(self.managed_process_sampler()), 'managed_process_sample')
                 duration, cpu_duration = time.monotonic()-began, time.thread_time()-cpu
                 sample['sampler_wall_seconds'] = duration
                 sample['sampler_thread_cpu_seconds'] = cpu_duration
@@ -692,6 +700,11 @@ class RuntimeDiagnostics:
             if not isinstance(error, Exception):
                 final_interruptions.append(error)
         self._final_process = self._safe_read(self.process_reader, 'final_process', final_interruptions)
+        if self.managed_process_sampler is not None:
+            from benchmarks.events.process_resources import sanitize_process_resources
+            self._final_managed_processes = self._safe_read(
+                lambda: sanitize_process_resources(self.managed_process_sampler()),
+                'final_managed_processes', final_interruptions)
         if interruption is None and final_interruptions:
             interruption = final_interruptions[0]
         try:
@@ -766,10 +779,17 @@ class RuntimeDiagnostics:
         cpu_delta = counter_delta(first, last, ('user_cpu_seconds', 'system_cpu_seconds'))
         wall = _number(self._ended-self._started) if getattr(self, '_ended', None) is not None else None
         lifecycle_complete = bool(self._start_complete and self._joined and self._cleanup_complete and persisted and not errors)
+        managed_processes = None
+        if self.managed_process_sampler is not None:
+            from benchmarks.events.process_resources import summarize_process_resources
+            managed_processes = summarize_process_resources(
+                [sample.get('managed_processes') for sample in self._samples],
+                getattr(self, '_final_managed_processes', None))
         collection_complete = bool(lifecycle_complete and not self._truncated
             and wall is not None and all(value is not None for value in cpu_delta['values'].values())
             and not cpu_delta['reset_counters'] and database_complete and not resource_errors
-            and required.issubset(covered) and expected_stopped.issubset(stopped_observed))
+            and required.issubset(covered) and expected_stopped.issubset(stopped_observed)
+            and (managed_processes is None or managed_processes['collection_complete']))
         return {'scenario': self.scenario, 'profile': diagnostics_profile(),
             'artifact_name': self.path.name, 'facts': copy.deepcopy(getattr(self, '_facts', None)),
             'started_at': getattr(self, '_started_wall', None),
@@ -785,6 +805,9 @@ class RuntimeDiagnostics:
             'expected_resource_roles': list(self.expected_resource_roles),
             'known_stopped_roles': list(self.known_stopped_roles),
             'observed_cpu_memory_roles': sorted(covered), 'observed_known_stopped_roles': sorted(stopped_observed),
+            'managed_process_sampler_supplied': self.managed_process_sampler is not None,
+            'managed_process_resources': managed_processes,
+            'final_managed_processes': copy.deepcopy(getattr(self, '_final_managed_processes', None)),
             'sample_error_type_counts': dict(sample_errors),
             'database_delta': counter_delta(database_samples[0][1], database_samples[-1][1], DATABASE_COUNTERS) if len(database_samples)>1 else None,
             'database_delta_coverage_seconds': database_samples[-1][0]-database_samples[0][0] if len(database_samples)>1 else None,

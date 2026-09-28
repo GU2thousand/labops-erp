@@ -47,7 +47,8 @@ to `true` or pass the CLI flag. The requested profile freezes that choice before
 environment/setup. Disabling diagnostics changes instrumentation scope; it does
 not change the four lanes, queue capacity four, global target rate, 5% generation
 window or any business/fault denominator. No four-process execution mode is
-introduced by this checkpoint.
+selected by the diagnostics flag: process/thread selection follows the separately
+frozen count policy below, including when diagnostics are disabled.
 
 When disabled, the report records `runtime_diagnostics_enabled=false`,
 `runtime_diagnostics_applicable=false`, `runtime_diagnostics_status=NOT_REQUESTED`
@@ -125,8 +126,14 @@ decisions requiring executed staging evidence.
 
 ## Frozen business execution profile and known results
 
-Capacity scenarios use the separately declared `parallel-lanes-v1` execution
-profile: four FIFO worker lanes, each with queue capacity four. Assign an entire
+Before environment/setup, the CLI freezes an automatic selection policy:
+capacity-scenario batches of **512 or more commands** use exactly four fresh
+`spawn` children (`spawn-lanes-v1`); smaller capacity batches use the existing
+four thread lanes (`parallel-lanes-v1`). Thus 512/3,000-command probes and full
+90,000 steady/30,000 fault inputs select spawn; default 60-command steady and
+20-command fault inputs retain threads. The approved spawn experiment has no
+claimed hosted acceptance result yet. Both modes have four FIFO worker lanes,
+each with queue capacity four. Assign an entire
 four-command cycle to lane `(global_index//4)%4`; command kind follows
 `global_index%4` as receipt, issue, transfer, reversal. Each complete cycle retains
 that exact mix and its own batch/issue state. Global indices and lane state persist
@@ -147,24 +154,47 @@ order-line IDs, shared context and lock scope.
 One scheduler applies the requested **global** rate. At 50/s, 12.5/s per lane is a
 nominal average, not four independent 50/s schedulers or a 200/s workload. Bounded
 queues apply backpressure; each queue's four slots exclude its in-flight command.
-For each capacity batch, elapsed time starts before
-per-lane journal-batch setup and ends only after actual business commits,
-observations, connection cleanup, worker completion and joins, and journal
-finalization. Initial project/task/request/order fixture setup precedes that
-capacity clock and is excluded. Report completed commands divided by that elapsed time and
+For each capacity batch, elapsed starts before lane-batch or spawn-plan setup and
+includes actual business commits/observations, owning database close and worker
+completion. Threads include joins; spawn additionally includes spawn/init, origin
+persistence, reaping and PostgreSQL session settlement. Enabled diagnostic discovery and cleanup also consume that
+same clock. Spawn pacing begins after all four READY handshakes; readiness
+overhead still consumes the unchanged completion window. Initial shared business
+fixture setup precedes this clock and is excluded. Report completed commands divided by that elapsed time and
 the corresponding schedule lateness. Enqueuing 50 commands/s alone cannot pass
 the frozen generation-rate gate.
 
-The shared incremental journal uses an `RLock`; each lane receives its own batch
+Thread mode's shared incremental journal uses an `RLock`; each lane receives its own batch
 under the original scenario label. Retain requested/attempted/committed/
 identified/unattempted counts, per-lane outcomes and scheduled/started/completed/
 cancelled/unscheduled indices. A first failure stops scheduling and new command
-starts; already-started commands finish before cleanup. Every lane closes its
-own database connection and signals explicit completion, and every worker is
-joined before the original failure or interruption is rethrown. A passing final
+starts. Thread in-flight commands finish before owning connection cleanup and
+joins. Spawn failure cleanup is bounded: in-flight work may finish during an
+up-to-30-second drain, then SIGTERM/5-second grace and forced stop if necessary. Reap and
+session settlement remain required; a forced stop cannot imply rollback or
+complete cleanup. A passing final
 report requires every recorded generation topology to have `passed=true`, as
 well as all mandatory scenarios and journal/database/effect gates. A partial topology or cleanup failure
 cannot be hidden by a successful queue schedule or completed subset.
+
+Each spawn child exclusively owns its origin journal. ATTEMPT and COMMIT
+transitions are flushed and fsynced; identification/event observations are
+flushed, with the origin prefix fsynced on completion/failure/finalization.
+`CompositeGenerationJournal` unions thread and child reservations/counts without
+rewriting child evidence. A lost IPC result is `COMMIT_UNKNOWN` until retained
+origin evidence or exact legal movement/outbox reconciliation resolves it after
+the owned PostgreSQL sessions settle. Missing/conflicting facts stay unknown or
+failed; they never become zero commits. Reconciliation does not automatically
+replay a command or turn an interrupted batch into a pass.
+
+Private child bootstrap carries the actual owning Django database configuration,
+including its `NAME`, and the frozen `EVENT_TRANSPORT`, inventory topic, source
+cluster and stream generation. It does not select a database from an unrelated
+environment fallback. Artifacts retain safe identities/digests and authored
+namespace context, excluding credentials. Child failures cross IPC as sanitized
+stage/class/outcome evidence; raw messages/tracebacks and bootstrap credentials
+are not artifact content. Database reconciliation establishes legal row/outbox
+facts; configuration context alone does not establish broker source identity.
 
 Freeze `generation-execution-profile.json` exclusively and fsync it before
 environment loading or harness setup, alongside the numeric requested profile.
@@ -175,6 +205,8 @@ serial drills identify their execution mode in the workload result. The actual
 artifacts distinguish the declared profile from the topology and
 business work that really ran. A change from serial to concurrent execution
 requires a new identified run; it does not change an earlier run's outcome.
+The frozen policy and each batch's actual selected mode must agree; spawning is
+independent of the diagnostics opt-in and is not a response to observed speed.
 
 The hosted serial probe [Actions run 36375853169](https://github.com/GU2thousand/labops-erp/actions/runs/36375853169),
 at commit `dee603f649a097ebfcf78b3f6ad83fda937df654`, requested 3,000 commands at
@@ -225,6 +257,20 @@ coverage was incomplete. Retained `report.json` SHA-256 is
 The new default does not remove discovery time from that historical result or
 relabel either failed run as a pass.
 
+At source head `f3cb2e11ab859b4fcd51a232054c8d145b089fba`, the
+[default smoke run 36381732572](https://github.com/GU2thousand/labops-erp/actions/runs/36381732572)
+ran PR checkout `35d00e2df5b71a8819ff212e488869578003991d` and passed **30/30**
+recorded cases with 173 unique inventory events; diagnostics were `NOT_REQUESTED`.
+Its `report.json` SHA-256 is
+`ff2c545b4899791c51d9ea163b29d610ddc51289794a7f4177e7f396919bb569`.
+The same source's [512-command thread diagnostic 36381740390](https://github.com/GU2thousand/labops-erp/actions/runs/36381740390)
+completed in **14.897411965s**, an actual **34.368385677/s** against 50/s, so
+throughput remained **FAIL**. All 512 published/effect IDs were complete; its
+14 samples contained 84 valid CPU/memory role observations (six roles each),
+with diagnostic collection/lifecycle complete. The failing report SHA-256 is
+`f7f8c06f15ddeaf26d82de4f5e9d34f3c99038995aa6b23abe2286d99813cdb4`.
+These are thread-mode results, not evidence for the new spawn execution policy.
+
 The four-lane profile has no claimed hosted/full 50/s pass in this document.
 A local SQL profile of 200 application-service commands is implementation
 profiling, not an RF3 workload or hosted/production acceptance result. Full RF3,
@@ -233,7 +279,7 @@ evidence at their frozen denominators and clock boundaries.
 
 ### Measurement-only capacity diagnosis
 
-An explicitly enabled bounded diagnostic keeps the four lanes, queue capacity four, legal
+An explicitly enabled bounded diagnostic keeps the selected four lanes, queue capacity four, legal
 business services/locks, global 50/s target and 5% completion-window gate. A
 512-event request is a diagnostic input, not the 90,000-event acceptance target.
 It may fail the rate gate and still retain useful raw measurements. A diagnostic
@@ -252,13 +298,27 @@ Unavailable counters and failed samples are explicit unknowns. A final artifact
 does not substitute zero for an unavailable measurement or infer a cause from
 `cpu_count` alone.
 
-`command-diagnostics.jsonl` links every attempted command's global index, lane
+Thread `command-diagnostics.jsonl` and enabled spawn
+`origins/.../command-diagnostics.jsonl` link every attempted command's global index, lane
 and kind to wall/thread/process CPU, SQL client-call count/wall time and physical
 commit count/wall time. SQL text, bind parameters, credentials and endpoint
 configuration are excluded. Client SQL wall time includes network/client
 decoding and Python scheduling; it is not pure PostgreSQL server execution time
 or a direct GIL-wait measurement. Per-command process CPU includes all concurrent
 threads and must not be summed as independent lane CPU.
+
+Enabled spawn diagnostics register only the exact owned generator and current
+Kafka-worker PIDs, validating process start identity before CPU/RSS attribution;
+they do not scan arbitrary processes. `process-resource-profile-NNN.json`
+freezes the managed-process role/sampling policy. Actual PID/start identities
+remain in runtime diagnostic samples and topology/schedule receipts. Generator
+READY counters are child-origin receipts checked against a fresh live kernel
+read; final receipts validate the same registered process identity and preceding
+counters. Their CPU delta covers READY to the pre-exit final receipt,
+excluding pre-READY init and later IPC/reap; the capacity elapsed still includes
+both. A retained final receipt is not a post-exit live kernel observation.
+CPU includes each process's threads and excludes descendants; RSS is approximate
+current residency. Missing/reused/stopped identities remain explicit unknowns.
 
 All enabled fresh Docker/process discovery, observer startup/sampling, joined
 owning-thread connection and sampler cleanup, required raw artifact
@@ -277,8 +337,10 @@ resource observations and coverage limits without invalidating otherwise valid
 business/fault results. Every enabled batch still requires
 `lifecycle_complete=true`; missing fault resource coverage cannot excuse failed
 observer startup, owning cleanup, joins or persistence. Such a failure fails
-the affected scenario's topology and final report. Business failures retain their original exception and
-durable partial journal even if diagnostic collection also fails. Preserve the
+the affected scenario's topology and final report. Parent-side failures retain
+their original exception and durable partial journal even if diagnostic
+collection also fails; child failures retain their sanitized authored evidence.
+Preserve the
 original failed probes unchanged when running a new diagnostic revision.
 
 The counter parser now accepts valid dotted numeric keys, including
@@ -287,8 +349,11 @@ The counter parser now accepts valid dotted numeric keys, including
 while retaining strict two-token, duplicate-key and unsigned-integer checks.
 That correction establishes parser compatibility with the declared grammar;
 it does not recover the omitted historical input or prove online CPU coverage.
-A new explicitly enabled hosted diagnostic must establish actual numeric
-coverage. Diagnosis remains separate from the full 90,000-event capacity gate.
+The retained `f3cb2e1` thread diagnostic subsequently established numeric coverage
+for its measured samples. New spawn CPU coverage and capacity remain unproved.
+Diagnosis remains separate from the full 90,000-event capacity gate; reduced
+smoke inputs remain capacity-unqualified and all full denominators/windows stay
+unchanged.
 
 ## Required scenarios and frozen targets
 
@@ -364,6 +429,14 @@ evidence/<run-id>/
   business-lane-topology.json # actual independent aggregates and shared context
   generation-topology-*.json # per-batch actual lane counts, journal batches/results
   generation-schedule-*.jsonl # incremental scheduler/worker observations
+  process-generation-plan-*.json # selected spawn reservations and safe scope
+  process-resource-profile-*.json # enabled managed-process role/sampling policy
+  origin-reconciliation.jsonl # conditional settled database facts/unknowns
+  origins/process_batch_NNN_lane_L/
+    origin-plan.json
+    origin-journal.jsonl     # exclusive child attempt/commit/observation evidence
+    events.jsonl
+    command-diagnostics.jsonl # enabled child command measurements
   runtime-resource-profile.json # requested/not-started or not-requested scope
   runtime-resource-profile-*.json # enabled batch's fresh scoped discovery
   runtime-diagnostics-*.json # enabled raw samples, unknowns and lifecycle/coverage

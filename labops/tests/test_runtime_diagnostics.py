@@ -12,6 +12,8 @@ from benchmarks.events.runtime_diagnostics import (
     counter_delta, diagnostics_profile, sanitize_resources,
 )
 from labops.tests.test_container_diagnostics import LinuxFixture, CGROUP_PATH, SERVICE
+from labops.tests.test_process_resources import ProcessFixture
+from benchmarks.events.process_resources import GENERATOR_ROLES
 
 
 class FakeConnection:
@@ -310,6 +312,96 @@ class RuntimeSamplerTests(unittest.TestCase):
             database_sampler=database, process_reader=process_reader, host_reader=lambda: {},
             facts_reader=lambda: {'logical_cpu_count': 4}, interval_seconds=.01, **kwargs)
         return diagnostics, database
+
+    def test_scoped_process_callback_starts_before_children_and_requires_final_cleanup_receipts(self):
+        fixture = ProcessFixture()
+        planned, live = threading.Event(), threading.Event()
+        def snapshot():
+            value = fixture.catalog.sample()
+            generators = [row for row in value['processes'] if row['role'] in GENERATOR_ROLES]
+            if all(row['stage'] == 'planned' for row in generators): planned.set()
+            if all(row['stage'] == 'running' for row in generators): live.set()
+            return value
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics, database = self.start(directory, roles=(), managed_process_sampler=snapshot)
+            with diagnostics:
+                self.assertTrue(planned.wait(timeout=2))
+                fixture.start_all()
+                self.assertTrue(live.wait(timeout=2))
+                fixture.finish_generators()
+            report = json.loads((Path(directory)/'runtime.json').read_text())
+            self.assertTrue(report['collection_complete'])
+            self.assertTrue(report['lifecycle_complete'])
+            self.assertTrue(report['managed_process_sampler_supplied'])
+            self.assertEqual(report['managed_process_resources']['generator_complete_roles'], list(GENERATOR_ROLES))
+            self.assertEqual(report['managed_process_resources']['worker_complete_roles'], ['publisher'])
+            self.assertTrue(database.closed)
+            final = report['final_managed_processes']['processes'][0]
+            self.assertEqual(final['stage'], 'exited')
+            self.assertIsNone(final['value'])
+            self.assertEqual(final['final_snapshot']['source'], 'child_origin')
+
+    def test_missing_live_process_counter_invalidates_good_prior_coverage(self):
+        fixture = ProcessFixture()
+        fixture.start_all()
+        bad = threading.Event()
+        calls = 0
+        def snapshot():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                fixture.files['/proc/1001/stat'] = PermissionError('PRIVATE missing live process')
+            value = fixture.catalog.sample()
+            if calls == 2:
+                fixture.set('generator-0')
+                bad.set()
+            return value
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics, _ = self.start(directory, roles=(), managed_process_sampler=snapshot)
+            with diagnostics:
+                self.assertTrue(bad.wait(timeout=2))
+                fixture.finish_generators()
+            record = diagnostics.summary()
+            self.assertTrue(record['lifecycle_complete'])
+            self.assertFalse(record['collection_complete'])
+            self.assertFalse(record['managed_process_resources']['live_sample_coverage_complete'])
+            self.assertIn('generator-0', record['managed_process_resources']['observed_live_roles'])
+            self.assertNotIn('PRIVATE', json.dumps(record))
+
+    def test_scoped_callback_failure_and_final_interruption_preserve_primary_business_exception(self):
+        original = ValueError('PRIVATE business')
+        fixture = ProcessFixture()
+        fixture.start_all()
+        database = FakeDatabaseSampler()
+        def snapshot():
+            if database.closed:
+                raise KeyboardInterrupt('PRIVATE final callback')
+            return fixture.catalog.sample()
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics, _ = self.start(directory, roles=(), database=database,
+                managed_process_sampler=snapshot)
+            with self.assertRaises(ValueError) as caught:
+                with diagnostics:
+                    self.assertTrue(database.sampled.wait(timeout=2))
+                    raise original
+            self.assertIs(caught.exception, original)
+            self.assertTrue(database.closed)
+            self.assertTrue(diagnostics.summary()['sampler_joined'])
+            self.assertFalse(diagnostics.summary()['collection_complete'])
+            report = json.loads((Path(directory)/'runtime.json').read_text())
+            self.assertEqual(report['final_managed_processes']['errors'][0]['error_type'], 'KeyboardInterrupt')
+            self.assertNotIn('PRIVATE', json.dumps(report))
+
+    def test_optional_scoped_callback_none_preserves_existing_collection_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics, database = self.start(directory, roles=(), managed_process_sampler=None)
+            with diagnostics:
+                self.assertTrue(database.sampled.wait(timeout=2))
+            report = diagnostics.summary()
+            self.assertTrue(report['collection_complete'])
+            self.assertFalse(report['managed_process_sampler_supplied'])
+            self.assertIsNone(report['managed_process_resources'])
+            self.assertIsNone(report['final_managed_processes'])
 
     def test_native_container_resources_to_runtime_complete_and_unknown_io_retained(self):
         fixture = LinuxFixture()
