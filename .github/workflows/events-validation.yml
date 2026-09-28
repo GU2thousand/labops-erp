@@ -1,9 +1,15 @@
 name: Kafka RF3 acceptance
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
+      tier:
+        description: 'full freezes the plan targets; smoke permits smaller integration inputs'
+        type: choice
+        options: [full, smoke]
+        default: full
       events:
         description: 'Unique inventory events (staging target: 90000)'
         type: number
@@ -20,8 +26,6 @@ on:
         description: 'Repetitions per crash boundary (staging target: 20)'
         type: number
         default: 20
-  schedule:
-    - cron: '23 6 * * 1'
 permissions:
   contents: read
 concurrency:
@@ -36,6 +40,7 @@ jobs:
       EVENTS_RATE: ${{ github.event.inputs.rate || '10' }}
       EVENTS_DURATION: ${{ github.event.inputs.duration || '0' }}
       FAULT_REPETITIONS: ${{ github.event.inputs.fault_repetitions || '1' }}
+      EVENTS_TIER: ${{ github.event.inputs.tier || 'smoke' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,13 +69,13 @@ jobs:
           python infra/events/admin.py users --env-file infra/events/validation/generated/client.env --identities infra/events/validation/generated/secrets.json --report "infra/events/validation/evidence/$EVENTS_RUN_ID/users.json"
           python infra/events/admin.py topics --env-file infra/events/validation/generated/client.env --report "infra/events/validation/evidence/$EVENTS_RUN_ID/topics-before.json"
           python infra/events/admin.py acls --env-file infra/events/validation/generated/client.env --identities infra/events/validation/generated/secrets.json --report "infra/events/validation/evidence/$EVENTS_RUN_ID/acls.json"
-          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics up -d kafka-exporter
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics up -d kafka-exporter prometheus
       - name: Real business effects and fault matrix
         run: |
           set -a
           . infra/events/validation/generated/client.env
           set +a
-          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+          if [ "$EVENTS_TIER" = full ]; then
             SINGLE_BROKER_SECONDS=300
             ALL_BROKER_SECONDS=600
             CONSUMER_SECONDS=600
@@ -81,7 +86,7 @@ jobs:
             CONSUMER_SECONDS=5
             FAULT_EVENTS=20
           fi
-          python benchmarks/events/acceptance.py --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
+          python benchmarks/events/acceptance.py --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
       - name: Verify actual offsets topic replication and topic configuration
         if: always()
         run: |

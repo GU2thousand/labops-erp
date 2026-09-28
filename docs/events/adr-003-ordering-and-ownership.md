@@ -14,9 +14,44 @@ before send; the lease exceeds queue wait, flush acknowledgement and database
 write budget. Ack-only writeback matches the active token and checks affected row
 count. A replaced/expired owner cannot mark a new owner's row published.
 
-Optional publisher shards deterministically assign movement UUIDs. Supervise one
-active owner per shard assignment; change shard count at a drained boundary and
-record it. A shard assignment is application scheduling, not broker fencing.
+Optional publisher shards deterministically assign movement UUIDs. Each publisher
+holds a PostgreSQL session advisory lock for its shard on a dedicated physical
+connection, separate from application transaction/reconnect handling. Before
+producing and again after broker acknowledgement, it checks the original backend
+PID and the granted `ExclusiveLock` in `pg_locks`; a different backend or missing
+lock is ownership loss. The loop exits on session loss and does not silently
+reacquire. It purges locally queued/in-flight producer records instead of flushing
+additional stale sends. Purging cannot retract a record already accepted by the
+broker or guarantee that an in-flight request will not be accepted.
+
+Dedicated-session loss is a nonzero process exit, including with `--loop`.
+Recovery requires a **new publisher process started by its supervisor** after
+PostgreSQL is healthy; the old loop does not resume or reacquire ownership.
+The new process takes a new session/shard lock and recovers eligible outbox rows
+using their original IDs and normal lease expiry. Failed business connections
+are closed before later attempts so a broken application connection does not
+prevent checking the dedicated ownership session. Do not clear leases, markers
+or failed rows to speed restart. Consumers similarly exit if PostgreSQL cannot
+commit an effect or durable failure record; their supervisor restarts the process,
+which reuses the same group and replays the uncommitted broker offset.
+
+The root Compose application services use `restart: unless-stopped`. A
+Kubernetes Deployment or equivalent production supervisor must restart failed
+worker processes and report failures/restarts. A worker intentionally stopped
+for maintenance requires an explicit start; restoring PostgreSQL alone does not
+restart a manually stopped worker. Include process exit/restart and natural
+lease recovery in outage acceptance evidence, separate from resuming a process
+that stayed alive during a broker-only pause.
+
+Use a direct PostgreSQL connection or session pooling for this ownership
+connection. PgBouncer transaction pooling is incompatible with session advisory
+ownership. The shard count and index are both part of the lock key and UUID
+routing: **stop all publishers** and finish the drained cutover before changing
+shard count, because differently sized shard assignments use different locks and
+can otherwise overlap. Record the old/new count and watermark. SQLite supports
+only one publisher process with shard count 1; larger counts are refused, and its
+process-local guard provides no exclusion between separate processes. Shard
+ownership is database-side scheduling, not hard Kafka producer fencing.
 
 ## Stale send and crash boundary
 

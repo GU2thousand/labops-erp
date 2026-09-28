@@ -30,6 +30,7 @@ def main():
     (output / 'secrets.json').write_text(json.dumps(passwords, indent=2) + '\n')
     tls_directory = output / 'tls'
     tls_directory.mkdir(mode=0o755)
+    tls_directory.chmod(0o755)
     def openssl(*arguments):
         subprocess.run(['openssl', *arguments], cwd=tls_directory, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256', '-days', '2', '-subj', '/CN=LabOps disposable validation CA', '-keyout', 'ca.key', '-out', 'ca.crt')
@@ -79,11 +80,31 @@ def main():
         'KAFKA_ADMIN_URL': 'https://127.0.0.1:19644', 'KAFKA_EXPORTER_PASSWORD': passwords['exporter'],
         'METRICS_TOKEN': secrets.token_urlsafe(32), 'REDIS_URL': '', 'OTEL_EXPORTER_OTLP_ENDPOINT': ''}
     (output / 'client.env').write_text(''.join(f'{key}={value}\n' for key, value in values.items()))
-    # The containers use UID 101; broker private keys need read access inside the
-    # private directory mount. The generated directory itself remains owner-only.
+    metrics_directory = output / 'metrics'
+    metrics_directory.mkdir(mode=0o755)
+    metrics_directory.chmod(0o755)
+    (metrics_directory / 'targets.json').write_text('[]\n')
+    (metrics_directory / 'targets.json').chmod(0o644)
+    (output / 'metrics-token').write_text(values['METRICS_TOKEN'])
+    # The token is owner-private through generated/ on the host, and mounted as
+    # one read-only file for the unprivileged Prometheus UID in its container.
+    (output / 'metrics-token').chmod(0o644)
+    prometheus = {'global': {'scrape_interval': '5s', 'evaluation_interval': '5s'},
+        'rule_files': ['/etc/prometheus/alerts.yml'],
+        'scrape_configs': [
+            {'job_name': 'redpanda', 'scheme': 'https', 'metrics_path': '/public_metrics',
+             'tls_config': {'ca_file': '/etc/labops-ca/ca.crt'},
+             'static_configs': [{'targets': ['127.0.0.1:19644', '127.0.0.1:29644', '127.0.0.1:39644']}]},
+            {'job_name': 'kafka-exporter', 'static_configs': [{'targets': ['127.0.0.1:19308']}]},
+            {'job_name': 'labops-events-workers', 'metrics_path': '/metrics',
+             'authorization': {'credentials_file': '/etc/labops-runtime/metrics-token'},
+             'file_sd_configs': [{'files': ['/etc/labops-targets/targets.json'], 'refresh_interval': '5s'}]}]}
+    (output / 'prometheus.yaml').write_text(json.dumps(prometheus, indent=2) + '\n')
+    # Brokers read only their own key/cert and the public CA through individual
+    # file mounts. The generated directory itself remains owner-only on the host.
     for path in output.iterdir():
         if path.is_file():
-            path.chmod(0o644 if path.suffix == '.yaml' else 0o600)
+            path.chmod(0o644 if path.suffix == '.yaml' or path.name == 'metrics-token' else 0o600)
     for path in tls_directory.iterdir():
         path.chmod(0o644 if path.suffix == '.crt' or path.name.endswith('.key') and path.name.startswith('redpanda-') else 0o600)
     print(json.dumps({'run_id': args.run_id, 'image': IMAGE, 'generated': str(output), 'credentials': 'excluded from Git and evidence', 'cluster_scope': 'three processes on one Docker host'}))

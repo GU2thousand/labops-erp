@@ -36,6 +36,11 @@ groups:
         for: 1m
         labels: {severity: critical}
         annotations: {summary: 'An events worker has stopped making progress'}
+      - alert: EventWorkerHeartbeatMissing
+        expr: up{job="labops-events-workers"} unless on (instance, job) labops_worker_heartbeat_timestamp_seconds
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'A required events worker is missing its heartbeat metric'}
       - alert: EventWorkerDatabaseUnavailable
         expr: labops_worker_database_available == 0
         for: 1m
@@ -65,6 +70,11 @@ groups:
         for: 2m
         labels: {severity: critical}
         annotations: {summary: 'Consumer-group lag evidence is unavailable'}
+      - alert: KafkaInventoryConsumersAbsent
+        expr: max by (consumergroup) (kafka_consumergroup_members{job="kafka-exporter",consumergroup=~"^labops[.](.*[.])?(notification|analytics)[.]v1$"}) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: 'A required inventory consumer group has no connected consumer'}
       - alert: RedpandaMetricsUnavailable
         expr: up{job="redpanda"} == 0
         for: 2m

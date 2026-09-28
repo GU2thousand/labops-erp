@@ -17,6 +17,15 @@ may add `--include-payload` only into protected incident evidence. Record source
 cluster, stream generation, delivery coordinates, original hash, status and age;
 an offset with zero lag may still correspond to unresolved business work.
 
+For poisoned input, inspect the evidence encoding as well as the checksum.
+Kafka ingress preserves invalid UTF-8/JSON, nonfinite/deep JSON and NUL input as
+base64 of original broker bytes. Direct delivery of an already parsed NUL value
+preserves canonical JSON bytes and marks `canonical-json-with-nul`; its lexical
+source bytes are unavailable. The semantic JSON checksum normalizes integral
+numeric representations across PostgreSQL JSONB, so it is distinct from an exact
+raw-byte digest. See [poison evidence](adr-002-immutable-contracts.md#poison-evidence-and-raw-bytes)
+before interpreting a conflict or reconstructing restricted incident data.
+
 ## Retry and disposition
 
 Stop the relevant retry/DLQ worker for manual disposition, wait for live leases to
@@ -107,6 +116,28 @@ their own authenticated worker metrics when enabled. Do not launch several
 same-host workers on the same metrics port; assign a unique port or use separate
 containers. SIGTERM finishes one bounded durable operation and a bounded producer
 flush; forced death may legally cause original-ID redelivery.
+
+`publish_events --loop` does not reacquire a lost dedicated PostgreSQL ownership
+session: it purges client-pending sends and exits nonzero. After PostgreSQL is
+healthy, its supervisor must start a **new process** that acquires a new shard
+session. `consume_kafka` also exits if an effect or failure record cannot be
+committed to PostgreSQL; restart the same consumer group to replay the offset
+that was not committed. Existing outbox/failed records and leases remain intact,
+and abandoned claims become eligible through natural lease expiry. Do not confuse
+this process restart with a same-process resume after a broker pause.
+
+Compose application workers use `restart: unless-stopped`; host deployments
+and Kubernetes must provide an equivalent failed-process restart policy and
+restart monitoring. For intentionally stopped development workers, explicitly
+start them after database health is restored:
+
+```sh
+docker compose --profile events up -d publisher notification-consumer analytics-consumer retry-worker dlq-publisher
+```
+
+Record process exit and replacement start times, original-ID/offset replay and
+eventual effects. Do not delete leases, markers or parked records as a restart
+shortcut. See the [ownership and restart boundary](adr-003-ordering-and-ownership.md).
 
 Continue `process_events` for imports, daily alerts and local routes. It does not
 replace Kafka consumers, and Kafka consumers do not replace it. After command

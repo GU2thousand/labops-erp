@@ -11,7 +11,7 @@ import uuid
 from datetime import timedelta
 from decimal import Decimal
 from django.conf import settings
-from django.db import transaction, connection, IntegrityError, OperationalError
+from django.db import transaction, connection, DatabaseError, IntegrityError, OperationalError
 from django.db.models import Exists, OuterRef, Q
 from django.db.models.expressions import RawSQL
 from django.utils import timezone
@@ -237,14 +237,16 @@ def owned_event(event):
                                      locked_until__gt=timezone.now()+timedelta(seconds=required)).exists()
 
 
-def publish_one(producer, after_send=None, *, shard_index=0, shard_count=1):
+def publish_one(producer, after_send=None, *, shard_index=0, shard_count=1, ownership_check=None):
     event = claim_event(shard_index=shard_index, shard_count=shard_count)
     if event is None: return False
     try:
         value = envelope(event)
+        if ownership_check: ownership_check()
         if not owned_event(event): raise LeaseLost('Publish owner expired before send')
         send(producer, settings.KAFKA_TOPIC, f'{event.aggregate_type}:{event.aggregate_id}', value)
         if after_send: after_send()
+        if ownership_check: ownership_check()
         changed = OutboxEvent.objects.filter(pk=event.pk, status='PROCESSING', lease_token=event.lease_token,
                                             locked_until__gt=timezone.now()).update(
             status='PUBLISHED', published_at=timezone.now(), locked_until=None, lease_token=None, last_error='')
@@ -254,6 +256,13 @@ def publish_one(producer, after_send=None, *, shard_index=0, shard_count=1):
             raise LeaseLost('Expired publish owner cannot mark delivery')
         EVENTS.labels('publisher', 'success').inc()
     except Exception as exc:
+        from .publisher_shards import ShardOwnershipLost
+        if isinstance(exc, ShardOwnershipLost) or (isinstance(exc, DatabaseError) and not isinstance(exc, IntegrityError)):
+            # Preserve an ambiguous claim until expiry. Owner loss exits and
+            # purges without a final flush; an application DB failure discards
+            # that connection and rechecks the dedicated owner before reuse.
+            if isinstance(exc, ShardOwnershipLost): LEASE_REJECTIONS.labels('publisher').inc()
+            raise
         attempts = event.attempts + 1; retry = settings.EVENT_RETRY_SECONDS
         failure_class = classify_failure(exc)
         changed = OutboxEvent.objects.filter(pk=event.pk, status='PROCESSING', lease_token=event.lease_token).update(
@@ -371,6 +380,10 @@ def retry_deliveries(limit=100):
                 process_envelope(row.consumer_name, row.envelope)
                 row.status = 'RESOLVED'; row.resolved_at = timezone.now(); outcome = 'success'
             except Exception as exc:
+                if isinstance(exc, DatabaseError) and not isinstance(exc, IntegrityError):
+                    # Roll back this retry transaction and discard the failed
+                    # application connection in the command's outer boundary.
+                    raise
                 row.attempts += 1; row.last_error = safe_error(exc); row.failure_class = classify_failure(exc)
                 if row.failure_class != 'transient' or row.attempts > len(settings.EVENT_RETRY_SECONDS): row.status = 'DEAD'
                 else: row.next_attempt_at = timezone.now()+timedelta(seconds=retry_delay(row.attempts, str(row.id)))
@@ -418,6 +431,10 @@ def publish_dlq(producer, limit=100):
                 locked.save(update_fields=['dlq_published_at', 'dlq_lease_token', 'dlq_locked_until'])
                 record_audit(locked, 'PUBLISH_DLQ', {'status': 'DEAD'}, reason='Acknowledged stable delivery ID')
             EVENTS.labels('dlq', 'success').inc(); count += 1
+        except DatabaseError:
+            # A post-ack DB failure is ambiguous. Leave the durable claim until
+            # natural expiry; a replacement mirror retains its delivery ID.
+            raise
         except Exception as exc:
             FailedDelivery.objects.filter(pk=row.pk, dlq_lease_token=row.dlq_lease_token).update(
                 dlq_lease_token=None, dlq_locked_until=None, dlq_attempts=row.dlq_attempts+1,

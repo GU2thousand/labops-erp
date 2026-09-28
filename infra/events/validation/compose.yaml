@@ -16,7 +16,9 @@ services:
       - redpanda-0:/var/lib/redpanda/data
       - ./generated/redpanda-0.yaml:/etc/redpanda/redpanda.yaml:ro
       - ./generated/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
-      - ./generated/tls:/etc/labops-tls:ro
+      - ./generated/tls/redpanda-0.key:/etc/labops-tls/redpanda-0.key:ro
+      - ./generated/tls/redpanda-0.crt:/etc/labops-tls/redpanda-0.crt:ro
+      - ./generated/tls/ca.crt:/etc/labops-tls/ca.crt:ro
   redpanda-1:
     <<: *broker
     ports: ['127.0.0.1:29092:19092', '127.0.0.1:29644:9644']
@@ -24,7 +26,9 @@ services:
       - redpanda-1:/var/lib/redpanda/data
       - ./generated/redpanda-1.yaml:/etc/redpanda/redpanda.yaml:ro
       - ./generated/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
-      - ./generated/tls:/etc/labops-tls:ro
+      - ./generated/tls/redpanda-1.key:/etc/labops-tls/redpanda-1.key:ro
+      - ./generated/tls/redpanda-1.crt:/etc/labops-tls/redpanda-1.crt:ro
+      - ./generated/tls/ca.crt:/etc/labops-tls/ca.crt:ro
   redpanda-2:
     <<: *broker
     ports: ['127.0.0.1:39092:19092', '127.0.0.1:39644:9644']
@@ -32,7 +36,9 @@ services:
       - redpanda-2:/var/lib/redpanda/data
       - ./generated/redpanda-2.yaml:/etc/redpanda/redpanda.yaml:ro
       - ./generated/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
-      - ./generated/tls:/etc/labops-tls:ro
+      - ./generated/tls/redpanda-2.key:/etc/labops-tls/redpanda-2.key:ro
+      - ./generated/tls/redpanda-2.crt:/etc/labops-tls/redpanda-2.crt:ro
+      - ./generated/tls/ca.crt:/etc/labops-tls/ca.crt:ro
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.9.0
     profiles: [metrics]
@@ -48,6 +54,21 @@ services:
     volumes: ['./generated/tls/ca.crt:/etc/labops-ca/ca.crt:ro']
     ports: ['127.0.0.1:19308:9308']
     mem_limit: 128m
+    restart: 'no'
+  prometheus:
+    image: prom/prometheus:v3.3.0
+    profiles: [metrics]
+    # Linux CI only: workers are independent host processes, so the collector
+    # needs the same host loopback. Port 19091 stays private to the job host.
+    network_mode: host
+    command: [--config.file=/etc/prometheus/prometheus.yml, --web.listen-address=127.0.0.1:19091, --storage.tsdb.retention.time=4h]
+    volumes:
+      - ./generated/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ../../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./generated/metrics-token:/etc/labops-runtime/metrics-token:ro
+      - ./generated/metrics:/etc/labops-targets:ro
+      - ./generated/tls/ca.crt:/etc/labops-ca/ca.crt:ro
+    mem_limit: 192m
     restart: 'no'
   postgres:
     image: postgres:17-alpine

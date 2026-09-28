@@ -7,7 +7,7 @@ from unittest.mock import patch
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
-from django.db import connection
+from django.db import connection, OperationalError
 from unittest import skipIf
 from django.utils import timezone
 from labops.tests.test_acceptance import Fixture
@@ -86,6 +86,64 @@ class EventReliabilityTests(Fixture, TestCase):
         with patch('labops.events.send'):
             with self.assertRaises(LeaseLost): publish_one(None, after_send=owner_replaced)
         event.refresh_from_db(); self.assertEqual(event.status, 'PROCESSING'); self.assertIsNone(event.published_at)
+
+    def assert_shard_owner_loss_preserves_lease(self, failure_at):
+        from labops.publisher_shards import ShardOwnershipLost
+        event = self.event(); event.transport = 'kafka'; event.save()
+        observations = []
+        def ownership_check():
+            current = OutboxEvent.objects.get(pk=event.pk)
+            observations.append((current.lease_token, current.locked_until))
+            if len(observations) == failure_at:
+                raise ShardOwnershipLost('Owner session ended')
+        with patch('labops.events.send') as send:
+            with self.assertRaises(ShardOwnershipLost):
+                publish_one(None, ownership_check=ownership_check)
+        self.assertEqual(send.call_count, failure_at - 1)
+        event.refresh_from_db()
+        self.assertEqual(event.status, 'PROCESSING')
+        self.assertEqual((event.lease_token, event.locked_until), observations[-1])
+        self.assertEqual(event.attempts, 0)
+        self.assertIsNone(event.published_at)
+
+    def test_shard_owner_loss_before_send_preserves_lease(self):
+        self.assert_shard_owner_loss_preserves_lease(1)
+
+    def test_shard_owner_loss_after_ack_preserves_ambiguous_lease(self):
+        self.assert_shard_owner_loss_preserves_lease(2)
+
+    def test_publisher_database_failure_preserves_claim_without_retry_rewrite(self):
+        event = self.event(); event.transport = 'kafka'; event.save()
+        with patch('labops.events.send', side_effect=OperationalError('Disconnected database')):
+            with self.assertRaises(OperationalError): publish_one(None)
+        event.refresh_from_db()
+        self.assertEqual(event.status, 'PROCESSING'); self.assertEqual(event.attempts, 0)
+        self.assertIsNotNone(event.lease_token); self.assertIsNotNone(event.locked_until)
+        self.assertIsNone(event.published_at)
+
+    def test_retry_database_failure_rolls_back_attempt_and_audit(self):
+        value = envelope(self.event())
+        with patch('labops.events.process_envelope', side_effect=RuntimeError('Temporary dependency')):
+            deliver('analytics', value, 'db-retry:0:1')
+        row = FailedDelivery.objects.get()
+        FailedDelivery.objects.filter(pk=row.pk).update(next_attempt_at=timezone.now())
+        before_audits = row.audit_entries.count(); before_attempts = row.attempts
+        with patch('labops.events.process_envelope', side_effect=OperationalError('Disconnected database')):
+            with self.assertRaises(OperationalError): retry_deliveries()
+        row.refresh_from_db()
+        self.assertEqual(row.status, 'RETRY'); self.assertEqual(row.attempts, before_attempts)
+        self.assertIsNone(row.lease_token); self.assertEqual(row.audit_entries.count(), before_audits)
+        self.assertFalse(ProcessedEvent.objects.exists())
+
+    def test_dlq_database_failure_retains_claim_without_compensating_write(self):
+        deliver('analytics', {'invalid': True}, 'db-dlq:0:1')
+        row = FailedDelivery.objects.get(); before_audits = row.audit_entries.count()
+        with patch('labops.events.send', side_effect=OperationalError('Disconnected database')):
+            with self.assertRaises(OperationalError): publish_dlq(None)
+        row.refresh_from_db()
+        self.assertEqual(row.status, 'DEAD'); self.assertEqual(row.dlq_attempts, 0)
+        self.assertIsNotNone(row.dlq_lease_token); self.assertIsNotNone(row.dlq_locked_until)
+        self.assertIsNone(row.dlq_published_at); self.assertEqual(row.audit_entries.count(), before_audits)
 
     def test_retry_preserves_original_payload_and_audits_dependency_recovery(self):
         event = self.event(); value = envelope(event)

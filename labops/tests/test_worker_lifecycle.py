@@ -2,20 +2,22 @@ import base64
 import socket
 import signal
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from unittest import skipUnless
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from django.core.management import call_command
 from django.core.exceptions import ImproperlyConfigured
-from django.db import OperationalError
-from django.test import SimpleTestCase, override_settings
+from django.db import OperationalError, connection
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 
 from labops.worker_metrics import (start_worker_metrics, stop_worker_metrics, StopController,
                                    operation_deadline, OperationDeadlineExceeded)
+from labops.publisher_shards import ShardOwnershipLost
 
 
 class Message:
@@ -114,12 +116,15 @@ class WorkerLifecycleTests(SimpleTestCase):
     def test_publisher_runs_only_outbox_and_honors_shard(self):
         broker = MagicMock()
         broker.flush.return_value = 0
+        shard_owner = MagicMock(spec=['assert_owned'])
         with patch('labops.management.commands.publish_events.producer', return_value=broker), \
              patch('labops.management.commands.publish_events.publish_one', return_value=False) as publish, \
+             patch('labops.management.commands.publish_events.publisher_shard_owner', return_value=nullcontext(shard_owner)) as owner, \
              patch('labops.management.commands.publish_events.database_statement_budget', return_value=nullcontext()), \
              patch('labops.events.retry_deliveries') as retry, patch('labops.events.publish_dlq') as dlq:
             call_command('publish_events', limit=5, shard_index=1, shard_count=3)
-        publish.assert_called_once_with(broker, shard_index=1, shard_count=3)
+        publish.assert_called_once_with(broker, shard_index=1, shard_count=3, ownership_check=shard_owner.assert_owned)
+        owner.assert_called_once_with(1, 3)
         retry.assert_not_called()
         dlq.assert_not_called()
         broker.flush.assert_called_once_with(12)
@@ -141,6 +146,57 @@ class WorkerLifecycleTests(SimpleTestCase):
             call_command('retry_events', limit=2, stdout=StringIO())
         self.assertEqual(retry.call_count, 2)
         producer.assert_not_called()
+
+    def test_database_errors_close_app_connection_and_retry_next_loop(self):
+        cases = [('publish_events', 'publish_one', 'database_statement_budget'),
+                 ('retry_events', 'retry_deliveries', 'database_processing_budget'),
+                 ('publish_dlq', 'publish_dlq', 'database_statement_budget')]
+        for command, operation, budget in cases:
+            with self.subTest(command=command), ExitStack() as patches:
+                module = 'labops.management.commands.' + command
+                stop = StopController()
+                stop.wait = MagicMock()
+                broker = MagicMock()
+                broker.flush.return_value = 0
+                calls = []
+                def process(*args, **kwargs):
+                    calls.append('attempt')
+                    if len(calls) == 1:
+                        raise OperationalError('connection is closed')
+                    stop.request()
+                    return 1
+                patches.enter_context(patch(module + '.StopController', return_value=stop))
+                patches.enter_context(patch(module + '.' + budget, return_value=nullcontext()))
+                processed = patches.enter_context(patch(module + '.' + operation, side_effect=process))
+                database = patches.enter_context(patch(module + '.connections'))
+                if command != 'retry_events':
+                    patches.enter_context(patch(module + '.producer', return_value=broker))
+                if command == 'publish_events':
+                    owner = MagicMock(spec=['assert_owned'])
+                    ownership = patches.enter_context(patch(module + '.publisher_shard_owner', return_value=nullcontext(owner)))
+                call_command(command, loop=True, limit=1, stdout=StringIO())
+                self.assertEqual(processed.call_count, 2)
+                database['default'].close.assert_called_once()
+                if command == 'publish_events':
+                    ownership.assert_called_once_with(0, 1)
+                    self.assertEqual(owner.assert_owned.call_count, 2)
+
+    def test_shard_session_loss_is_checked_before_stale_application_connection(self):
+        owner = MagicMock(spec=['assert_owned'])
+        owner.assert_owned.side_effect = ShardOwnershipLost('owner backend lost')
+        broker = MagicMock()
+        with patch('labops.management.commands.publish_events.producer', return_value=broker), \
+             patch('labops.management.commands.publish_events.publisher_shard_owner', return_value=nullcontext(owner)) as ownership, \
+             patch('labops.management.commands.publish_events.database_statement_budget') as database_budget, \
+             patch('labops.management.commands.publish_events.publish_one') as publish, \
+             patch('labops.management.commands.publish_events.connections') as database:
+            with self.assertRaises(ShardOwnershipLost):
+                call_command('publish_events', loop=True, limit=1)
+        ownership.assert_called_once_with(0, 1)
+        database_budget.assert_not_called()
+        database['default'].close.assert_not_called()
+        publish.assert_not_called()
+        broker.flush.assert_not_called()
 
     def test_signal_stops_after_current_durable_delivery(self):
         stop = StopController()
@@ -210,3 +266,42 @@ class WorkerLifecycleTests(SimpleTestCase):
                     self.assertIn(b'labops_worker_heartbeat_timestamp_seconds', response.read())
             finally:
                 stop_worker_metrics(server)
+
+
+@skipUnless(connection.vendor == 'postgresql', 'Real PostgreSQL worker connection recovery')
+@override_settings(WORKER_METRICS_ENABLED=False, KAFKA_REQUIRE_SECURITY=False,
+                   KAFKA_SECURITY_PROTOCOL='PLAINTEXT')
+class WorkerPostgreSQLReconnectTests(TransactionTestCase):
+    def test_workers_reconnect_after_application_backend_termination(self):
+        for command, operation in [('publish_events', 'publish_one'),
+                                   ('retry_events', 'retry_deliveries'),
+                                   ('publish_dlq', 'publish_dlq')]:
+            with self.subTest(command=command), ExitStack() as patches:
+                module = 'labops.management.commands.' + command
+                stop = StopController()
+                stop.wait = MagicMock()
+                broker = MagicMock()
+                broker.flush.return_value = 0
+                attempts = []
+                def process(*args, **kwargs):
+                    with connection.cursor() as cursor:
+                        cursor.execute('SELECT pg_backend_pid()')
+                        attempts.append(cursor.fetchone()[0])
+                        if len(attempts) == 1:
+                            # Kill only this test's application backend. The
+                            # dedicated publisher owner must remain alive.
+                            cursor.execute('SELECT pg_terminate_backend(pg_backend_pid())')
+                        else:
+                            cursor.execute('SELECT 1')
+                            self.assertEqual(cursor.fetchone()[0], 1)
+                    if command == 'publish_events':
+                        kwargs['ownership_check']()
+                    stop.request()
+                    return 1
+                patches.enter_context(patch(module + '.StopController', return_value=stop))
+                patches.enter_context(patch(module + '.' + operation, side_effect=process))
+                if command != 'retry_events':
+                    patches.enter_context(patch(module + '.producer', return_value=broker))
+                call_command(command, loop=True, limit=1, stdout=StringIO())
+                self.assertEqual(len(attempts), 2)
+                self.assertNotEqual(attempts[0], attempts[1])

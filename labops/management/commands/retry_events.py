@@ -1,6 +1,7 @@
 import logging
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import DatabaseError, connections
 from labops.events import retry_deliveries
 from labops.kafka_config import validate_runtime
 from labops.worker_metrics import (StopController, start_worker_metrics, stop_worker_metrics,
@@ -34,6 +35,13 @@ class Command(BaseCommand):
                             count += processed
                             if not processed:
                                 break
+                    except DatabaseError:
+                        # Transaction contexts have unwound before reconnecting;
+                        # durable failure rows and leases keep their normal boundaries.
+                        connections['default'].close()
+                        logging.getLogger('labops').exception('retry_database_failed')
+                        if not options['loop']:
+                            raise
                     except Exception:
                         logging.getLogger('labops').exception('retry_worker_failed')
                         if not options['loop']:

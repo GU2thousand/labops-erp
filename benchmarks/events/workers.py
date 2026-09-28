@@ -26,6 +26,7 @@ def main():
     p.add_argument('--consumer', choices=['notification', 'analytics'])
     p.add_argument('--stage', default='normal')
     p.add_argument('--event')
+    p.add_argument('--event-file')
     p.add_argument('--marker')
     p.add_argument('--observations')
     p.add_argument('--max-messages', type=int, default=0)
@@ -134,6 +135,11 @@ def main():
         return
 
     from labops.management.commands import consume_kafka
+    base_consumer = consume_kafka.Consumer
+
+    def identified_consumer(config):
+        return base_consumer({**config, 'client.id': 'acceptance-' + str(os.getpid())})
+    consume_kafka.Consumer = identified_consumer
     if args.event and args.max_messages:
         original_consumer = consume_kafka.Consumer
 
@@ -187,6 +193,8 @@ def main():
     events.connection.check_constraints = constraints
 
     def deliver(name, event, key, *a, **kw):
+        if args.event_file and Path(args.event_file).exists():
+            args.event = json.loads(Path(args.event_file).read_text())['event_id']
         context.clear()
         context.update(event_id=event.get('event_id'), consumer=name,
                        delivery_key=key, received_at=time.time())

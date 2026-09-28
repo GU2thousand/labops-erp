@@ -63,8 +63,10 @@ class Harness:
         (self.evidence / 'errors.jsonl').touch(exist_ok=False)
         self.children = []
         self.child_metrics = {}
+        self.child_groups = {}
         self.workers = {}
         self.shutdowns = []
+        self.supervisor_restarts = []
         self.events = []
         self.cases = []
         self.logs = []
@@ -129,7 +131,7 @@ class Harness:
     def spawn(self, name, argv, role, *, metrics_port=None, extra_env=None):
         env = {**self.env, 'KAFKA_SASL_USERNAME': role,
                'KAFKA_SASL_PASSWORD': self.secrets[role],
-               'WORKER_METRICS_PORT': str(metrics_port or (19100 + len(self.children)))}
+               'WORKER_METRICS_PORT': str(metrics_port or (21000 + len(self.children)))}
         if extra_env:
             env.update(extra_env)
         log = (self.evidence / 'logs' / f'{name}-{len(self.children)}.log').open('x')
@@ -138,7 +140,75 @@ class Harness:
                                    stdout=log, stderr=log)
         self.children.append(process)
         self.child_metrics[process.pid] = int(env['WORKER_METRICS_PORT'])
+        consumer = None
+        if '--consumer' in argv:
+            consumer = argv[argv.index('--consumer') + 1]
+        elif 'consume_kafka' in argv:
+            consumer = argv[argv.index('consume_kafka') + 1]
+        self.child_groups[process.pid] = (env['KAFKA_GROUP_PREFIX'] + '.' + consumer + '.v1'
+                                        if consumer in {'notification', 'analytics'} else None)
         return process
+
+    def stop_consumer_role(self, name):
+        for label in list(self.workers):
+            if label == name or label.startswith(name + '-'):
+                self.stop(label)
+        for child in self.children:
+            if self.child_groups.get(child.pid) != self.consumer_group(name) or child.poll() is not None:
+                continue
+            child.send_signal(signal.SIGTERM)
+            escalated = False
+            began = time.monotonic()
+            try:
+                child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                escalated = True
+                child.kill()
+                child.wait(timeout=10)
+            self.shutdowns.append({'worker': name + '-untracked-instance', 'pid': child.pid,
+                'requested_signal': 'SIGTERM', 'forced_SIGKILL': escalated,
+                'exit_code': child.returncode, 'elapsed_seconds': time.monotonic() - began})
+        assert not any(child.poll() is None and self.child_groups.get(child.pid) == self.consumer_group(name)
+                       for child in self.children), 'An old consumer group instance remains alive'
+
+    def group_assignment(self, name, *, client_id=None):
+        from confluent_kafka import ConsumerGroupState
+        from confluent_kafka.admin import AdminClient
+        group = self.consumer_group(name)
+        description = AdminClient(self.configs['admin']).describe_consumer_groups([group])[group].result(timeout=10)
+        if description.state != ConsumerGroupState.STABLE or len(description.members) != 1:
+            return False
+        member = description.members[0]
+        parts = member.assignment.topic_partitions
+        expected = {(self.settings.KAFKA_TOPIC, partition) for partition in range(3)}
+        if len(parts) != 3 or {(part.topic, part.partition) for part in parts} != expected:
+            return False
+        if client_id and member.client_id != client_id:
+            return False
+        return {'group': group, 'state': str(description.state), 'member_count': 1,
+                'client_id': member.client_id, 'assignments': [
+                    {'topic': part.topic, 'partition': part.partition}
+                    for part in member.assignment.topic_partitions]}
+
+    def supervisor_after_postgres_restart(self, reason):
+        before = {name: {'pid': process.pid, 'exit_code_before_restart': process.poll()}
+                  for name, process in self.workers.items()}
+        self.stop('publisher')
+        self.stop_consumer_role('notification')
+        self.stop_consumer_role('analytics')
+        self.start_publisher()
+        self.start_consumer('notification')
+        self.start_consumer('analytics')
+        assignments = {name: self.wait(lambda name=name: self.group_assignment(name,
+            client_id='acceptance-' + str(self.workers[name].pid)),
+            'Supervised consumer did not regain all partitions: ' + name, timeout=90)
+            for name in ('notification', 'analytics')}
+        evidence = {'reason': reason, 'previous_processes': before,
+                    'restarted_processes': {name: {'pid': process.pid} for name, process in self.workers.items()},
+                    'stable_assignments_after_restart': assignments,
+                    'method': 'explicit validation supervisor creates new process/DB session after PostgreSQL restart'}
+        self.supervisor_restarts.append(evidence)
+        return evidence
 
     def stop(self, name, *, kill=False):
         process = self.workers.pop(name, None)
@@ -156,17 +226,31 @@ class Harness:
                 'requested_signal': 'SIGKILL' if kill else 'SIGTERM',
                 'forced_SIGKILL': escalated, 'exit_code': process.returncode,
                 'elapsed_seconds': time.monotonic() - started})
+        self.sync_metrics_targets()
+
+    def sync_metrics_targets(self):
+        """Publish only supervised workers, excluding temporary fault children."""
+        path = self.args.generated_dir / 'metrics' / 'targets.json'
+        if not path.parent.is_dir():
+            return
+        targets = [{'targets': [f'127.0.0.1:{self.child_metrics[process.pid]}'],
+                    'labels': {'worker': name}}
+                   for name, process in sorted(self.workers.items()) if process.poll() is None]
+        write_json(path, targets)
+        path.chmod(0o644)
 
     def start_consumer(self, name, suffix=''):
         label = name + suffix
         process = self.spawn(label, [str(HERE / 'workers.py'), 'consumer', '--consumer', name,
                              '--observations', str(self.evidence / 'logs' / f'{label}-deliveries.jsonl')], name)
         self.workers[label] = process
+        self.sync_metrics_targets()
         return process
 
     def start_publisher(self):
         self.workers['publisher'] = self.spawn('publisher-' + str(len(self.children)),
-            ['manage.py', 'publish_events', '--loop', '--limit', '500'], 'publisher', metrics_port=19100)
+            ['manage.py', 'publish_events', '--loop', '--limit', '500'], 'publisher', metrics_port=21000)
+        self.sync_metrics_targets()
 
     def setup(self):
         parsed = urlparse(self.env['DATABASE_URL'])
@@ -204,6 +288,7 @@ class Harness:
             raise AssertionError('Actual inventory topic must have 3 partitions and RF3')
         write_json(self.evidence / 'harness-manifest.json', {
             'run_id': self.args.run_id, 'commit': self.command(['git', 'rev-parse', 'HEAD']).strip(),
+            'acceptance_tier': self.args.tier, 'generation_window_tolerance_fraction': .05,
             'worktree_dirty': bool(self.command(['git', 'status', '--porcelain']).strip()),
             'python': sys.version, 'host': platform.platform(), 'cpu_count': os.cpu_count(),
             'security_protocol': 'SASL_SSL', 'compose_project': self.env['LABOPS_VALIDATION_PROJECT'],
@@ -413,7 +498,7 @@ class Harness:
         for name in ('notification', 'analytics'):
             for stage in ('before_commit', 'after_commit'):
                 for repetition in range(self.args.fault_repetitions):
-                    self.stop(name)
+                    self.stop_consumer_role(name)
                     ids, _ = self.generate(1, name + '-' + stage)
                     eid = ids[0]
                     label = f'{name}-{stage}-{repetition}'
@@ -460,7 +545,9 @@ class Harness:
                     child.kill()
                     assert child.wait(timeout=10) == -signal.SIGKILL
                 from django.utils import timezone
-                self.models.OutboxEvent.objects.filter(id=eid).update(locked_until=timezone.now() - timedelta(seconds=1))
+                original_claim = self.models.OutboxEvent.objects.get(id=eid)
+                fixture_expiry = timezone.now() - timedelta(seconds=1)
+                self.models.OutboxEvent.objects.filter(id=eid).update(locked_until=fixture_expiry)
                 recovered_marker = self.marker(label + '-recover')
                 recovered = self.spawn(label + '-recover', [str(HERE / 'workers.py'), 'publisher',
                     '--event', eid, '--marker', str(recovered_marker)], 'publisher')
@@ -479,6 +566,11 @@ class Harness:
                 self.cases.append({'name': 'publisher_crash', 'stage': stage, 'repetition': repetition,
                     'event_id': eid, 'acknowledged_before_kill': paused.get('acknowledged_records', []),
                     'same_event_id_recovered': True, 'expired_owner_writeback_successes': 0 if stage == 'stale_owner' else None,
+                    'lease_expiry_method': 'accelerated disposable fixture timestamp',
+                    'original_lease_expiry': original_claim.locked_until,
+                    'fixture_lease_expiry': fixture_expiry,
+                    'original_lease_token': original_claim.lease_token,
+                    'natural_lease_wait_verified': False,
                     'passed': True})
         self.start_publisher()
 
@@ -490,28 +582,70 @@ class Harness:
             ids, workload = self.generate(self.args.fault_events, label)
             if len(services) >= 2:
                 # Force a completed publish budget while quorum is unavailable.
-                self.stop('publisher', kill=True)
                 sender = self.api.producer()
-                candidate = self.models.OutboxEvent.objects.filter(id__in=ids).first()
-                from django.utils import timezone
-                self.models.OutboxEvent.objects.filter(id=candidate.id).update(status='PENDING',
-                    locked_until=None, lease_token=None, next_attempt_at=timezone.now())
                 failed = False
-                attempted = {}
+                attempted = {'acknowledgements': [], 'delivery_errors': []}
                 original_send = self.api.send
+
+                class ObservingProducer:
+                    def __getattr__(self, name):
+                        return getattr(sender, name)
+
+                    @property
+                    def last_security_error(self):
+                        return sender.last_security_error
+
+                    @last_security_error.setter
+                    def last_security_error(self, value):
+                        sender.last_security_error = value
+
+                    def produce(self, *a, **kw):
+                        callback = kw.get('on_delivery')
+
+                        def observed(error, message):
+                            if error is None:
+                                attempted['acknowledgements'].append({'topic': message.topic(),
+                                    'partition': message.partition(), 'offset': message.offset()})
+                            else:
+                                attempted['delivery_errors'].append(error.name())
+                            if callback:
+                                callback(error, message)
+                        kw['on_delivery'] = observed
+                        return sender.produce(*a, **kw)
 
                 def observed_send(client, topic, key, value):
                     attempted['event_id'] = value['event_id']
                     return original_send(client, topic, key, value)
                 self.api.send = observed_send
+                probe_began = time.monotonic()
+                claim_budget = (self.settings.EVENT_LEASE_SECONDS +
+                    max(self.settings.EVENT_RETRY_SECONDS[:1] or [0]) +
+                    self.settings.KAFKA_PUBLISH_FLUSH_SECONDS + 15)
+                no_candidate_polls = 0
                 try:
-                    self.api.publish_one(sender)
-                except Exception as exc:
-                    failed = True
-                    publish_error = type(exc).__name__
+                    while time.monotonic() - probe_began < claim_budget:
+                        try:
+                            self.api.publish_one(ObservingProducer())
+                        except Exception as exc:
+                            # A claim/pre-send error cannot establish a broker
+                            # denial. Only the captured actual send is eligible.
+                            if not attempted.get('event_id'):
+                                raise
+                            failed = True
+                            publish_error = type(exc).__name__
+                            break
+                        if attempted.get('event_id'):
+                            break
+                        no_candidate_polls += 1
+                        time.sleep(.15)
                 finally:
                     self.api.send = original_send
+                attempted['claim_probe_seconds'] = time.monotonic() - probe_began
+                attempted['no_candidate_polls'] = no_candidate_polls
+                write_json(self.evidence / (label + '-publication-probe.json'), attempted)
+                assert attempted.get('event_id'), 'No naturally eligible outbox was attempted within the bounded quorum probe'
                 assert failed, 'Broker falsely acknowledged publication without quorum'
+                assert not attempted['acknowledgements'], 'Broker record acknowledged without quorum'
                 assert attempted.get('event_id') in ids, 'Quorum failure attempted a different workload event'
                 candidate = self.models.OutboxEvent.objects.get(id=attempted['event_id'])
                 candidate.refresh_from_db()
@@ -525,24 +659,44 @@ class Harness:
                 time.sleep(min(.25, remaining))
                 remaining = seconds - (time.monotonic() - started)
             down_snapshot = self.snapshot(ids)
+            down_rows = self.outbox_retry_evidence(ids)
+            write_json(self.evidence / (label + '-outbox-during-outage.json'), down_rows)
             downtime = time.monotonic() - started
         finally:
             self.compose('start', *services)
         self.wait_brokers()
         self.connections.close_all()
-        from django.utils import timezone
-        self.models.OutboxEvent.objects.filter(id__in=ids).exclude(status='PUBLISHED').update(
-            status='PENDING', next_attempt_at=timezone.now(), locked_until=None, lease_token=None)
         if 'publisher' not in self.workers:
             self.start_publisher()
         recovery = time.monotonic()
-        self.drained(ids, timeout=self.args.drain_timeout)
+        try:
+            self.drained(ids, timeout=self.args.drain_timeout)
+        finally:
+            recovered_rows = self.outbox_retry_evidence(ids)
+            write_json(self.evidence / (label + '-outbox-after-recovery.json'), recovered_rows)
+            dead = [row['id'] for row in recovered_rows if row['status'] == 'DEAD']
+            if dead:
+                with (self.evidence / 'errors.jsonl').open('a') as out:
+                    out.write(json.dumps({'kind': 'automatic_broker_recovery_exhausted',
+                        'scenario': label, 'dead_event_ids': dead, 'operator_requeued_events': 0}) + '\n')
         self.cases.append({'name': label, 'services': services, 'downtime_seconds': downtime,
             'input': len(ids), 'workload': workload, 'publish_denial_error_type': publish_error,
             'attempted_publish_event_id': attempted.get('event_id'),
+            'attempted_publish_ack_count': len(attempted.get('acknowledgements', [])) if len(services) >= 2 else None,
+            'attempted_publish_delivery_errors': attempted.get('delivery_errors', []),
+            'claim_probe_seconds': attempted.get('claim_probe_seconds'),
+            'no_candidate_polls': attempted.get('no_candidate_polls'),
             'database_transactions_committed': len(ids), 'down_snapshot': down_snapshot,
+            'recovery_method': 'automatic persisted retry schedules and natural lease expiry',
+            'operator_requeued_events': 0, 'publishers_killed_by_broker_drill': 0,
             'recovery_drain_seconds': time.monotonic() - recovery, 'offsets_before': before,
             'offsets_after': self.offsets(), 'passed': True})
+
+    def outbox_retry_evidence(self, ids):
+        return [{**{key: value for key, value in row.items() if key != 'lease_token'},
+                 'id': str(row['id']), 'lease_token_present': row['lease_token'] is not None}
+                for row in self.models.OutboxEvent.objects.filter(id__in=ids).order_by('created_at', 'id').values(
+                    'id', 'status', 'attempts', 'next_attempt_at', 'locked_until', 'lease_token', 'published_at')]
 
     def wait_brokers(self):
         from confluent_kafka.admin import AdminClient
@@ -599,30 +753,41 @@ class Harness:
             assert before[key] == after[key], 'Business transaction rollback changed ' + key
         self.cases.append({'name': 'postgres_business_commit', 'attempted_commands': 1,
             'committed_commands': 0, 'partial_ledger_or_outbox': 0, 'error_type': error['error_type'], 'passed': True})
-        self.start_publisher()
-        self.start_consumer('notification')
-        self.start_consumer('analytics')
+        business_supervision = self.supervisor_after_postgres_restart('business transaction fault')
+        self.cases[-1]['supervisor_restart'] = business_supervision
         for name in ('notification', 'analytics'):
             for boundary in ('effect_commit', 'failed_delivery_persist'):
-                self.stop(name)
-                sender = self.api.producer()
+                self.stop('publisher')
+                self.stop_consumer_role('notification')
+                self.stop_consumer_role('analytics')
                 label = 'postgres_' + boundary + '_' + name
+                marker = self.marker(label)
+                target_file = self.evidence / 'markers' / (label + '.target.json')
+                stage = 'postgres_effect_commit' if boundary == 'effect_commit' else 'before_delivery'
+                child = self.spawn(label, [str(HERE / 'workers.py'), 'consumer', '--consumer', name,
+                    '--stage', stage, '--event-file', str(target_file), '--marker', str(marker),
+                    '--observations', str(self.evidence / 'logs' / (label + '-deliveries.jsonl'))], name)
+                assignment = self.wait(lambda: self.group_assignment(name, client_id='acceptance-' + str(child.pid)),
+                    'Fault process did not exclusively own all group partitions', timeout=90)
                 if boundary == 'effect_commit':
                     ids, _ = self.generate(1, label)
                     eid = ids[0]
-                    stage = 'postgres_effect_commit'
+                    write_json(target_file, {'event_id': eid})
+                    self.start_publisher()
                 else:
                     ids = []
                     eid = str(uuid.uuid4())
+                    write_json(target_file, {'event_id': eid})
                     poison = {'event_id': eid, 'schema_version': 999, 'payload': {}}
-                    self.api.send(sender, self.settings.KAFKA_TOPIC, label, poison)
-                    stage = 'before_delivery'
-                marker = self.marker(label)
-                child = self.spawn(label, [str(HERE / 'workers.py'), 'consumer', '--consumer', name,
-                    '--stage', stage, '--event', eid, '--marker', str(marker)], name)
+                    self.api.send(self.api.producer(), self.settings.KAFKA_TOPIC, label, poison)
                 paused = self.wait_marker(marker, child)
                 _, partition, offset = paused['delivery_key'].rsplit(':', 3)[-3:]
                 before_offset = self.offsets()[name][partition]
+                published = None
+                if ids:
+                    self.wait(lambda: self.models.OutboxEvent.objects.filter(id=eid, status='PUBLISHED').exists(),
+                              'Target outbox did not reach actual broker acknowledgement', timeout=30)
+                    published = self.models.OutboxEvent.objects.get(id=eid)
                 self.compose('stop', '-t', '0', 'postgres')
                 try:
                     Path(str(marker) + '.release').touch()
@@ -638,7 +803,7 @@ class Harness:
                 self.wait(lambda: self.models.User.objects.count() > 0, 'PostgreSQL did not recover')
                 assert not self.models.ProcessedEvent.objects.filter(consumer_name=name, event_id=eid).exists()
                 assert not self.models.FailedDelivery.objects.filter(consumer_name=name, delivery_key=paused['delivery_key']).exists()
-                self.start_consumer(name)
+                supervision = self.supervisor_after_postgres_restart(label)
                 if ids:
                     self.drained(ids)
                 else:
@@ -647,7 +812,9 @@ class Harness:
                 self.cases.append({'name': label, 'source': paused['delivery_key'],
                     'offset_before': before_offset, 'offset_while_database_down': after_offset,
                     'failure_type': error['error_type'], 'partial_effect_after_restart': 0,
-                    'durable_outcome_after_recovery': True, 'passed': True})
+                    'durable_outcome_after_recovery': True, 'exclusive_fault_assignment_before_input': assignment,
+                    'target_event_id': eid, 'outbox_status_before_database_stop': published.status if published else None,
+                    'supervisor_restart': supervision, 'passed': True})
 
     def poison_drill(self):
         sender = self.api.producer()
@@ -749,7 +916,9 @@ class Harness:
             assert row.status == 'RETRY'
             original_hash, original_envelope = row.original_hash, row.envelope
             assert not self.models.ProcessedEvent.objects.filter(consumer_name=name, event_id=eid).exists()
-            self.models.FailedDelivery.objects.filter(id=row.id).update(next_attempt_at=timezone.now())
+            original_due = row.next_attempt_at
+            fixture_due = timezone.now()
+            self.models.FailedDelivery.objects.filter(id=row.id).update(next_attempt_at=fixture_due)
             self.start_consumer(name)
             healthy, _ = self.generate(4, 'healthy_while_retry_' + name)
             self.drained(healthy)
@@ -762,9 +931,13 @@ class Harness:
             assert 'PARK' in audit and 'RETRY' in audit
             self.cases.append({'name': 'durable_retry', 'consumer': name, 'event_id': eid,
                 'delivery_id': str(row.id), 'original_hash': original_hash, 'healthy_while_parked': len(healthy),
+                'retry_due_method': 'accelerated disposable fixture timestamp',
+                'original_next_attempt_at': original_due, 'fixture_next_attempt_at': fixture_due,
+                'natural_retry_wait_verified': False,
                 'audit_actions': list(audit), 'resolved_same_event_id': True, 'passed': True})
 
     def rebalance(self):
+        from confluent_kafka import ConsumerGroupState
         from confluent_kafka.admin import AdminClient
         admin = AdminClient(self.configs['admin'])
 
@@ -775,7 +948,10 @@ class Harness:
                 description = admin.describe_consumer_groups([group])[group].result(timeout=10)
                 assignments = [[{'topic': part.topic, 'partition': part.partition}
                                 for part in member.assignment.topic_partitions] for member in description.members]
-                if len(description.members) != expected or sum(map(len, assignments)) != 3:
+                coordinates = [(part['topic'], part['partition']) for member in assignments for part in member]
+                if (description.state != ConsumerGroupState.STABLE or len(description.members) != expected or
+                        len(coordinates) != 3 or set(coordinates) !=
+                        {(self.settings.KAFKA_TOPIC, partition) for partition in range(3)}):
                     return False
                 result[name] = {'group': group, 'state': str(description.state),
                                 'member_count': len(description.members), 'assignments': assignments}
@@ -953,6 +1129,7 @@ class Harness:
         for name, command, role in [('retry', 'retry_events', 'replay'), ('dlq', 'publish_dlq', 'dlq')]:
             self.workers[name] = self.spawn(name + '-metrics-loop',
                 ['manage.py', command, '--loop', '--limit', '100'], role)
+        self.sync_metrics_targets()
         token = self.env.get('WORKER_METRICS_TOKEN', self.env.get('METRICS_TOKEN', ''))
         cases = []
         for name in ('publisher', 'notification', 'analytics', 'retry', 'dlq'):
@@ -965,8 +1142,24 @@ class Harness:
                 payload = urllib.request.urlopen(request, timeout=5).read().decode()
                 assert f'worker="{name}"' in payload and 'labops_worker_database_available 1.0' in payload
                 assert 'labops_worker_outbox_events' in payload and 'labops_worker_failed_deliveries' in payload
+                heartbeat = re.search(r'^labops_worker_heartbeat_timestamp_seconds\{worker="' +
+                                      re.escape(name) + r'"\} (\S+)$', payload, re.MULTILINE)
+                assert heartbeat, 'Actual worker heartbeat metric missing'
+                timestamp = float(heartbeat.group(1))
+                assert math.isfinite(timestamp) and -2 <= time.time() - timestamp <= 30, 'Worker heartbeat is stale'
                 return payload
             payload = self.wait(scrape, 'Worker authenticated metrics missing: ' + name, timeout=30)
+            observed_before = time.time()
+            before_timestamp = float(re.search(r'^labops_worker_heartbeat_timestamp_seconds\{worker="' +
+                re.escape(name) + r'"\} (\S+)$', payload, re.MULTILINE).group(1))
+
+            def advancing():
+                candidate = scrape()
+                timestamp = float(re.search(r'^labops_worker_heartbeat_timestamp_seconds\{worker="' +
+                    re.escape(name) + r'"\} (\S+)$', candidate, re.MULTILINE).group(1))
+                return (candidate, timestamp) if timestamp > before_timestamp else False
+            after_payload, after_timestamp = self.wait(advancing, 'Worker heartbeat did not advance: ' + name, timeout=15)
+            observed_after = time.time()
             denied = False
             try:
                 urllib.request.urlopen(endpoint, timeout=5)
@@ -974,8 +1167,13 @@ class Harness:
                 denied = exc.code == 403
             assert denied, 'Unauthenticated worker metrics exposed'
             (self.evidence / 'metrics' / f'{name}-accepted.prom').write_text(payload)
+            (self.evidence / 'metrics' / f'{name}-heartbeat-advanced.prom').write_text(after_payload)
             cases.append({'worker': name, 'pid': process.pid, 'port': port,
-                'heartbeat_observed': True, 'database_available': True, 'unauthenticated_denied': True})
+                'heartbeat_observed': True, 'heartbeat_before': before_timestamp,
+                'heartbeat_after': after_timestamp, 'heartbeat_advanced': after_timestamp > before_timestamp,
+                'first_scrape_observed_at': observed_before, 'second_scrape_observed_at': observed_after,
+                'elapsed_between_samples_seconds': observed_after - observed_before,
+                'database_available': True, 'unauthenticated_denied': True})
 
         def exporter_scrape():
             payload = urllib.request.urlopen('http://127.0.0.1:19308/metrics', timeout=5).read().decode()
@@ -991,6 +1189,67 @@ class Harness:
         self.cases.append({'name': 'metrics', 'workers': cases, 'exporter_broker_count': 3,
             'inventory_partition_replicas': [3, 3, 3], 'consumer_group_lag_observed': True,
             'durable_RETRY_DEAD_counts_separate_from_lag': True, 'passed': True})
+
+    def live_alert_acceptance(self):
+        import urllib.request
+        from urllib.parse import urlencode
+        import requests
+        base = 'http://127.0.0.1:19091'
+        instance = '127.0.0.1:19644'
+        alert_query = ('ALERTS{alertname="RedpandaMetricsUnavailable",'
+                       'alertstate="firing",instance="' + instance + '"}')
+        observations = []
+
+        def query(expression):
+            url = base + '/api/v1/query?' + urlencode({'query': expression})
+            response = json.loads(urllib.request.urlopen(url, timeout=5).read())
+            assert response['status'] == 'success'
+            observations.append({'observed_at': time.time(), 'query': expression, 'response': response})
+            return response['data']['result']
+
+        def all_brokers_up():
+            rows = query('up{job="redpanda"}')
+            return rows if len(rows) == 3 and all(float(row['value'][1]) == 1 for row in rows) else False
+
+        baseline = self.wait(all_brokers_up, 'Prometheus broker baseline is not three successful scrapes', timeout=90)
+        assert not query(alert_query), 'Target alert was already firing before injection'
+        started = time.time()
+        self.compose('stop', '-t', '0', 'redpanda-0')
+        try:
+            firing = self.wait(lambda: query(alert_query), 'Live broker alert did not fire after actual stop', timeout=150)
+            assert all(row['metric'].get('instance') == instance and float(row['value'][1]) == 1 for row in firing)
+            while time.time() - started < 150:
+                time.sleep(.25)
+            stopped_for = time.time() - started
+        finally:
+            self.compose('start', 'redpanda-0')
+            write_json(self.evidence / 'metrics' / 'prometheus-live-alert-observations.json', observations)
+        session = requests.Session()
+        session.auth = ('admin', self.secrets['admin'])
+        session.verify = self.settings.KAFKA_SSL_CA_LOCATION
+
+        def broker_endpoint_ready():
+            response = session.get('https://' + instance + '/public_metrics', timeout=5)
+            return response.status_code == 200 and bool(response.content)
+        self.wait(broker_endpoint_ready, 'Restored broker metrics endpoint did not return authenticated HTTP 200', timeout=120)
+        restored_up = self.wait(all_brokers_up, 'Prometheus did not recover three healthy broker scrapes', timeout=90)
+        self.wait(lambda: not query(alert_query), 'Live broker alert did not resolve', timeout=90)
+        ended = time.time()
+        raw_ranges = {}
+        for name, expression in [('alert', alert_query), ('up', 'up{job="redpanda"}'),
+                                  ('replication', 'redpanda_cluster_health_under_replicated_partitions')]:
+            url = base + '/api/v1/query_range?' + urlencode({'query': expression,
+                'start': started - 10, 'end': ended, 'step': 5})
+            response = json.loads(urllib.request.urlopen(url, timeout=5).read())
+            assert response['status'] == 'success'
+            write_json(self.evidence / 'metrics' / f'prometheus-live-alert-{name}-range.json', response)
+            raw_ranges[name] = response['data']['result']
+        assert raw_ranges['alert'], 'Live firing interval missing from raw Prometheus history'
+        write_json(self.evidence / 'metrics' / 'prometheus-live-alert-observations.json', observations)
+        self.cases.append({'name': 'live_broker_metrics_alert', 'alert': 'RedpandaMetricsUnavailable',
+            'instance': instance, 'baseline': baseline, 'actual_stop_seconds': stopped_for,
+            'firing': firing, 'restored_endpoint_status': 200, 'restored_up': restored_up,
+            'alert_cleared': True, 'history_start': started - 10, 'history_end': ended, 'passed': True})
 
     def run(self):
         self.setup()
@@ -1019,7 +1278,8 @@ class Harness:
         assert snapshot['notification_count'] == snapshot['expected_notification_count']
         self.cases.append({'name': 'steady', 'workload': workload, 'reconciliation': snapshot,
                            'latency': latency, 'passed': latency['passed'] and
-                           workload['schedule_lateness_seconds'] <= max(1, self.args.events / self.args.rate * .05)})
+                           workload['schedule_lateness_seconds'] <= max(1, self.args.events / self.args.rate * .05) and
+                           (self.args.tier != 'full' or workload['elapsed_seconds'] <= self.args.duration * 1.05)})
         if not latency['passed']:
             raise AssertionError('Steady workload latency threshold or complete sample coverage failed')
         if not self.cases[-1]['passed']:
@@ -1042,9 +1302,15 @@ class Harness:
         if not security['passed']:
             raise AssertionError('Security negative cases did not all demonstrate a denial')
         self.restore()
+        from recovery_matrix import run_recovery_matrix
+        recovery_cases = run_recovery_matrix(self)
+        self.cases.extend(recovery_cases)
+        if len(recovery_cases) != 3 or not all(case.get('passed') for case in recovery_cases):
+            raise AssertionError('Required recovery matrix failed; inspect recovery-matrix.json')
         all_ids = [item['event_id'] for item in self.events]
         self.drained(all_ids, timeout=self.args.drain_timeout)
         self.metrics_acceptance()
+        self.live_alert_acceptance()
         self.collect_metrics()
         reconciliation = self.snapshot(all_ids)
         assert not reconciliation['mismatches']
@@ -1065,17 +1331,32 @@ class Harness:
                 process.wait(timeout=10)
         for log in self.logs:
             log.close()
+        passing_cases = {case.get('name') for case in self.cases if case.get('passed')}
+        limits = ['Mandatory independent-host/AZ fault exercise not executed by this same-host harness',
+                  'Synthetic command workload; HTTP command throughput and production capacity unmeasured',
+                  'PostgreSQL PITR and quantified older-snapshot business losses remain unmeasured',
+                  'Publisher crash and standalone durable-retry drills accelerate disposable lease/due timestamps; natural configured TTL/retry wait is unmeasured in those drills',
+                  'No external email/SMS exactly-once claim; only effects in this PostgreSQL database']
+        for name, description in [('live_broker_metrics_alert', 'live broker alert firing/recovery'),
+                                  ('isolated_retention_exhaustion', 'natural broker retention exhaustion'),
+                                  ('same_name_topic_recreation', 'same-name topic replacement'),
+                                  ('postgres_restart_retry_dead_dedupe', 'RETRY/DEAD/dedupe persistence across restart')]:
+            if name not in passing_cases:
+                limits.append('Mandatory ' + description + ' has no passing execution evidence')
+        if self.args.tier != 'full':
+            limits.append('Smoke tier does not establish the 90,000-event/1,800-second/50-per-second capacity target')
         report = {'passed': error is None and all(case.get('passed') for case in self.cases),
             'run_id': self.args.run_id, 'unique_generated_events': len(self.events),
+            'acceptance_tier': self.args.tier, 'production_ready': False,
+            'full_workload_requested': self.args.tier == 'full',
+            'full_workload_targets_passed': self.args.tier == 'full' and 'steady' in passing_cases,
+            'steady_inventory_inputs_committed': sum(item['scenario'] == 'steady' for item in self.events),
             'elapsed_seconds': time.time() - self.started_at, 'cases': self.cases,
             'error_type': type(error).__name__ if error else None,
             'error': str(error) if error else None,
             'shutdowns': self.shutdowns,
-            'limits': ['Mandatory independent-host/AZ fault exercise not executed by this same-host harness',
-                      'Synthetic command workload; HTTP command throughput and production capacity unmeasured',
-                      'Mandatory real Prometheus alert trigger/recovery not executed; metric endpoints are probed',
-                      'Mandatory PITR, older-snapshot loss, retention exhaustion and same-name topic replacement not executed',
-                      'No external email/SMS exactly-once claim; only effects in this PostgreSQL database']}
+            'supervisor_restarts': self.supervisor_restarts,
+            'limits': limits}
         write_json(self.evidence / 'report.json', report)
         lines = [f"Run {self.args.run_id}: {'PASS' if report['passed'] else 'FAIL'}", '',
                  f"Unique generated inventory events: {len(self.events)}", '',
@@ -1102,6 +1383,7 @@ class Harness:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-id', required=True)
+    p.add_argument('--tier', choices=['smoke', 'full'], default='smoke')
     p.add_argument('--events', type=int, default=200)
     p.add_argument('--rate', type=float, default=10)
     p.add_argument('--duration', type=float, default=20)
@@ -1118,8 +1400,26 @@ def main():
     args = p.parse_args()
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', args.run_id):
         p.error('--run-id must contain 1-48 lowercase letters, digits, underscore or hyphen')
-    if args.events < 4 or args.rate <= 0 or args.duration < 0 or args.fault_repetitions < 1:
-        p.error('Positive counts/rate/duration are required; at least four steady events')
+    bounds = {'events': (4, 1000000), 'rate': (.01, 1000), 'duration': (0, 86400),
+              'fault_repetitions': (1, 100), 'fault_events': (1, 100000),
+              'duplicate_events': (1, 100000), 'poison_events': (12, 1000),
+              'broker_fault_seconds': (1, 3600), 'outage_seconds': (1, 3600),
+              'consumer_outage_seconds': (1, 3600), 'drain_timeout': (1, 7200)}
+    for name, (minimum, maximum) in bounds.items():
+        value = getattr(args, name)
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            p.error(f'--{name.replace("_", "-")} must be finite and between {minimum} and {maximum}')
+    if args.events >= 90000 and args.tier != 'full':
+        p.error('90,000-event acceptance requires explicit --tier full and the frozen full profile')
+    if args.tier == 'full':
+        if (args.events, args.rate, args.duration) != (90000, 50, 1800):
+            p.error('--tier full requires exactly --events 90000 --rate 50 --duration 1800')
+        minimums = {'fault_repetitions': 20, 'fault_events': 30000, 'duplicate_events': 10000,
+                    'poison_events': 100, 'broker_fault_seconds': 300, 'outage_seconds': 600,
+                    'consumer_outage_seconds': 600, 'drain_timeout': 900}
+        for name, minimum in minimums.items():
+            if getattr(args, name) < minimum:
+                p.error(f'--tier full requires --{name.replace("_", "-")} >= {minimum}')
     args.generated_dir = args.generated_dir.resolve()
     args.evidence_dir = args.evidence_dir.resolve()
     load_environment(args.generated_dir / 'client.env')

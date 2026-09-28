@@ -59,6 +59,16 @@ The profile creates and verifies inventory and DLQ topics with three partitions,
 
 Internal clients use `redpanda:9092`; host clients use `127.0.0.1:19093`. The single broker uses replication factor one and is appropriate for local tests, not replicated production durability. Publisher retries and consumer deduplication provide at-least-once delivery. A broker acknowledgement followed by process failure can produce duplicate events; the database uniqueness key `(consumer_name, event_id)` prevents duplicate database effects for each consumer.
 
+Publisher loss of its dedicated PostgreSQL shard session exits nonzero even in
+loop mode; it requires a new supervised process and never reacquires within the
+old loop. Consumers also exit if PostgreSQL cannot persist an effect or failure
+record, leaving the broker offset uncommitted. Compose's `restart: unless-stopped`
+restarts failed application workers; a production supervisor must provide this
+behavior and restart monitoring. After database recovery, a manually stopped
+worker needs an explicit start. Retained leases recover by natural expiry and
+replay keeps original IDs; restoring the database alone is not a same-process
+resume guarantee. See [worker restart commands](events/operator-commands.md).
+
 ## Inspect and replay failed deliveries
 
 ```sh

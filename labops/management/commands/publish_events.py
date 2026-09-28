@@ -1,13 +1,15 @@
 import logging
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import DatabaseError, connections
 from labops.events import producer, publish_one
+from labops.publisher_shards import publisher_shard_owner, ShardOwnershipLost
 from labops.worker_metrics import (StopController, start_worker_metrics, stop_worker_metrics, heartbeat,
                                    operation_deadline, database_statement_budget)
 
 
 class Command(BaseCommand):
-    help = 'Publish inventory outbox records; retry and DLQ are separate workers.'
+    help = 'Publish inventory outbox with one PostgreSQL owner per shard. Stop all publishers before changing shard count.'
 
     def add_arguments(self, parser):
         parser.add_argument('--loop', action='store_true')
@@ -23,7 +25,8 @@ class Command(BaseCommand):
         metrics = None
         try:
             metrics = start_worker_metrics('publisher', port=options['metrics_port'])
-            with StopController() as stop:
+            with StopController() as stop, publisher_shard_owner(options['shard_index'], options['shard_count']) as owner:
+                owner_lost = False
                 try:
                     while not stop.stopped:
                         heartbeat('publisher')
@@ -32,10 +35,26 @@ class Command(BaseCommand):
                                 if stop.stopped:
                                     break
                                 budget = settings.KAFKA_PRODUCER_QUEUE_WAIT_SECONDS + settings.KAFKA_PUBLISH_FLUSH_SECONDS + settings.EVENT_PUBLISH_DB_BUDGET_SECONDS
-                                with operation_deadline(min(budget, stop.remaining())), database_statement_budget(settings.EVENT_PUBLISH_DB_BUDGET_SECONDS):
-                                    published = publish_one(broker, shard_index=options['shard_index'], shard_count=options['shard_count'])
+                                with operation_deadline(min(budget, stop.remaining())):
+                                    # Verify the dedicated session before touching
+                                    # a possibly stale application DB connection.
+                                    owner.assert_owned()
+                                    with database_statement_budget(settings.EVENT_PUBLISH_DB_BUDGET_SECONDS):
+                                        published = publish_one(broker, shard_index=options['shard_index'], shard_count=options['shard_count'],
+                                                                ownership_check=owner.assert_owned)
                                 if not published:
                                     break
+                        except ShardOwnershipLost:
+                            # A loop never silently reacquires after owner loss.
+                            owner_lost = True
+                            raise
+                        except DatabaseError:
+                            # Only the application connection is replaceable.
+                            # The independently owned shard session is never reacquired.
+                            connections['default'].close()
+                            logging.getLogger('labops').exception('publisher_database_failed')
+                            if not options['loop']:
+                                raise
                         except Exception:
                             logging.getLogger('labops').exception('publisher_failed')
                             if not options['loop']:
@@ -44,8 +63,14 @@ class Command(BaseCommand):
                             break
                         stop.wait(1)
                 finally:
-                    remaining = broker.flush(min(settings.KAFKA_PUBLISH_FLUSH_SECONDS, stop.remaining()))
-                    if remaining:
-                        logging.getLogger('labops').error('publisher_shutdown_unacknowledged count=%s', remaining)
+                    if owner_lost:
+                        # Do not drain extra queued sends from a stale owner.
+                        # Purging cannot retract broker records already in flight.
+                        broker.purge(in_queue=True, in_flight=True, blocking=False)
+                        broker.poll(0)
+                    else:
+                        remaining = broker.flush(min(settings.KAFKA_PUBLISH_FLUSH_SECONDS, stop.remaining()))
+                        if remaining:
+                            logging.getLogger('labops').error('publisher_shutdown_unacknowledged count=%s', remaining)
         finally:
             stop_worker_metrics(metrics)

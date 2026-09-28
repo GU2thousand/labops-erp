@@ -40,7 +40,7 @@ def main():
     destination.mkdir(parents=True, exist_ok=True)
     (destination / 'logs').mkdir(exist_ok=True)
     (destination / 'metrics').mkdir(exist_ok=True)
-    command = ['docker', 'compose', '--env-file', args.env_file, '-f', 'infra/events/validation/compose.yaml']
+    command = ['docker', 'compose', '--env-file', args.env_file, '-f', 'infra/events/validation/compose.yaml', '--profile', 'metrics']
     def run(argv):
         result = subprocess.run(argv, text=True, capture_output=True)
         return redact({'exit_code': result.returncode, 'output': result.stdout, 'stderr': result.stderr})
@@ -93,7 +93,25 @@ def main():
         (destination / 'metrics' / 'kafka-exporter.txt').write_text(redact(exporter.text))
     except Exception as exc:
         errors.append({'endpoint': 'kafka-exporter', 'error_class': type(exc).__name__})
+    try:
+        prometheus = requests.get('http://127.0.0.1:19091/api/v1/targets', timeout=5, allow_redirects=False)
+        prometheus.raise_for_status()
+        (destination / 'metrics' / 'prometheus-targets.json').write_text(json.dumps(redact(prometheus.json()), indent=2) + '\n')
+        alerts = requests.get('http://127.0.0.1:19091/api/v1/alerts', timeout=5, allow_redirects=False)
+        alerts.raise_for_status()
+        (destination / 'metrics' / 'prometheus-alerts-after.json').write_text(json.dumps(redact(alerts.json()), indent=2) + '\n')
+    except Exception as exc:
+        errors.append({'endpoint': 'prometheus', 'error_class': type(exc).__name__})
     (destination / 'collection-errors.json').write_text(json.dumps(errors, indent=2) + '\n')
+    # Apply the same explicit credential redaction to every text evidence file,
+    # including worker logs and failure summaries captured by the harness.
+    text_suffixes = {'.json', '.jsonl', '.log', '.md', '.csv', '.prom', '.txt', '.sql'}
+    for path in destination.rglob('*'):
+        if path.is_file() and path.suffix in text_suffixes:
+            original = path.read_text()
+            protected = redact(original)
+            if protected != original:
+                path.write_text(protected)
     print(json.dumps({'run_id': args.run_id, 'evidence_dir': str(destination), 'collection_errors': len(errors), 'private_keys_uploaded': False}))
 
 

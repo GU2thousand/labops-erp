@@ -17,7 +17,7 @@ starting the restricted exporter, a short integration run is:
 
 ```bash
 python benchmarks/events/acceptance.py \
-  --run-id "$RUN_ID" --events 60 --rate 10 --duration 0 \
+  --run-id "$RUN_ID" --tier smoke --events 60 --rate 10 --duration 0 \
   --fault-repetitions 1 --fault-events 20 \
   --evidence-dir "evidence/$RUN_ID"
 ```
@@ -27,7 +27,7 @@ manual run, on a sufficiently provisioned disposable host:
 
 ```bash
 python benchmarks/events/acceptance.py \
-  --run-id "$RUN_ID" --events 90000 --rate 50 --duration 1800 \
+  --run-id "$RUN_ID" --tier full --events 90000 --rate 50 --duration 1800 \
   --fault-repetitions 20 --duplicate-events 10000 --poison-events 100 \
   --fault-events 30000 --single-broker-outage-seconds 300 \
   --all-broker-outage-seconds 600 --consumer-outage-seconds 600 \
@@ -39,6 +39,11 @@ separate denominators. The full manual command can take considerably longer than
 30 minutes. Parameters are frozen before execution. Slower business commands,
 publisher throughput, failures and unfinished effects remain visible; successful
 short integration runs do not establish the full workload target.
+The full tier requires that exact workload plus the documented full fault
+parameters. Its generation window has a fixed 5% tolerance (at most 1,890
+seconds); missed rate/window and missing effects fail the suite. Numeric input
+must be finite and within bounded counts/durations. NaN and infinity are rejected
+before creating resources or evidence.
 
 ## Cases and evidence
 
@@ -58,30 +63,55 @@ The harness records and verifies:
   consumer delivery denominators and zero additional database effects.
 - Real publisher SIGKILL before send and after broker acknowledgement, lease
   expiry and stale-owner recovery with stable event IDs and rejected writeback.
+  These crash fixtures accelerate the disposable row's lease expiry; they do
+  not measure recovery after the configured natural lease TTL.
 - Real notification/analytics SIGKILL inside the effect transaction and after
   its outer commit but before broker offset commit; the same source coordinate
   must be redelivered and then committed.
 - Real broker process stop/start, one broker, quorum loss and whole-cluster loss;
-  committed business operations survive failed publication budgets.
+  committed business operations survive failed publication budgets. Recovery
+  preserves real persisted retry schedules and leases without resetting rows;
+  exhausted DEAD events fail rather than receiving an implicit operator requeue.
 - Independent notification progress while analytics is stopped, measured drain
   timing, actual consumer-group membership/assignments for 1→3→1 and shutdown
   outcomes including any forced kill escalation.
 - PostgreSQL server stop during an uncommitted business command, consumer effect
   transaction and failed-delivery persistence. Partial effects remain absent and
-  unpersisted outcomes cannot advance offsets.
+  unpersisted outcomes cannot advance offsets. The validation supervisor starts
+  fresh publisher/consumer processes after every database restart and records
+  their PIDs and stable, exclusive topic/partition ownership before fault input.
 - Durable retry and independent DLQ workers with append-only action audit;
   poisonous JSON/schema/UUID/time/decimal/size variants, valid JSON with NUL,
   near-1-MiB invalid raw data, normal messages continuing, and actual DLQ record
-  inspection checking stable delivery IDs and original hashes.
+  inspection checking stable delivery IDs and original hashes. Standalone retry
+  fixtures accelerate the retry due timestamp and report the original/applied
+  dates; they do not measure the configured natural retry delay.
 - Six security negative classes, explicit authentication/authorization/TLS
   denial evidence and correlated broker log evidence where an anonymous client
   sees only a disconnect. Mere timeouts do not pass.
 - Frozen-watermark `pg_dump` into a separate database, exact restored hashes for
   nine business/event/audit tables, legal-ledger projection rebuild and actual
   same-ID replay against restored database effects.
+- PostgreSQL and broker restart with durable RETRY/DEAD envelopes, hashes and
+  dedupe markers preserved; independent retry resolves the original ID and main
+  topic redelivery adds zero effects.
+- Natural retention cleanup on a sacrificial RF3 topic: closed segments are
+  rolled by size and the broker low watermark must advance beyond retained
+  original records. A guarded `delete_records` fallback tests recovery under
+  truncation, records a limitation and fails the required natural-retention gate.
+  Legal-ledger rebuild and an older restored database's quarantine of a future
+  broker event verify that replay cannot invent missing business truth.
+- A sacrificial topic deleted and recreated under the same name with a new
+  explicit source generation and fresh groups: both incarnations reuse offset
+  zero without colliding failure records; original event IDs/hashes persist and
+  later duplicate records produce zero additional database effects.
 - Authenticated metrics from all five independent worker roles, denied anonymous
   scrapes, actual broker/replica/group-lag exporter metrics and durable RETRY/DEAD
   gauges distinct from group lag.
+- Actual `RedpandaMetricsUnavailable` alert firing after a broker's 150-second
+  stop, authenticated endpoint recovery, alert resolution and raw Prometheus
+  `ALERTS`/`up`/replication query-range evidence. Three successful broker scrapes
+  are required before injection, so bad scrape authentication cannot fake a pass.
 
 `harness-manifest.json` preserves the acceptance runtime metadata without secrets;
 the workflow's infrastructure collector writes `manifest.json`. Every process log
@@ -95,9 +125,11 @@ copied into evidence.
 ## Required exercises beyond this harness
 
 This same-host container run measures protocol/process failures. Independent
-host/AZ failures, actual Prometheus alert trigger/recovery, PostgreSQL PITR,
-older-snapshot business losses, retention exhaustion and same-name topic
-replacement remain required staging exercises and are prominently marked
-unexecuted in every summary. Frozen snapshot restoration reports a watermark,
+host/AZ failures, PostgreSQL PITR and quantified older-snapshot business losses
+remain required staging exercises. Every summary separately marks missing passing
+evidence for live alert, natural retention exhaustion, topic replacement and
+restart persistence cases. Frozen snapshot restoration reports a watermark,
 snapshot RPO and measured restore time; it makes no claim about production RPO.
 No result here establishes public deployment or exactly-once external email/SMS.
+These are executable checks. Their implementation and syntax validation do not
+establish a passing real-cluster execution; use the corresponding CI artifacts.
