@@ -339,6 +339,121 @@ class ConsumerPoolTests(SimpleTestCase):
         self.assertEqual({row['labels']['owned_role'] for row in targets}, {'notification', 'notification-1'})
         self.assertEqual(len({row['targets'][0] for row in targets}), 2)
 
+    def crash_flow(self, outcome='normal', preset='single'):
+        """Model target ACK plus ongoing natural closure at the real flow boundary."""
+        h = self.harness(preset)
+        (h.evidence / 'markers').mkdir()
+        counts, processes, recoveries, waits = {}, {}, [], []
+        position = {'offset': 20, 'coordinate': None}
+        def generate(count, label):
+            event = 'event-' + str(len(counts) + 1)
+            counts[event] = {'notification': 0, 'analytics': 0}
+            position['offset'] = 20 + len(counts)
+            position['coordinate'] = 'cluster:inventory.events:0:' + str(position['offset'])
+            return [event], {}
+        h.generate = Mock(side_effect=generate)
+        h.models = SimpleNamespace(ProcessedEvent=SimpleNamespace(objects=SimpleNamespace(
+            filter=lambda consumer_name, event_id: SimpleNamespace(count=lambda: counts[event_id][consumer_name]))))
+        h.offsets = lambda: {name: {'0': position['offset']} for name in ('notification', 'analytics')}
+        original_spawn = h.spawn.side_effect
+        timeout_error = acceptance.subprocess.TimeoutExpired('target-recovery-fixture', 30)
+        def spawn(label, argv, role, **kwargs):
+            process = original_spawn(label, argv, role, **kwargs)
+            target = argv[argv.index('--event') + 1] if '--event' in argv else None
+            stage = argv[argv.index('--stage') + 1] if '--stage' in argv else 'normal'
+            identity = h.child_identities[process.pid]
+            identity['fault_stage'] = stage
+            processes[id(process)] = {'target': target, 'stage': stage, 'consumer': role}
+            if '--max-messages' in argv:
+                recoveries.append(process)
+                def signal(value):
+                    # Default SIGTERM after StopController restoration is abnormal.
+                    process.signals.append(value)
+                    process.returncode = -value
+                process.send_signal = signal
+                def wait(timeout):
+                    waits.append(timeout)
+                    if outcome == 'timeout':
+                        raise timeout_error
+                    if process.returncode is None:
+                        process.returncode = -15 if outcome == 'abnormal' else 0
+                    return process.returncode
+                process.wait = wait
+                path = h.evidence / 'logs' / (identity['identity_receipt'] + '.closed')
+                if outcome == 'missing_close':
+                    path.unlink()
+                elif outcome == 'failed_close':
+                    value = json.loads(path.read_text())
+                    value['cleanup_complete'] = False
+                    path.write_text(json.dumps(value))
+            return process
+        h.spawn.side_effect = spawn
+        def marker(path, process, timeout=90):
+            metadata = processes[id(process)]
+            event, name = metadata['target'], metadata['consumer']
+            if str(path).endswith('.completed'):
+                counts[event][name] = 1
+                coordinate = position['coordinate']
+                position['offset'] += 1
+                # The durable ACK is visible while this target child still closes.
+                self.assertIsNone(process.poll())
+                return {'delivery_key': coordinate}
+            counts[event][name] = int(metadata['stage'] == 'after_commit')
+            return {'delivery_key': position['coordinate']}
+        h.wait_marker = Mock(side_effect=marker)
+        h.drained = Mock()
+        return h, recoveries, waits, timeout_error
+
+    def test_target_ack_recovery_closes_naturally_without_parent_sigterm(self):
+        for preset in ('single', 'notification-dual'):
+            h, recoveries, waits, _ = self.crash_flow(preset=preset)
+            with self.proc():
+                h.consumer_crashes()
+            self.assertEqual(waits, [30] * 4)
+            self.assertEqual(len(recoveries), 4)
+            self.assertTrue(all(child.returncode == 0 and child.signals == [] for child in recoveries))
+            self.assertTrue(all(h.worker_closures[child.pid]['owning_close_receipt_complete']
+                for child in recoveries))
+            self.assertEqual({(case['consumer'], case['stage']) for case in h.cases}, {
+                (name, stage) for name in ('notification', 'analytics') for stage in ('before_commit', 'after_commit')})
+            self.assertTrue(all(case['passed'] and case['effects_after_recovery'] == 1
+                and case['offset_after_recovery'] == case['offset_before_kill'] + 1 for case in h.cases))
+            self.assertEqual(h.drained.call_count, 4)
+
+    def test_target_recovery_abnormal_exit_cannot_pass_even_with_valid_close_receipt(self):
+        h, recoveries, waits, _ = self.crash_flow('abnormal')
+        with self.proc(), self.assertRaises(AssertionError):
+            h.consumer_crashes()
+        self.assertEqual(recoveries[0].returncode, -15)
+        self.assertEqual(recoveries[0].signals, [])
+        self.assertEqual(waits, [30])
+        self.assertFalse(h.cases)
+        h.drained.assert_not_called()
+
+    def test_target_recovery_timeout_keeps_original_wait_bound_and_owned_child(self):
+        h, recoveries, waits, original = self.crash_flow('timeout')
+        with self.proc(), self.assertRaises(acceptance.subprocess.TimeoutExpired) as raised:
+            h.consumer_crashes()
+        self.assertIs(raised.exception, original)
+        self.assertIs(h.children[-1], recoveries[0])
+        self.assertIsNone(recoveries[0].poll())
+        self.assertEqual(recoveries[0].signals, [])
+        self.assertEqual(waits, [30])
+        self.assertFalse(h.cases)
+        h.drained.assert_not_called()
+
+    def test_target_recovery_failed_or_missing_close_receipt_prevents_restoration_success(self):
+        for outcome in ('failed_close', 'missing_close'):
+            h, recoveries, waits, _ = self.crash_flow(outcome)
+            with self.proc(), self.assertRaises(AssertionError):
+                h.consumer_crashes()
+            self.assertEqual(recoveries[0].returncode, 0)
+            self.assertEqual(recoveries[0].signals, [])
+            self.assertEqual(waits, [30])
+            self.assertFalse(h.worker_closures[recoveries[0].pid]['owning_close_receipt_complete'])
+            self.assertFalse(h.cases)
+            h.drained.assert_not_called()
+
 
 class FrozenTopologyTests(SimpleTestCase):
     def test_invalid_or_profiled_nondefault_topology_is_refused_before_any_setup_io(self):

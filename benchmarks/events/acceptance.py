@@ -1772,8 +1772,10 @@ class Harness:
                     assert replay['delivery_key'] == paused['delivery_key'], 'Same broker offset was not replayed'
                     self.wait(lambda: self.offsets()[name][partition] == int(offset) + 1,
                               'Recovery did not commit offset')
-                    child.send_signal(signal.SIGTERM)
-                    child.wait(timeout=30)
+                    # The target-aware child requests its own graceful stop
+                    # immediately after the synchronous target offset ACK.
+                    assert child.wait(timeout=30) == 0, 'Target recovery consumer did not close normally'
+                    self.observe_worker_close(child)
                     assert self.models.ProcessedEvent.objects.filter(consumer_name=name, event_id=eid).count() == 1
                     restoration = self.restore_consumer_pool(name)
                     self.drained(ids)
