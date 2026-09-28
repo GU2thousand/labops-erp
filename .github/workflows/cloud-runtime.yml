@@ -59,24 +59,58 @@ jobs:
         run: |
           docker compose restart web
           python - <<'PY'
-          import json,time,requests
+          import json,time,re,requests
+          from datetime import datetime
           from pathlib import Path
           for i in range(30):
               try:
                   if requests.get('http://localhost:8001/login/',timeout=5).ok:break
               except requests.RequestException:pass
               time.sleep(2)
-          s=requests.Session();s.get('http://localhost:8001/login/').raise_for_status()
+          s=requests.Session();s.get('http://localhost:8001/login/',timeout=5).raise_for_status()
+          web_ready_at=time.time()
           s.post('http://localhost:8001/login/',data={'email':'admin@labops.local','password':'LabOpsDemo!2026','csrfmiddlewaretoken':s.cookies['csrftoken']}).raise_for_status()
           saved=json.loads(Path('output/playwright/persistence.json').read_text())
           for kind,key in [('samples','sample_id'),('lab-orders','order_id')]:
               r=s.get('http://localhost:8001/api/v1/'+kind+'/'+saved[key]);r.raise_for_status();assert r.json()['data']['status']=='COMPLETED'
           for url in ['http://localhost:19090/-/ready','http://localhost:13000/api/health','http://localhost:16687/api/services']:
               requests.get(url,timeout=10).raise_for_status()
-          result=requests.get('http://localhost:19090/api/v1/targets').json()
-          targets=result['data']['activeTargets'];assert targets and all(t['health']=='up' for t in targets),targets
+          expected_targets={('labops','web:8000'),('redpanda','redpanda:9644'),
+              ('kafka-exporter','kafka-exporter:9308'),
+              *[('labops-events-workers',name+':9100') for name in
+                ('publisher','notification-consumer','analytics-consumer','retry-worker','dlq-publisher')]}
+          def fresh_targets(targets,cutoff):
+              if len(targets)!=len(expected_targets) or {
+                  (t['labels'].get('job'),t['labels'].get('instance')) for t in targets}!=expected_targets:return False
+              for target in targets:
+                  if target.get('health')!='up' or target.get('lastError'):return False
+                  try:scraped=datetime.fromisoformat(target['lastScrape'].replace('Z','+00:00'))
+                  except (KeyError,TypeError,ValueError):return False
+                  if scraped.tzinfo is None or scraped.timestamp()<cutoff:return False
+              return True
+          deadline=time.monotonic()+90
+          polls=0
+          while True:
+              remaining=deadline-time.monotonic()
+              if remaining<=0:raise AssertionError('Prometheus targets did not recover fresh successful scrapes within90seconds')
+              polls+=1
+              try:response=requests.get('http://localhost:19090/api/v1/targets',timeout=min(5,remaining))
+              except requests.RequestException as error:
+                  with Path('output/playwright/restart-prometheus-observations.jsonl').open('a') as out:
+                      out.write(json.dumps({'observed_at':time.time(),'web_ready_at':web_ready_at,'poll':polls,
+                          'request_error_type':type(error).__name__})+'\n')
+                  raise
+              with Path('output/playwright/restart-prometheus-observations.jsonl').open('a') as out:
+                  out.write(json.dumps({'observed_at':time.time(),'web_ready_at':web_ready_at,'poll':polls,
+                      'http_status':response.status_code,'raw_response':response.text})+'\n')
+              response.raise_for_status();result=response.json()
+              assert result['status']=='success',result
+              targets=result['data']['activeTargets']
+              assert not any(re.search(r'HTTP status (401|403)\b',t.get('lastError','')) for t in targets),targets
+              if fresh_targets(targets,web_ready_at):break
+              time.sleep(min(2,max(0,deadline-time.monotonic())))
           services=requests.get('http://localhost:16687/api/services').json()['data'];assert 'labops' in services,services
-          Path('output/playwright/restart-observability.json').write_text(json.dumps({'persistent_samples':True,'persistent_lab_orders':True,'prometheus_targets':targets,'traced_services':services},indent=2))
+          Path('output/playwright/restart-observability.json').write_text(json.dumps({'persistent_samples':True,'persistent_lab_orders':True,'prometheus_targets':targets,'traced_services':services,'web_ready_at':web_ready_at,'fresh_scrapes_observed_at':time.time(),'prometheus_poll_count':polls,'scrape_recovery_window_seconds':90},indent=2))
           PY
           docker compose exec -T redis redis-cli ping
           docker compose exec -T web python manage.py reconcile_stock
