@@ -663,3 +663,22 @@ current runs from historical evidence. Only after mandatory implementation **and
 real acceptance gates pass may the Kafka event upgrade be called complete.
 Optional Apache Kafka/MSK Phase 7 remains separate and is not required for the
 first Redpanda release.
+
+Migration `0007_outbox_active_ordered_index` adds the nonunique
+`outbox_active_created_id_idx` on `(created_at, id)` for Kafka PENDING/PROCESSING
+rows. It preserves every existing index and the publisher's due, lease,
+dependency, shard and row-lock predicates. PostgreSQL creation and removal run
+concurrently outside a transaction; SQLite uses its normal partial-index DDL.
+Concurrent creation can wait for older transactions and adds database/WAL work;
+the index alone establishes no workload rate or latency result.
+
+A same-name object, including an invalid interrupted build or a valid build
+whose migration record was not written, stops migration rather than being
+silently reused or deleted. Inspect the public index's target table OID,
+definition and validity before recovery. For a verified leftover from this
+migration, explicitly drop that index concurrently, then rerun the migration;
+preserve a different same-name object and resolve the collision separately.
+Binary rollback can retain this additive index. Database rollback to `0006`
+removes only the matching expected index concurrently; a missing or mismatched
+catalog definition stops rollback. It does not remove existing indexes, change
+business data, or alter acceptance gates.

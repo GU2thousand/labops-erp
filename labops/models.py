@@ -203,7 +203,9 @@ class OutboxEvent(Base):
     class Meta:
         indexes = [models.Index(fields=['status','next_attempt_at']),
                    models.Index(fields=['transport', 'status', 'next_attempt_at'], name='outbox_route_due_idx'),
-                   models.Index(fields=['aggregate_type', 'aggregate_id', 'aggregate_version'], name='outbox_aggregate_version_idx')]
+                   models.Index(fields=['aggregate_type', 'aggregate_id', 'aggregate_version'], name='outbox_aggregate_version_idx'),
+                   models.Index(fields=['created_at', 'id'], name='outbox_active_created_id_idx',
+                       condition=Q(transport='kafka') & Q(status__in=['PENDING', 'PROCESSING']))]
         constraints = [models.UniqueConstraint(
             fields=['aggregate_type', 'aggregate_id', 'aggregate_version'],
             condition=Q(aggregate_type='stockmovement', event_type__in=[
