@@ -23,7 +23,8 @@ def selected_service_images(command, run, project):
         '"service":{{json (index .Config.Labels "com.docker.compose.service")}}}')
     image_format = ('{"image_id":{{json .Id}},"repo_digests":{{json .RepoDigests}},'
         '"architecture":{{json .Architecture}},"os":{{json .Os}},'
-        '"image_version_label":{{json (index .Config.Labels "org.opencontainers.image.version")}}}')
+        '"image_version_label":{{if .Config.Labels}}'
+        '{{json (index .Config.Labels "org.opencontainers.image.version")}}{{else}}null{{end}}}')
     cache = {}
     result = {}
     for service in ('redpanda-0', 'redpanda-1', 'redpanda-2', 'postgres', 'kafka-exporter', 'prometheus'):

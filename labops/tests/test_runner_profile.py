@@ -1,7 +1,9 @@
 """Pure admission and fixed-file profile fixtures; no Docker or services."""
 from copy import deepcopy
+import ast
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -53,6 +55,49 @@ def images():
         'architecture': 'arm64', 'os': 'linux', 'image_version_label': None,
         'Env': ['PASSWORD=PRIVATE'], 'Labels': {'unrelated': 'PRIVATE'}}
     return container, image
+
+
+def collector_function():
+    # Execute the production pure callback function without importing the
+    # collector's HTTP/runtime dependencies. The injected command callback is
+    # the only inspection boundary; no Docker process is launched by fixtures.
+    source = Path(__file__).resolve().parents[2] / 'infra/events/validation/collect.py'
+    tree = ast.parse(source.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'selected_service_images')
+    namespace = {'json': json, 're': re, 'selected_image_profile': selected_image_profile}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), 'exec'), namespace)
+    return namespace['selected_service_images']
+
+
+class CollectorImages:
+    def __init__(self, failed_role=None):
+        roles = ('redpanda-0', 'redpanda-1', 'redpanda-2', 'postgres', 'kafka-exporter', 'prometheus')
+        self.containers = {str(index + 1) * 64: {'container_id': str(index + 1) * 64,
+            'project': PROJECT, 'service': role, 'declared_image_ref': 'official/' + role + ':fixed',
+            'image_id': 'sha256:' + ('a' if role.startswith('redpanda') else str(index + 1)) * 64}
+            for index, role in enumerate(roles)}
+        self.role_ids = {row['service']: identity for identity, row in self.containers.items()}
+        self.calls = []
+        self.failed_role = failed_role
+
+    def run(self, argv):
+        self.calls.append(list(argv))
+        if argv[:3] == ['docker', 'compose', 'ps']:
+            return {'exit_code': 0, 'output': self.role_ids[argv[-1]] + '\n', 'stderr': ''}
+        if argv[:3] == ['docker', 'container', 'inspect']:
+            return {'exit_code': 0, 'output': json.dumps(self.containers[argv[3]]), 'stderr': ''}
+        if argv[:3] == ['docker', 'image', 'inspect']:
+            image_id = argv[3]
+            if self.failed_role and image_id == self.containers[self.role_ids[self.failed_role]]['image_id']:
+                return {'exit_code': 1, 'output': '\n',
+                        'stderr': 'template parsing error: PRIVATE inspection failure'}
+            # Native nil-label fixtures render valid JSON with a null optional
+            # version, retaining identity/platform rather than skipping image.
+            return {'exit_code': 0, 'output': json.dumps({'image_id': image_id,
+                'repo_digests': ['official/image@' + image_id], 'architecture': 'arm64',
+                'os': 'linux', 'image_version_label': None}), 'stderr': ''}
+        raise AssertionError('Fixture attempted an unexpected command')
 
 
 class RunnerProfileTests(unittest.TestCase):
@@ -183,6 +228,31 @@ class RunnerProfileTests(unittest.TestCase):
             (candidate_container if area == 'container' else candidate_image)[key] = value
             with self.subTest(area=area, key=key), self.assertRaises(ValueError):
                 selected_image_profile(candidate_container, candidate_image, PROJECT, 'postgres')
+
+    def test_collector_nil_optional_versions_preserve_all_six_identities_and_cached_image_reads(self):
+        fixture = CollectorImages()
+        observed = collector_function()(['docker', 'compose'], fixture.run, PROJECT)
+        self.assertEqual(set(observed), set(fixture.role_ids))
+        for role, row in observed.items():
+            self.assertEqual(row['status'], 'available')
+            self.assertEqual(row['architecture'], 'arm64')
+            self.assertEqual(row['os'], 'linux')
+            self.assertEqual(row['selected_image_id'], fixture.containers[fixture.role_ids[role]]['image_id'])
+            self.assertIsNone(row['image_version_label'])
+            self.assertIsNone(row['actual_binary_version'])
+            self.assertIsNone(row['child_manifest_digest'])
+        inspected = [argv[3] for argv in fixture.calls if argv[:3] == ['docker', 'image', 'inspect']]
+        self.assertEqual(len(inspected), 4)
+        self.assertEqual(len(set(inspected)), 4)
+        self.assertNotIn('PRIVATE', json.dumps(observed))
+
+    def test_collector_does_not_waive_a_real_image_inspection_failure(self):
+        fixture = CollectorImages(failed_role='kafka-exporter')
+        observed = collector_function()(['docker', 'compose'], fixture.run, PROJECT)
+        self.assertEqual(observed['kafka-exporter'], {'status': 'unavailable', 'error_type': 'ValueError'})
+        self.assertEqual(observed['postgres']['status'], 'available')
+        self.assertIsNone(observed['postgres']['image_version_label'])
+        self.assertNotIn('PRIVATE', json.dumps(observed))
 
 
 if __name__ == '__main__':

@@ -72,6 +72,7 @@ def raw_envelope(event):
 def emit_inventory(movement):
     from .operations.services import stock_recipients
     carrier = {}; inject(carrier)
+    lines = movement.prefetched_lines if hasattr(movement, 'prefetched_lines') else movement.lines.order_by('line_no')
     payload = {
         '_trace_context': carrier,
         'movement_id': str(movement.id), 'movement_type': movement.type,
@@ -79,7 +80,7 @@ def emit_inventory(movement):
         'recipients': [str(x) for x in stock_recipients()],
         'lines': [{'batch_id': str(x.batch_id), 'warehouse_id': str(x.warehouse_id),
                    'delta_qty': str(x.delta_qty), 'unit_cost': str(x.unit_cost)}
-                  for x in movement.lines.order_by('line_no')],
+                  for x in lines],
     }
     event, created = OutboxEvent.objects.get_or_create(dedupe_key=f'inventory:{movement.id}', defaults={
         'event_type': f'inventory.{movement.type.lower()}.posted', 'aggregate_type': 'stockmovement',

@@ -30,6 +30,7 @@ class Command(BaseCommand):
                 try:
                     while not stop.stopped:
                         heartbeat('publisher')
+                        batch_complete = False
                         try:
                             for _ in range(options['limit']):
                                 if stop.stopped:
@@ -44,6 +45,8 @@ class Command(BaseCommand):
                                                                 ownership_check=owner.assert_owned)
                                 if not published:
                                     break
+                            else:
+                                batch_complete = True
                         except ShardOwnershipLost:
                             # A loop never silently reacquires after owner loss.
                             owner_lost = True
@@ -61,7 +64,11 @@ class Command(BaseCommand):
                                 raise
                         if not options['loop']:
                             break
-                        stop.wait(1)
+                        # Backlog work can continue immediately after a full
+                        # successful batch; idle, partial and failed batches
+                        # retain their interruptible retry/idle wait.
+                        if not batch_complete:
+                            stop.wait(1)
                 finally:
                     if owner_lost:
                         # Do not drain extra queued sends from a stale owner.

@@ -28,8 +28,7 @@ def post(user,kind,lines,data,key,rid,receipt=None,reversal=None,draft=None):
     balances=[]
     for (bid,wid),delta in sorted(changes.items()):
         advisory(f'balance:{bid}:{wid}')
-        balance,_=StockBalance.objects.get_or_create(batch_id=bid,warehouse_id=wid)
-        balance=StockBalance.objects.select_for_update().get(pk=balance.pk)
+        balance,_=StockBalance.objects.select_for_update().get_or_create(batch_id=bid,warehouse_id=wid)
         require(balance.on_hand_qty+delta>=0,'INSUFFICIENT_STOCK','Insufficient batch stock in the selected warehouse; no changes were made',422,'qty')
         balances.append((balance,delta))
     m=draft or new(StockMovement,user,rid,movement_no=number('STK'),type=kind)
@@ -39,9 +38,17 @@ def post(user,kind,lines,data,key,rid,receipt=None,reversal=None,draft=None):
     for n,x in enumerate(lines,1): StockMovementLine.objects.create(movement=m,line_no=n,**x)
     for balance,delta in balances:
         balance.on_hand_qty+=delta; balance.version+=1; balance.save()
-    save_change(user,m,rid,before,'POST',m.reason)
-    from labops.events import emit_inventory
-    emit_inventory(m)
+    missing=object(); prior_lines=m.__dict__.get('prefetched_lines',missing)
+    try:
+        # Read persisted Fixed6 values once: audit and immutable event strings
+        # must use database normalization, including caller-supplied decimals.
+        m.prefetched_lines=list(m.lines.order_by('line_no'))
+        save_change(user,m,rid,before,'POST',m.reason)
+        from labops.events import emit_inventory
+        emit_inventory(m)
+    finally:
+        if prior_lines is missing: m.__dict__.pop('prefetched_lines',None)
+        else: m.prefetched_lines=prior_lines
     return m
 
 def line(batch,warehouse,delta,**other): return dict(batch=batch,warehouse=warehouse,delta_qty=delta,unit_cost=batch.unit_cost,**other)

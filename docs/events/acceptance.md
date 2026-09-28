@@ -56,9 +56,21 @@ prove physical core count; that field remains unmeasured. After execution, the
 collector records the IDs, architectures and repository digests of the images
 actually selected by the six validation services, without an additional pull.
 Architecture-specific child digests may differ beneath a shared image manifest.
-The planned ARM 3,000-event/50-per-second/60-second comparison explicitly enables
+The ARM 3,000-event/50-per-second/60-second comparison explicitly enables
 diagnostics; its inclusive elapsed and latency gates remain unchanged. The prior
-x64 rate and latency failure remains a separate retained result.
+x64 rate and latency failure remains a separate retained result. The first ARM
+[run 36387008788](https://github.com/GU2thousand/labops-erp/actions/runs/36387008788),
+at `c5ee5ed` with unchanged `605c9d3` application code, also **failed**: all 3,000
+commands committed in 76.823346875 seconds (39.050628774/s), exceeding the
+63-second generation window. Analytics p95/p99 were 10.015/10.957 seconds and
+notification p95/p99 were 20.895/21.169 seconds; latency qualification failed.
+Both consumers completed all original IDs with exact effects and no ledger or
+projection mismatch. The new image observer retained four of six image rows;
+PostgreSQL and exporter inspection failed on missing optional label maps, while
+the existing run-scoped Compose image evidence independently retained all six
+native ARM identities. Keep those observer failures intact. The guarded optional
+label lookup leaves a missing version as null. Subsequent balance/line read and
+publisher pacing changes require a new run; none predicts 50/s capacity.
 
 Runtime diagnostics are an explicit opt-in with `--runtime-diagnostics`.
 The default CLI and automatic 60-event smoke leave diagnostics disabled. The

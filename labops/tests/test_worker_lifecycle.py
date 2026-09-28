@@ -129,6 +129,89 @@ class WorkerLifecycleTests(SimpleTestCase):
         dlq.assert_not_called()
         broker.flush.assert_called_once_with(12)
 
+    @contextmanager
+    def publisher_loop(self):
+        module = 'labops.management.commands.publish_events'
+        stop = StopController()
+        stop.wait = MagicMock(side_effect=lambda seconds: stop.request())
+        broker = MagicMock()
+        broker.flush.return_value = 0
+        owner = MagicMock(spec=['assert_owned'])
+        with ExitStack() as patches:
+            patches.enter_context(patch(module + '.StopController', return_value=stop))
+            patches.enter_context(patch(module + '.producer', return_value=broker))
+            ownership = patches.enter_context(patch(module + '.publisher_shard_owner', return_value=nullcontext(owner)))
+            patches.enter_context(patch(module + '.database_statement_budget', return_value=nullcontext()))
+            publish = patches.enter_context(patch(module + '.publish_one'))
+            yield SimpleNamespace(stop=stop, broker=broker, owner=owner,
+                                  ownership=ownership, publish=publish)
+
+    def test_publisher_continues_after_full_success_and_waits_when_idle(self):
+        with self.publisher_loop() as loop:
+            loop.publish.side_effect = [True, True, False]
+            call_command('publish_events', loop=True, limit=2, stdout=StringIO())
+        self.assertEqual(loop.publish.call_count, 3)
+        loop.stop.wait.assert_called_once_with(1)
+        loop.ownership.assert_called_once_with(0, 1)
+        self.assertEqual(loop.owner.assert_owned.call_count, 3)
+        loop.broker.flush.assert_called_once()
+
+    def test_publisher_partial_and_failed_batches_retain_wait(self):
+        for outcome in (False, RuntimeError('publication failed')):
+            with self.subTest(outcome=type(outcome).__name__), self.publisher_loop() as loop:
+                loop.publish.side_effect = [True, outcome]
+                if isinstance(outcome, Exception):
+                    with self.assertLogs('labops', level='ERROR'):
+                        call_command('publish_events', loop=True, limit=3, stdout=StringIO())
+                else:
+                    call_command('publish_events', loop=True, limit=3, stdout=StringIO())
+            self.assertEqual(loop.publish.call_count, 2)
+            loop.stop.wait.assert_called_once_with(1)
+            loop.broker.flush.assert_called_once()
+
+    def test_publisher_database_context_failure_after_success_does_not_skip_wait(self):
+        @contextmanager
+        def failed_commit_budget(*args):
+            yield
+            raise OperationalError('database context failed after publication')
+        with self.publisher_loop() as loop, \
+             patch('labops.management.commands.publish_events.database_statement_budget', failed_commit_budget), \
+             patch('labops.management.commands.publish_events.connections') as database:
+            loop.publish.return_value = True
+            with self.assertLogs('labops', level='ERROR'):
+                call_command('publish_events', loop=True, limit=1, stdout=StringIO())
+        loop.publish.assert_called_once()
+        loop.stop.wait.assert_called_once_with(1)
+        database['default'].close.assert_called_once()
+
+    def test_publisher_owner_loss_after_full_batch_purges_without_wait_or_flush(self):
+        with self.publisher_loop() as loop:
+            loop.publish.return_value = True
+            loop.owner.assert_owned.side_effect = [None, None, ShardOwnershipLost('owner session lost')]
+            with self.assertRaises(ShardOwnershipLost):
+                call_command('publish_events', loop=True, limit=2, stdout=StringIO())
+        self.assertEqual(loop.publish.call_count, 2)
+        loop.stop.wait.assert_not_called()
+        loop.ownership.assert_called_once_with(0, 1)
+        loop.broker.purge.assert_called_once_with(in_queue=True, in_flight=True, blocking=False)
+        loop.broker.poll.assert_called_once_with(0)
+        loop.broker.flush.assert_not_called()
+
+    def test_publisher_stop_during_last_success_exits_without_new_batch(self):
+        with self.publisher_loop() as loop:
+            calls = []
+            def publish(*args, **kwargs):
+                calls.append('acknowledged')
+                if len(calls) == 2:
+                    loop.stop.request()
+                return True
+            loop.publish.side_effect = publish
+            call_command('publish_events', loop=True, limit=2, stdout=StringIO())
+        self.assertEqual(calls, ['acknowledged', 'acknowledged'])
+        self.assertEqual(loop.owner.assert_owned.call_count, 2)
+        loop.stop.wait.assert_not_called()
+        loop.broker.flush.assert_called_once()
+
     def test_dlq_poison_does_not_prevent_next_row(self):
         broker = MagicMock()
         broker.flush.return_value = 0
