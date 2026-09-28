@@ -37,6 +37,17 @@ acknowledgment with caching disabled is the intended persistence boundary.
 Do not translate Apache Kafka's ISR/min.insync.replicas policy into a Redpanda
 claim. Record actual successful producer acknowledgments and recovery evidence.
 
+Each advertised broker/RPC identity must keep a stable address through supported
+restarts. Use the platform's supported stable node endpoints and verify their
+identity after each restart. In a custom container deployment, assign stable
+per-broker private addresses: a hostname alone does not protect against a peer
+caching an old address that Docker has reassigned to another broker. The RF3 CI
+profile uses a dedicated network and fixed broker addresses for this reason.
+Before returning to service, check all brokers' cluster health, no down nodes,
+no leaderless/under-replicated partitions, and actual topic leaders/replicas;
+counting reachable endpoints or metadata entries is insufficient. The developer
+Compose profile has one broker and does not validate this multi-node boundary.
+
 Configure and validate `internal_topic_replication_factor=3` before any consumer
 group first commits. The administration tool only inspects `__consumer_offsets`
 after a consumer has created it; it never creates or modifies internal topics.

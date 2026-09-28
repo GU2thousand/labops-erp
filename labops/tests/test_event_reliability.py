@@ -26,7 +26,7 @@ class EventReliabilityTests(Fixture, TestCase):
         from confluent_kafka import KafkaError
         error = broker_error(KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED, 'secret-should-not-escape'))
         self.assertEqual(classify_failure(error), 'authorization')
-        self.assertEqual(str(error), 'broker_authorization_failed')
+        self.assertEqual(str(error), f'broker_authorization_failed:kafka_code={KafkaError.TOPIC_AUTHORIZATION_FAILED}')
         self.assertNotIn('secret', str(error))
 
     def test_jsonb_unrepresentable_poison_is_retained_without_nul(self):

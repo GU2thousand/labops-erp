@@ -11,6 +11,9 @@ x-broker: &broker
 services:
   redpanda-0:
     <<: *broker
+    networks:
+      default:
+        ipv4_address: ${LABOPS_VALIDATION_IPV4_PREFIX:-10.243.77}.10
     ports: ['127.0.0.1:19092:19092', '127.0.0.1:19644:9644']
     volumes:
       - redpanda-0:/var/lib/redpanda/data
@@ -21,6 +24,9 @@ services:
       - ./generated/tls/ca.crt:/etc/labops-tls/ca.crt:ro
   redpanda-1:
     <<: *broker
+    networks:
+      default:
+        ipv4_address: ${LABOPS_VALIDATION_IPV4_PREFIX:-10.243.77}.11
     ports: ['127.0.0.1:29092:19092', '127.0.0.1:29644:9644']
     volumes:
       - redpanda-1:/var/lib/redpanda/data
@@ -31,6 +37,9 @@ services:
       - ./generated/tls/ca.crt:/etc/labops-tls/ca.crt:ro
   redpanda-2:
     <<: *broker
+    networks:
+      default:
+        ipv4_address: ${LABOPS_VALIDATION_IPV4_PREFIX:-10.243.77}.12
     ports: ['127.0.0.1:39092:19092', '127.0.0.1:39644:9644']
     volumes:
       - redpanda-2:/var/lib/redpanda/data
@@ -90,3 +99,13 @@ volumes:
   redpanda-1:
   redpanda-2:
   postgres:
+networks:
+  default:
+    # Keep broker identities stable across real abrupt stop/start faults.
+    # Docker's dynamic reassignment can swap peers behind cached RPC DNS.
+    # Choose an unused RFC1918 three-octet prefix for concurrent local projects.
+    # Each disposable Compose project still owns its own named bridge network.
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${LABOPS_VALIDATION_IPV4_PREFIX:-10.243.77}.0/24

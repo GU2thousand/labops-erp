@@ -37,8 +37,12 @@ class LeaseLost(RuntimeError):
 
 
 class BrokerDeliveryError(RuntimeError):
-    def __init__(self, code, failure_class='transient'):
-        super().__init__(code)
+    def __init__(self, code, failure_class='transient', kafka_error_code=None):
+        # Only the numeric protocol/local code crosses this diagnostic boundary.
+        # Broker text may include payloads, endpoints or authentication details.
+        self.kafka_error_code = kafka_error_code if type(kafka_error_code) is int else None
+        message = code if self.kafka_error_code is None else f'{code}:kafka_code={self.kafka_error_code}'
+        super().__init__(message)
         self.code, self.failure_class = code, failure_class
 
 
@@ -49,10 +53,10 @@ def broker_error(error):
         'TOPIC_AUTHORIZATION_FAILED', 'GROUP_AUTHORIZATION_FAILED', 'CLUSTER_AUTHORIZATION_FAILED',
         'SASL_AUTHENTICATION_FAILED', '_AUTHENTICATION', '_SSL')}
     if actual is not None and actual in auth:
-        return BrokerDeliveryError('broker_authorization_failed', 'authorization')
+        return BrokerDeliveryError('broker_authorization_failed', 'authorization', actual)
     if actual == getattr(KafkaError, 'MSG_SIZE_TOO_LARGE', None):
-        return BrokerDeliveryError('broker_message_size', 'permanent')
-    return BrokerDeliveryError('broker_delivery_failed')
+        return BrokerDeliveryError('broker_message_size', 'permanent', actual)
+    return BrokerDeliveryError('broker_delivery_failed', kafka_error_code=actual)
 
 
 
@@ -284,7 +288,7 @@ def classify_failure(exc):
 def safe_error(exc):
     # A fixed code is safe for durable operator-visible diagnostics; original
     # payload stays permission-restricted in FailedDelivery, never log labels.
-    return getattr(exc, 'code', None) or type(exc).__name__
+    return str(exc) if isinstance(exc, BrokerDeliveryError) else getattr(exc, 'code', None) or type(exc).__name__
 
 
 def retry_delay(attempts, identity):

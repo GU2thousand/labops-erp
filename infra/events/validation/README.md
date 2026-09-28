@@ -27,6 +27,21 @@ python benchmarks/events/acceptance.py --run-id ci123 --tier smoke --events 60 -
 ```
 
 Generated credentials and private keys are excluded from Git and artifacts.
+The generated env file freezes a validation retry schedule of `15,30` followed
+by twenty-two `60`-second delays and jitter in `[1,1.2]`. Natural broker recovery
+is measured under this recorded policy; default production retry timing is
+unmeasured. No broker fault resets retained outbox status, due times or leases.
+
+Each broker keeps its private address `.10/.11/.12` on the dedicated default
+`10.243.77.0/24` bridge through abrupt stop/start. `prepare.py --ipv4-prefix`
+accepts another unused RFC1918 three-octet prefix and freezes it in the env file.
+Docker IPAM refuses an overlapping existing pool; do not remove another project's
+network to work around that refusal. Choose an unused prefix instead. Parallel
+projects also need distinct host ports or separate Docker daemons. Each broker
+fault retains before/after network identities and fails on an address/node change.
+Recovery additionally requires healthy views from all three brokers and actual
+RF3 leaders/full ISR for inventory and DLQ. Cluster readiness has its existing
+180-second deadline and counts within the total 900-second recovery/drain window.
 TLS certificates last two days and are for disposable runs only. Preserve logs
 and the raw evidence before `docker compose ... down -v`; cleanup applies only to
 the generated Compose project. Never reuse retained v25.1 data volumes with this

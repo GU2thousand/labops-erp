@@ -5,9 +5,38 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
+import time
 import requests
 from wait_ready import load_env
+
+
+def network_identity(command, project):
+    """Inspect only network identity fields, never container Env or full config."""
+    def inspect(argv):
+        result = subprocess.run(argv, text=True, capture_output=True)
+        return {'exit_code': result.returncode, 'output': result.stdout, 'stderr': result.stderr}
+    container_format = ('{"container_id":{{json .Id}},"name":{{json .Name}},'
+        '"status":{{json .State.Status}},'
+        '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
+        '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+        '"networks":{{json .NetworkSettings.Networks}}}')
+    services = {}
+    for name in ('redpanda-0', 'redpanda-1', 'redpanda-2'):
+        ids = inspect([*command, 'ps', '--all', '--quiet', name])
+        rows = []
+        for container in ids['output'].splitlines() if ids['exit_code'] == 0 else []:
+            result = inspect(['docker', 'container', 'inspect', container, '--format', container_format])
+            rows.append(json.loads(result['output']) if result['exit_code'] == 0 else result)
+        services[name] = {'container_ids_result': ids, 'containers': rows}
+    network_format = ('{"network_id":{{json .Id}},"name":{{json .Name}},'
+        '"driver":{{json .Driver}},"ipam_config":{{json .IPAM.Config}},'
+        '"containers":{{json .Containers}}}')
+    network = inspect(['docker', 'network', 'inspect', project + '_default', '--format', network_format])
+    return {'observed_at': time.time(), 'compose_project': project,
+        'bridge': json.loads(network['output']) if network['exit_code'] == 0 else network,
+        'brokers': services, 'inspection_scope': 'network IDs, aliases, IPAM and runtime addresses only'}
 
 
 def main():
@@ -15,7 +44,13 @@ def main():
     parser.add_argument('--env-file', required=True)
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--evidence-dir', type=Path, required=True)
+    parser.add_argument('--network-snapshot-only', action='store_true',
+        help='Capture identity before/after fault injection without running the full final collector')
+    parser.add_argument('--network-stage', default='collection',
+        help='Unique evidence label, for example before, quorum-after or collection')
     args = parser.parse_args()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', args.network_stage):
+        parser.error('--network-stage must be 1-48 lowercase letters, digits, underscore or hyphen')
     env = load_env(args.env_file)
     sensitive = []
     secrets_path = Path(args.env_file).parent / 'secrets.json'
@@ -44,6 +79,12 @@ def main():
     def run(argv):
         result = subprocess.run(argv, text=True, capture_output=True)
         return redact({'exit_code': result.returncode, 'output': result.stdout, 'stderr': result.stderr})
+    network_path = destination / ('network-identity-' + args.network_stage + '.json')
+    with network_path.open('x') as output:
+        output.write(json.dumps(redact(network_identity(command, env['LABOPS_VALIDATION_PROJECT'])), indent=2) + '\n')
+    if args.network_snapshot_only:
+        print(json.dumps({'run_id': args.run_id, 'network_evidence': str(network_path)}))
+        return
     # Only image IDs and repo digests are inspected, never container Env.
     image = run(['docker', 'image', 'inspect', env['REDPANDA_IMAGE'], '--format', '{{json .RepoDigests}}'])
     commit = run(['git', 'rev-parse', 'HEAD'])['output'].strip()

@@ -4,6 +4,7 @@ Never run this against retained production data. Output contains secrets and is
 excluded from Git and evidence uploads. Regeneration refuses an existing run.
 """
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -13,14 +14,35 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[3]
 IMAGE = 'docker.redpanda.com/redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96'
+# Frozen before worker startup. Keep natural persisted retries within the
+# 15-minute recovery window and enough attempts for the 10-minute outage.
+# This CI policy does not measure the production default's longer backoffs.
+VALIDATION_RETRY_SECONDS = [15, 30] + [60] * 22
+VALIDATION_RETRY_JITTER = .2
+
+
+def validate_ipv4_prefix(value):
+    if not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,3}){2}', value):
+        raise ValueError('validation IPv4 prefix must contain three decimal octets')
+    network = ipaddress.IPv4Network(value + '.0/24')
+    if not any(network.subnet_of(ipaddress.IPv4Network(private))
+               for private in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')):
+        raise ValueError('validation subnet must be within an RFC1918 private range')
+    return value
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-id', required=True)
+    parser.add_argument('--ipv4-prefix', default=os.getenv('LABOPS_VALIDATION_IPV4_PREFIX', '10.243.77'),
+        help='Unused RFC1918 three-octet /24 prefix; Docker refuses overlapping existing pools')
     args = parser.parse_args()
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', args.run_id):
         parser.error('run-id must be 1-48 lowercase ASCII letters, digits, _ or -')
+    try:
+        ipv4_prefix = validate_ipv4_prefix(args.ipv4_prefix)
+    except ValueError as exc:
+        parser.error(str(exc))
     output = Path(__file__).resolve().parent / 'generated'
     if output.exists():
         parser.error('generated already exists; use another checkout or explicitly preserve/remove the prior disposable run')
@@ -66,11 +88,14 @@ def main():
     (output / 'bootstrap.yaml').write_text(json.dumps(bootstrap, indent=2) + '\n')
     prefix = 'labops.' + args.run_id
     values = {'LABOPS_VALIDATION_PROJECT': 'labops_events_' + args.run_id,
+        'LABOPS_VALIDATION_IPV4_PREFIX': ipv4_prefix,
         'REDPANDA_IMAGE': IMAGE, 'RP_BOOTSTRAP_USER': f'admin:{passwords["admin"]}:SCRAM-SHA-256',
         'POSTGRES_PASSWORD': db_password, 'LABOPS_DB_MODE': 'postgres',
         'DATABASE_URL': f'postgresql://labops:{db_password}@127.0.0.1:55434/labops_events',
         'LABOPS_SECRET_KEY': secrets.token_urlsafe(48), 'LABOPS_DEBUG': '1',
         'LABOPS_EVENT_TRANSPORT': 'kafka', 'KAFKA_BOOTSTRAP_SERVERS': '127.0.0.1:19092,127.0.0.1:29092,127.0.0.1:39092',
+        'EVENT_RETRY_SECONDS': ','.join(map(str, VALIDATION_RETRY_SECONDS)),
+        'EVENT_RETRY_JITTER': str(VALIDATION_RETRY_JITTER),
         'KAFKA_TOPIC': prefix + '.inventory.v1', 'KAFKA_DLQ_TOPIC': prefix + '.inventory.dlq.v1',
         'KAFKA_GROUP_PREFIX': prefix, 'KAFKA_SOURCE_CLUSTER_ID': 'validation.' + args.run_id,
         'KAFKA_SOURCE_STREAM_GENERATION': '1', 'KAFKA_SECURITY_PROTOCOL': 'SASL_SSL',

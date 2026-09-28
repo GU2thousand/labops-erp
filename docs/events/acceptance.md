@@ -39,6 +39,21 @@ duration and one crash repetition); manual full inputs request 90,000 events,
 requesting full inputs does not prove every broker/consumer outage lasted the
 plan's five/ten minutes or every acceptance scenario was executed.
 
+Both CI tiers explicitly freeze `EVENT_RETRY_SECONDS=15,30` followed by twenty-two
+`60`-second delays, with deterministic jitter from the base through 20% above it,
+before any worker starts. Broker outage recovery waits for these durable due
+timestamps and natural leases; it never resets outbox status, leases or due times.
+The artifact records the exact policy. Its maximum scheduled retry delay is 72
+seconds and its minimum complete retry horizon exceeds the 600-second outage.
+This is a validation policy, not evidence for default production retry timing.
+The application's default `60,300,900,3600` schedule can delay an eligible retry
+up to 4,320 seconds; for both outbox publication and FailedDelivery consumer
+retries, its four delays can total 5,832 seconds before the fifth failed attempt
+becomes DEAD, in addition to processing time. A 900-second drain
+claim therefore requires a separately frozen compatible policy or an explicitly
+audited operator recovery. Production policy and recovery SLA remain deployment
+decisions requiring executed staging evidence.
+
 ## Required scenarios and frozen targets
 
 Use [capacity](capacity.md) for latency/retention/RPO assumptions. Preserve all

@@ -352,6 +352,11 @@ class Harness:
             'worktree_dirty': bool(self.command(['git', 'status', '--porcelain']).strip()),
             'python': sys.version, 'host': platform.platform(), 'cpu_count': os.cpu_count(),
             'security_protocol': 'SASL_SSL', 'compose_project': self.env['LABOPS_VALIDATION_PROJECT'],
+            'retry_policy': {'seconds': self.settings.EVENT_RETRY_SECONDS,
+                'jitter_fraction': self.settings.EVENT_RETRY_JITTER,
+                'jitter_range': 'base through base*(1+jitter), deterministic per identity/attempt',
+                'maximum_scheduled_delay_seconds': max(self.settings.EVENT_RETRY_SECONDS) * (1 + self.settings.EVENT_RETRY_JITTER),
+                'scope': 'explicit disposable validation configuration, frozen before worker startup; production default timing unmeasured'},
             'topic': self.settings.KAFKA_TOPIC,
             'replicas': {str(n): p.replicas for n, p in topic.partitions.items()},
             'client_config_hash': canonical_hash({k: v for k, v in self.env.items()
@@ -632,6 +637,7 @@ class Harness:
 
     def broker_fault(self, services, seconds, label):
         before = self.offsets()
+        network_before = self.network_snapshot(label + '-before')
         self.compose('stop', '-t', '0', *services)
         started = time.monotonic()
         try:
@@ -720,16 +726,34 @@ class Harness:
             downtime = time.monotonic() - started
         finally:
             self.compose('start', *services)
-        self.wait_brokers()
-        self.connections.close_all()
-        if 'publisher' not in self.workers:
-            self.start_publisher()
+        # The frozen drain window begins when stopped processes return, so
+        # network/cluster recovery cannot quietly extend the 900-second SLA.
         recovery = time.monotonic()
+        completed_seconds = None
         try:
-            self.drained(ids, timeout=self.args.drain_timeout)
+            network_after = self.network_snapshot(label + '-after')
+            from network_identity import compare_broker_networks
+            network_proof = compare_broker_networks(network_before, network_after,
+                self.env['LABOPS_VALIDATION_IPV4_PREFIX'])
+            self.wait_brokers()
+            health_recovery_seconds = time.monotonic() - recovery
+            self.connections.close_all()
+            if 'publisher' not in self.workers:
+                self.start_publisher()
+            remaining = self.args.drain_timeout - (time.monotonic() - recovery)
+            assert remaining > 0, 'Broker health recovery exhausted the frozen drain window'
+            self.drained(ids, timeout=remaining)
+            from benchmarks.events.health import completed_recovery_seconds
+            completed_seconds = completed_recovery_seconds(recovery, self.args.drain_timeout)
         finally:
             recovered_rows = self.outbox_retry_evidence(ids)
             write_json(self.evidence / (label + '-outbox-after-recovery.json'), recovered_rows)
+            write_json(self.evidence / (label + '-recovery-window.json'), {
+                'budget_seconds': self.args.drain_timeout,
+                'observation_elapsed_seconds': time.monotonic() - recovery,
+                'window_start': 'broker compose start completed',
+                'successful_completion_elapsed_seconds': completed_seconds,
+                'successful_completion_within_budget': completed_seconds is not None})
             dead = [row['id'] for row in recovered_rows if row['status'] == 'DEAD']
             if dead:
                 with (self.evidence / 'errors.jsonl').open('a') as out:
@@ -745,8 +769,19 @@ class Harness:
             'database_transactions_committed': len(ids), 'down_snapshot': down_snapshot,
             'recovery_method': 'automatic persisted retry schedules and natural lease expiry',
             'operator_requeued_events': 0, 'publishers_killed_by_broker_drill': 0,
-            'recovery_drain_seconds': time.monotonic() - recovery, 'offsets_before': before,
+            'stable_broker_network': network_proof,
+            'broker_health_recovery_seconds': health_recovery_seconds,
+            'recovery_window_seconds': self.args.drain_timeout,
+            'recovery_window_start': 'broker compose start completed; includes network/cluster health recovery',
+            'recovery_drain_seconds': completed_seconds, 'offsets_before': before,
             'offsets_after': self.offsets(), 'passed': True})
+
+    def network_snapshot(self, stage):
+        self.command([sys.executable, 'infra/events/validation/collect.py',
+            '--env-file', str(self.args.generated_dir / 'client.env'),
+            '--run-id', self.args.run_id, '--evidence-dir', str(self.evidence),
+            '--network-snapshot-only', '--network-stage', stage])
+        return json.loads((self.evidence / ('network-identity-' + stage + '.json')).read_text())
 
     def outbox_retry_evidence(self, ids):
         return [{**{key: value for key, value in row.items() if key != 'lease_token'},
@@ -756,9 +791,69 @@ class Harness:
 
     def wait_brokers(self):
         from confluent_kafka.admin import AdminClient
-        def ready():
-            return len(AdminClient(self.configs['admin']).list_topics(timeout=4).brokers) == 3
-        self.wait(ready, 'Three broker metadata did not recover', timeout=180)
+        import requests
+        from benchmarks.events.health import wait_broker_recovery
+        from labops.worker_metrics import operation_deadline, OperationDeadlineExceeded
+        # A metadata broker count can advertise three nodes while Raft remains
+        # leaderless or a surviving node contacts another node's stale address.
+        # Retain every local health view and the actual topic leaders/ISR.
+        index = len(list(self.evidence.glob('broker-recovery-*-result.json')))
+        prefix = self.evidence / f'broker-recovery-{index:02d}'
+        last = {}
+        session = requests.Session()
+        session.auth = (self.configs['admin']['sasl.username'], self.configs['admin']['sasl.password'])
+        session.verify = self.configs['ca_path']
+        session.trust_env = False
+
+        def observed(snapshot):
+            last.clear()
+            last.update(snapshot)
+            with prefix.with_name(prefix.name + '-observations.jsonl').open('a') as out:
+                out.write(json.dumps(snapshot, sort_keys=True) + '\n')
+
+        def health(node, remaining):
+            try:
+                with operation_deadline(remaining):
+                    response = session.get(f'https://127.0.0.1:{19644 + node * 10000}/v1/cluster/health_overview',
+                        timeout=min(4, remaining / 2), allow_redirects=False)
+                    if response.status_code != 200:
+                        raise RuntimeError('Broker health HTTP status is not 200')
+                    return response.json()
+            except OperationDeadlineExceeded:
+                raise TimeoutError('Broker health request exhausted recovery budget') from None
+
+        def metadata(remaining):
+            try:
+                with operation_deadline(remaining):
+                    value = AdminClient(self.configs['admin']).list_topics(timeout=min(4, remaining))
+                    topics = {}
+                    for name in (self.settings.KAFKA_TOPIC, self.settings.KAFKA_DLQ_TOPIC):
+                        topic = value.topics.get(name)
+                        if topic is None:
+                            continue
+                        topics[name] = {'error': topic.error.name() if topic.error else None,
+                            'partitions': [{'partition': number, 'leader': part.leader,
+                                'replicas': list(part.replicas), 'isr': list(part.isrs),
+                                'error': part.error.name() if part.error else None}
+                                for number, part in sorted(topic.partitions.items())]}
+                    return {'brokers': sorted(value.brokers), 'topics': topics}
+            except OperationDeadlineExceeded:
+                raise TimeoutError('Kafka metadata request exhausted recovery budget') from None
+
+        try:
+            result = wait_broker_recovery(health, metadata,
+                (self.settings.KAFKA_TOPIC, self.settings.KAFKA_DLQ_TOPIC),
+                timeout=180, on_observation=observed)
+        except Exception as exc:
+            write_json(prefix.with_name(prefix.name + '-result.json'),
+                {'status': 'FAILED', 'timeout_seconds': 180, 'error_type': type(exc).__name__,
+                 'last_observation': last})
+            raise
+        else:
+            write_json(prefix.with_name(prefix.name + '-result.json'),
+                {'status': 'READY', 'timeout_seconds': 180, 'last_observation': result})
+        finally:
+            session.close()
 
     def analytics_outage(self):
         self.stop('analytics')
@@ -1392,6 +1487,7 @@ class Harness:
                   'Synthetic command workload; HTTP command throughput and production capacity unmeasured',
                   'PostgreSQL PITR and quantified older-snapshot business losses remain unmeasured',
                   'Publisher crash and standalone durable-retry drills accelerate disposable lease/due timestamps; natural configured TTL/retry wait is unmeasured in those drills',
+                  'Broker recovery measures the recorded CI retry policy; the default 60/300/900/3600-second production schedule is not measured by this run',
                   'No external email/SMS exactly-once claim; only effects in this PostgreSQL database']
         for name, description in [('live_broker_metrics_alert', 'live broker alert firing/recovery'),
                                   ('isolated_retention_exhaustion', 'natural broker retention exhaustion'),
