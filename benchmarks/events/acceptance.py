@@ -52,13 +52,15 @@ def load_environment(path):
         os.environ[key] = parsed[0] if len(parsed) == 1 else raw
 
 
-def freeze_generation_execution_profile(evidence, run_id):
+def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False):
     from benchmarks.events.concurrent_generation import frozen_generation_profile
     from benchmarks.events.runtime_diagnostics import diagnostics_profile
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
         json.dump({'run_id': run_id, **frozen_generation_profile(),
             'runtime_diagnostics': {**diagnostics_profile(),
+                'enabled': runtime_diagnostics, 'applicable': runtime_diagnostics,
+                'request_status': 'REQUESTED' if runtime_diagnostics else 'NOT_REQUESTED',
                 'lifecycle_required_scenarios': 'every concurrent capacity batch',
                 'complete_collection_required_scenarios': ['steady'],
                 'fault_resource_scope': 'explicit optional missing resource coverage; existing business/count/rate/recovery gates unchanged',
@@ -143,7 +145,8 @@ class Harness:
         from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
         self.generation = generation or GenerationJournal(self.evidence, args.run_id, numeric_profile(args))
         if generation is None:
-            freeze_generation_execution_profile(self.evidence, args.run_id)
+            freeze_generation_execution_profile(self.evidence, args.run_id,
+                runtime_diagnostics=getattr(args, 'runtime_diagnostics', False))
         self.children = []
         self.child_metrics = {}
         self.child_groups = {}
@@ -185,17 +188,26 @@ class Harness:
             'logs', '--no-color', '--since', start, '--until', end,
             'redpanda-0', 'redpanda-1', 'redpanda-2')
         self.started_at = time.time()
-        # Read-only resource discovery happens before any business workload.
-        # The sampler itself, including its joined cleanup, belongs to each
-        # capacity batch's elapsed clock below.
-        from benchmarks.events.container_diagnostics import ContainerResources
-        self.runtime_resource_factory = lambda: ContainerResources.from_compose(self.compose,
-            command_callback=self.command, expected_project=self.env['LABOPS_VALIDATION_PROJECT'])
-        self.container_resources = self.runtime_resource_factory()
-        write_json(self.evidence / 'runtime-resource-profile.json', self.container_resources.profile())
-        self.runtime_diagnostics_enabled = True
+        self.configure_runtime_diagnostics()
+
+    def configure_runtime_diagnostics(self):
+        """Freeze opt-in applicability without discovering unrequested resources."""
+        self.runtime_diagnostics_enabled = getattr(self.args, 'runtime_diagnostics', False)
         self.runtime_diagnostics = []
         self.runtime_diagnostic_errors = []
+        self.runtime_resource_factory = None
+        self.container_resources = None
+        if self.runtime_diagnostics_enabled:
+            from benchmarks.events.container_diagnostics import ContainerResources
+            # Fresh discovery occurs inside each measured batch's clock.
+            self.runtime_resource_factory = lambda: ContainerResources.from_compose(self.compose,
+                command_callback=self.command, expected_project=self.env['LABOPS_VALIDATION_PROJECT'])
+        write_json(self.evidence / 'runtime-resource-profile.json', {
+            'enabled': self.runtime_diagnostics_enabled,
+            'applicable': self.runtime_diagnostics_enabled,
+            'status': 'REQUESTED_NOT_STARTED' if self.runtime_diagnostics_enabled else 'NOT_REQUESTED',
+            'collection_complete': None,
+            'discovery_scope': 'inside each enabled capacity batch elapsed clock'})
 
     def command(self, argv, *, timeout=60, binary=False, input=None):
         result = subprocess.run(argv, cwd=ROOT, env=self.env, input=input,
@@ -2136,14 +2148,17 @@ class Harness:
             and not getattr(self, '_generation_accounting_error', None))
         topologies_complete = all(topology.get('passed') is True
                                   for topology in getattr(self, 'generation_topologies', []))
-        diagnostics_complete = (not getattr(self, 'runtime_diagnostic_errors', [])
+        diagnostics_enabled = getattr(self, 'runtime_diagnostics_enabled', False)
+        diagnostics_complete = (bool(getattr(self, 'runtime_diagnostics', []))
+            and not getattr(self, 'runtime_diagnostic_errors', [])
             and all(row.get('summary', {}).get('lifecycle_complete') is True
                     and (row.get('scenario') != 'steady'
                          or row.get('summary', {}).get('collection_complete') is True)
                     for row in getattr(self, 'runtime_diagnostics', [])))
+        diagnostics_qualified = not diagnostics_enabled or diagnostics_complete
         final_complete = (final_state['database_observed'] and final_state['offsets_observed']
             and not final_state['errors'] and not final_state['unpublished_count']
-            and reconciliation_complete and generation_complete and topologies_complete and diagnostics_complete
+            and reconciliation_complete and generation_complete and topologies_complete and diagnostics_qualified
             and not final_state['processed_hash_conflicts']
             and all(not consumer['incomplete_count'] for consumer in final_state['consumers'].values())
             and not final_state['event_log_ids_missing_from_database']
@@ -2165,7 +2180,11 @@ class Harness:
             'generation_topologies_complete': topologies_complete,
             'runtime_diagnostics': getattr(self, 'runtime_diagnostics', []),
             'runtime_diagnostic_error_types': getattr(self, 'runtime_diagnostic_errors', []),
-            'runtime_diagnostics_complete': diagnostics_complete,
+            'runtime_diagnostics_enabled': diagnostics_enabled,
+            'runtime_diagnostics_applicable': diagnostics_enabled,
+            'runtime_diagnostics_status': ('COMPLETE' if diagnostics_complete else 'INCOMPLETE')
+                if diagnostics_enabled else 'NOT_REQUESTED',
+            'runtime_diagnostics_complete': diagnostics_complete if diagnostics_enabled else None,
             'generation_accounting_complete': generation_complete,
             'generation_accounting_error_type': getattr(self, '_generation_accounting_error', None),
             'final_reconciliation_complete': reconciliation_complete,
@@ -2206,6 +2225,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-id', required=True)
     p.add_argument('--tier', choices=['smoke', 'full'], default='smoke')
+    p.add_argument('--runtime-diagnostics', action='store_true',
+                   help='Opt in to timed CPU/SQL/PostgreSQL/container diagnostics; disabled by default')
     p.add_argument('--events', type=int, default=200)
     p.add_argument('--rate', type=float, default=10)
     p.add_argument('--duration', type=float, default=20)
@@ -2253,7 +2274,8 @@ def main():
     harness = None
     error = None
     try:
-        freeze_generation_execution_profile(args.evidence_dir, args.run_id)
+        freeze_generation_execution_profile(args.evidence_dir, args.run_id,
+            runtime_diagnostics=args.runtime_diagnostics)
         load_environment(args.generated_dir / 'client.env')
         for key in list(os.environ):
             if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':

@@ -17,6 +17,17 @@ CONTAINER_ID = 'a' * 64
 PID = 4321
 CGROUP_ROOT = '/test-cgroup'
 CGROUP_PATH = CGROUP_ROOT + '/system.slice/docker-' + CONTAINER_ID + '.scope'
+LINUX_617_CPU_COUNTERS = {
+    'usage_usec': 1000000, 'user_usec': 700000, 'system_usec': 300000,
+    'nice_usec': 12500, 'core_sched.force_idle_usec': 20000,
+    'nr_periods': 25, 'nr_throttled': 3, 'throttled_usec': 50000,
+    'nr_bursts': 1, 'burst_usec': 2000,
+    'future.dotted_numeric': 18446744073709551615,
+}
+
+
+def linux_617_cpu_stat():
+    return ''.join(key + ' ' + str(value) + '\n' for key, value in LINUX_617_CPU_COUNTERS.items())
 
 
 def proc_stat(*, pid=PID, start=123456, user=250, system=125, rss=7):
@@ -88,6 +99,49 @@ class ContainerDiagnosticsTests(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     parse_flat_counters(text)
+
+    def test_linux_617_cpu_stat_retains_core_scheduler_and_future_dotted_counters(self):
+        # Linux v6.17 kernel/cgroup/rstat.c emits core_sched.force_idle_usec
+        # when CONFIG_SCHED_CORE is compiled in; the counter may also be zero.
+        self.assertEqual(parse_flat_counters(linux_617_cpu_stat()), LINUX_617_CPU_COUNTERS)
+        self.assertEqual(parse_flat_counters('core_sched.force_idle_usec 0\n'),
+                         {'core_sched.force_idle_usec': 0})
+
+    def test_dotted_flat_counters_keep_duplicate_grammar_and_uint64_checks_strict(self):
+        invalid = [
+            'core_sched.force_idle_usec 1\ncore_sched.force_idle_usec 2\n',
+            '.core_sched.force_idle_usec 1\n',
+            'core_sched.force_idle_usec. 1\n',
+            'core_sched..force_idle_usec 1\n',
+            'core_sched.1invalid_segment 1\n',
+            'core_sched/force_idle_usec 1\n',
+            'core_sched.force-idle_usec 1\n',
+            'core_sched.force_idle_usec -1\n',
+            'core_sched.force_idle_usec 1.5\n',
+            'core_sched.force_idle_usec 1e3\n',
+            'core_sched.force_idle_usec 18446744073709551616\n',
+            'core_sched.force_idle_usec 1 extra\n',
+        ]
+        for text in invalid:
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    parse_flat_counters(text)
+
+    def test_snapshot_uses_usage_cpu_without_adding_core_force_idle_or_main_pid_cpu(self):
+        fixture = LinuxFixture()
+        fixture.files[CGROUP_PATH + '/cpu.stat'] = linux_617_cpu_stat()
+        row = fixture.discover().snapshot()['containers'][SERVICE]
+        self.assertEqual(row['cgroup_v2']['files']['cpu_stat'], {
+            'status': 'available', 'value': LINUX_617_CPU_COUNTERS})
+        self.assertEqual(row['cpu_total_seconds'], 1.0)
+        self.assertEqual(row['process_cpu_total_seconds'], 3.75)
+        self.assertNotEqual(row['cpu_total_seconds'], row['process_cpu_total_seconds'])
+        self.assertEqual(row['cpu_throttled_seconds'], .05)
+        self.assertEqual(row['cpu_throttled_periods'], 3)
+        self.assertEqual(row['cpu_periods'], 25)
+        self.assertEqual(row['cgroup_v2']['files']['cpu_stat']['value']['future.dotted_numeric'],
+                         18446744073709551615)
+        json.dumps(row, allow_nan=False)
 
     def test_io_stat_preserves_devices_and_actual_counters(self):
         self.assertEqual(parse_io_stat('8:0 rbytes=4096 wbytes=8192 rios=1 wios=2\n8:16 rbytes=0 wbytes=10\n'),

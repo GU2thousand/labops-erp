@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from django.test import SimpleTestCase
 
-from benchmarks.events.acceptance import Harness, write_json as persist_fixture_json
+from benchmarks.events.acceptance import Harness, main, write_json as persist_fixture_json
 from benchmarks.events.container_diagnostics import DEFAULT_SERVICES
 from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
 
@@ -118,6 +118,79 @@ class HarnessRuntimeDiagnosticsTests(SimpleTestCase):
         h._event_lock = threading.RLock()
         h.business_lanes = [{'batch': None, 'cycle_issue': None} for _ in range(4)]
         return h
+
+    def test_default_configuration_does_not_discover_or_wrap_business_commands(self):
+        h = self.harness()
+        h.compose, h.command = Mock(), Mock()
+        h.env = {'LABOPS_VALIDATION_PROJECT': 'owned-test-project'}
+        with patch('benchmarks.events.container_diagnostics.ContainerResources.from_compose') as discover:
+            h.configure_runtime_diagnostics()
+        discover.assert_not_called()
+        self.assertFalse(h.runtime_diagnostics_enabled)
+        self.assertIsNone(h.runtime_resource_factory)
+        profile = json.loads((h.evidence / 'runtime-resource-profile.json').read_text())
+        self.assertEqual(profile['status'], 'NOT_REQUESTED')
+        self.assertFalse(profile['applicable'])
+        self.assertIsNone(profile['collection_complete'])
+        h._execute_inventory_command_body = Mock(return_value={'event_id': 'original'})
+        with patch('benchmarks.events.runtime_diagnostics.CommandDiagnostics') as observer:
+            result = h._execute_inventory_command(0, 'steady', 'batch-1', {}, {},
+                                                   lane=0, scheduled_at=123.5)
+        observer.assert_not_called()
+        self.assertEqual(result, {'event_id': 'original'})
+        h._execute_inventory_command_body.assert_called_once()
+        h._generate_concurrent = Mock(return_value=(['original'], {'elapsed_seconds': 6}))
+        with patch('benchmarks.events.runtime_diagnostics.RuntimeDiagnostics') as sampler:
+            self.assertEqual(h.generate(32, 'steady'), (['original'], {'elapsed_seconds': 6}))
+        sampler.assert_not_called()
+
+    def test_enabled_configuration_defers_fresh_discovery_until_measured_batch(self):
+        h = self.harness()
+        h.args.runtime_diagnostics = True
+        h.compose, h.command = Mock(), Mock()
+        h.env = {'LABOPS_VALIDATION_PROJECT': 'owned-test-project'}
+        with patch('benchmarks.events.container_diagnostics.ContainerResources.from_compose') as discover:
+            h.configure_runtime_diagnostics()
+            discover.assert_not_called()
+            resources = h.runtime_resource_factory()
+        self.assertIs(resources, discover.return_value)
+        discover.assert_called_once_with(h.compose, command_callback=h.command,
+            expected_project='owned-test-project')
+        profile = json.loads((h.evidence / 'runtime-resource-profile.json').read_text())
+        self.assertEqual(profile['status'], 'REQUESTED_NOT_STARTED')
+        self.assertTrue(profile['enabled'] and profile['applicable'])
+        self.assertIsNone(profile['collection_complete'])
+
+    def test_cli_freezes_opt_in_before_environment_setup_for_both_tiers(self):
+        for tier, enabled in (('smoke', False), ('smoke', True), ('full', False), ('full', True)):
+            with self.subTest(tier=tier, enabled=enabled):
+                h = self.harness()
+                directory = h.evidence / 'cli'
+                argv = ['acceptance.py', '--run-id', 'diagnostic-policy', '--tier', tier,
+                        '--evidence-dir', str(directory)]
+                if tier == 'full':
+                    argv += ['--events', '90000', '--rate', '50', '--duration', '1800',
+                             '--fault-repetitions', '20', '--fault-events', '30000',
+                             '--broker-fault-seconds', '300', '--outage-seconds', '600',
+                             '--consumer-outage-seconds', '600', '--drain-timeout', '900']
+                if enabled:
+                    argv.append('--runtime-diagnostics')
+                original = OSError('environment setup boundary')
+                def unavailable_environment(_path):
+                    requested = json.loads((directory / 'requested-profile.json').read_text())
+                    execution = json.loads((directory / 'generation-execution-profile.json').read_text())
+                    self.assertIs(requested['requested_numeric_profile']['runtime_diagnostics_enabled'], enabled)
+                    policy = execution['runtime_diagnostics']
+                    self.assertIs(policy['enabled'], enabled)
+                    self.assertIs(policy['applicable'], enabled)
+                    self.assertEqual(policy['request_status'], 'REQUESTED' if enabled else 'NOT_REQUESTED')
+                    raise original
+                with patch('sys.argv', argv), patch('benchmarks.events.acceptance.load_environment',
+                        side_effect=unavailable_environment), self.assertRaises(OSError) as raised:
+                    main()
+                self.assertIs(raised.exception, original)
+                failure = json.loads((directory / 'startup-failure.json').read_text())
+                self.assertIs(failure['requested_numeric_profile']['runtime_diagnostics_enabled'], enabled)
 
     def generation_body(self, h, clock, probe, *, error=None, scenario='steady'):
         ids = [str(uuid4()) for _ in range(32)]
@@ -642,3 +715,20 @@ class HarnessRuntimeDiagnosticsTests(SimpleTestCase):
         retained = json.loads((h.evidence / 'report.json').read_text())
         self.assertFalse(retained['passed'])
         self.assertEqual(retained['runtime_diagnostic_error_types'], ['OSError'])
+
+        # Unrequested collection has no successful-completeness claim and does
+        # not replace the existing business/journal/reconciliation gates.
+        h.runtime_diagnostics_enabled = False
+        h.runtime_diagnostics, h.runtime_diagnostic_errors = [], []
+        with patch('builtins.print'):
+            disabled = h.finish()
+        self.assertTrue(disabled['passed'])
+        self.assertFalse(disabled['runtime_diagnostics_enabled'])
+        self.assertFalse(disabled['runtime_diagnostics_applicable'])
+        self.assertEqual(disabled['runtime_diagnostics_status'], 'NOT_REQUESTED')
+        self.assertIsNone(disabled['runtime_diagnostics_complete'])
+        self.assertEqual(disabled['runtime_diagnostics'], [])
+        h.final_inventory_evidence.return_value['reconciliation']['mismatches'] = ['original business mismatch']
+        with patch('builtins.print'):
+            broken_business = h.finish()
+        self.assertFalse(broken_business['passed'])

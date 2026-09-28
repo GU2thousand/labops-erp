@@ -43,7 +43,8 @@ class GenerationJournalTests(SimpleTestCase):
         self.assertEqual(frozen['requested_numeric_profile'], numeric_profile(requested_args()))
         self.assertEqual(frozen['requested_numeric_profile']['events'], 90000)
         self.assertEqual(frozen['requested_numeric_profile']['drain_timeout'], 900.0)
-        self.assertEqual(len(frozen['requested_numeric_profile']), 11)
+        self.assertEqual(len(frozen['requested_numeric_profile']), 12)
+        self.assertIs(frozen['requested_numeric_profile']['runtime_diagnostics_enabled'], False)
         self.assertNotIn('secret', frozen['requested_numeric_profile'])
         self.assertNotIn('private-password', journal.journal_path.read_text())
         self.assertEqual(journal.summary()['totals']['requested'], 0)
@@ -56,6 +57,15 @@ class GenerationJournalTests(SimpleTestCase):
         report = journal.summary()
         report['requested_numeric_profile']['events'] = 1
         self.assertEqual(journal.summary()['requested_numeric_profile']['events'], 90000)
+
+    def test_diagnostics_opt_in_survives_profile_copy_without_string_coercion(self):
+        for enabled in (False, True):
+            profile = numeric_profile(requested_args(runtime_diagnostics=enabled))
+            self.assertIs(profile['runtime_diagnostics_enabled'], enabled)
+            self.assertEqual(numeric_profile(profile), profile)
+        for invalid in ('false', 'true', 0, 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                numeric_profile(requested_args(runtime_diagnostics=invalid))
 
     def test_failure_before_commit_preserves_requested_and_unattempted_counts(self):
         journal = self.journal()

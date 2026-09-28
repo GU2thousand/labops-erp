@@ -51,9 +51,15 @@ def numeric_profile(args) -> dict:
     private configuration in future harness versions. No full-tier default or
     observed count is substituted for a requested value.
     """
-    return {name: _number(args[name] if isinstance(args, Mapping) else getattr(args, name),
+    profile = {name: _number(args[name] if isinstance(args, Mapping) else getattr(args, name),
                           count=name in COUNT_FIELDS)
             for name in PROFILE_FIELDS}
+    enabled = (args.get('runtime_diagnostics_enabled', args.get('runtime_diagnostics', False))
+               if isinstance(args, Mapping) else getattr(args, 'runtime_diagnostics', False))
+    if not isinstance(enabled, bool):
+        raise ValueError('Runtime diagnostics request must be a boolean')
+    profile['runtime_diagnostics_enabled'] = enabled
+    return profile
 
 
 def _identifier(value, purpose):

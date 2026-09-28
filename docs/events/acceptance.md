@@ -39,6 +39,28 @@ duration and one crash repetition); manual full inputs request 90,000 events,
 requesting full inputs does not prove every broker/consumer outage lasted the
 plan's five/ten minutes or every acceptance scenario was executed.
 
+Runtime diagnostics are an explicit opt-in with `--runtime-diagnostics`.
+The default CLI and automatic 60-event smoke leave diagnostics disabled. The
+manual workflow's `runtime_diagnostics` boolean also defaults to `false`; the
+planned 512-event diagnostic, 3,000-event probe and full runs explicitly set it
+to `true` or pass the CLI flag. The requested profile freezes that choice before
+environment/setup. Disabling diagnostics changes instrumentation scope; it does
+not change the four lanes, queue capacity four, global target rate, 5% generation
+window or any business/fault denominator. No four-process execution mode is
+introduced by this checkpoint.
+
+When disabled, the report records `runtime_diagnostics_enabled=false`,
+`runtime_diagnostics_applicable=false`, `runtime_diagnostics_status=NOT_REQUESTED`
+and `runtime_diagnostics_complete=null`. This is no claim of collected or complete
+measurements; an empty diagnostic list cannot become successful numeric coverage.
+When requested, the frozen execution profile records
+`runtime_diagnostics.enabled`, `.applicable` and `.request_status`; its request
+status is `REQUESTED` or `NOT_REQUESTED`. The initial
+`runtime-resource-profile.json` uses `REQUESTED_NOT_STARTED` when enabled;
+overall diagnostic qualification uses `COMPLETE` or `INCOMPLETE` with retained
+summaries and errors. Each batch's `collection_complete` remains separate: a
+qualified fault batch may still have incomplete numeric resource coverage.
+
 Full mode requires `--drain-timeout 900` exactly; a larger timeout does not qualify
 the frozen recovery target. It also requires the requested duplicate-event count
 to be no greater than the steady-event count. Reject an impossible full duplicate
@@ -179,6 +201,30 @@ These results establish correctness and latency at the measured workload;
 they do not meet the requested rate. CPU/GIL, SQL waits and host contention were
 not measured by that run, so no specific saturation cause is asserted.
 
+The hosted 512-event diagnostic [Actions run 36380529863](https://github.com/GU2thousand/labops-erp/actions/runs/36380529863),
+at commit `63f10f50ee544d68f37c1811634784cc4d79f230`, completed all 512 commands
+in **24.396559664s**, an actual **20.986565608/s** against the unchanged 50/s
+target, with **14.156559664s** of lateness. The rate gate **failed**. All 512
+outboxes published; both consumers completed 512 IDs, with exactly 1,024 dedupe
+markers and 1,536 notifications and zero reconciliation mismatches. The retained
+failing `report.json` SHA-256 is
+`a131b79e61a1dc612778f78234317ca1ac06e81b3727e689504951d03c04925a`.
+Container CPU collection was incomplete: all six roles reported `cpu_stat`
+`ValueError` in each of 24 samples, giving **144 failed role/sample observations**.
+The historical artifact did not retain raw `cpu.stat` text, so the exact failing
+input cannot be reconstructed. It does not establish CPU/GIL or database
+saturation, complete resource coverage, or full capacity acceptance.
+
+The earlier automatic 60-event run [Actions run 36380519394](https://github.com/GU2thousand/labops-erp/actions/runs/36380519394),
+at commit `b9f574e91c55a2ed5c7ca7f61d56c40042fbceb8`, used diagnostics before the
+new opt-in default. Its inclusive **7.133691250s** generation clock included
+**1.171047299s** of resource discovery, producing **8.410792940/s** against 10/s
+and a failing rate gate. All 60 event/effect IDs reconciled, but diagnostic CPU
+coverage was incomplete. Retained `report.json` SHA-256 is
+`355777361ce898ab35f3afa84edb62848bfc95b71712bf63ef0412a7f7bbe0fa`.
+The new default does not remove discovery time from that historical result or
+relabel either failed run as a pass.
+
 The four-lane profile has no claimed hosted/full 50/s pass in this document.
 A local SQL profile of 200 application-service commands is implementation
 profiling, not an RF3 workload or hosted/production acceptance result. Full RF3,
@@ -187,14 +233,16 @@ evidence at their frozen denominators and clock boundaries.
 
 ### Measurement-only capacity diagnosis
 
-The next bounded diagnostic keeps the four lanes, queue capacity four, legal
+An explicitly enabled bounded diagnostic keeps the four lanes, queue capacity four, legal
 business services/locks, global 50/s target and 5% completion-window gate. A
 512-event request is a diagnostic input, not the 90,000-event acceptance target.
 It may fail the rate gate and still retain useful raw measurements. A diagnostic
 does not qualify a slower input rate as 50/s or establish long-run capacity.
 
-The frozen execution profile declares the one-second resource observer and its
-sample/request bounds before setup. `runtime-resource-profile.json` records
+When diagnostics are enabled, the frozen execution profile declares the
+one-second resource observer and its sample/request bounds before setup. The
+initial `runtime-resource-profile.json` records the requested/not-started scope;
+each enabled batch's `runtime-resource-profile-NNN.json` records
 actual isolated-container identities and effective CPU/memory limits without
 environment variables. Each concurrent batch retains
 `runtime-diagnostics-NNN.json`: process user/system CPU versus wall time, safe
@@ -212,7 +260,8 @@ decoding and Python scheduling; it is not pure PostgreSQL server execution time
 or a direct GIL-wait measurement. Per-command process CPU includes all concurrent
 threads and must not be summed as independent lane CPU.
 
-Observer startup, joined owning-thread connection cleanup, required raw artifact
+All enabled fresh Docker/process discovery, observer startup/sampling, joined
+owning-thread connection and sampler cleanup, required raw artifact
 persistence and summary calculation consume the generation clock along with the business work. The
 final topology metadata rewrite reports the already measured completion boundary.
 Record
@@ -221,13 +270,25 @@ observer uses its own bounded database connection and performs read-only
 statistics queries. Before each capacity batch, resource discovery freezes the
 current isolated process identities, including explicitly inspected stopped
 roles during broker fault batches. Steady diagnostic collection requires its
-applicable CPU/database/resource observations; an incomplete steady sample
+finite numeric CPU/database/resource observations and `collection_complete=true`;
+an incomplete steady sample
 cannot support a passing measurement. Fault batches preserve optional missing
 resource observations and coverage limits without invalidating otherwise valid
-business/fault results. Observer startup, cleanup or persistence failure fails
-every scenario's topology and final report. Business failures retain their original exception and
+business/fault results. Every enabled batch still requires
+`lifecycle_complete=true`; missing fault resource coverage cannot excuse failed
+observer startup, owning cleanup, joins or persistence. Such a failure fails
+the affected scenario's topology and final report. Business failures retain their original exception and
 durable partial journal even if diagnostic collection also fails. Preserve the
 original failed probes unchanged when running a new diagnostic revision.
+
+The counter parser now accepts valid dotted numeric keys, including
+`core_sched.force_idle_usec` emitted by the official
+[Linux v6.17 cgroup implementation](https://github.com/torvalds/linux/blob/v6.17/kernel/cgroup/rstat.c#L700-L740),
+while retaining strict two-token, duplicate-key and unsigned-integer checks.
+That correction establishes parser compatibility with the declared grammar;
+it does not recover the omitted historical input or prove online CPU coverage.
+A new explicitly enabled hosted diagnostic must establish actual numeric
+coverage. Diagnosis remains separate from the full 90,000-event capacity gate.
 
 ## Required scenarios and frozen targets
 
@@ -303,6 +364,10 @@ evidence/<run-id>/
   business-lane-topology.json # actual independent aggregates and shared context
   generation-topology-*.json # per-batch actual lane counts, journal batches/results
   generation-schedule-*.jsonl # incremental scheduler/worker observations
+  runtime-resource-profile.json # requested/not-started or not-requested scope
+  runtime-resource-profile-*.json # enabled batch's fresh scoped discovery
+  runtime-diagnostics-*.json # enabled raw samples, unknowns and lifecycle/coverage
+  command-diagnostics.jsonl # enabled command timings/physical commit observations
   generation-journal.jsonl # incrementally flushed attempts/commit/ID transitions
   generation-summary.json # requested/attempted/committed/failure/pending totals
   startup-failure.json     # conditional env/setup failure and unobserved DB state
@@ -345,6 +410,9 @@ The execution profile is likewise frozen before environment/setup. Actual lane
 and per-batch topology evidence must match that profile; generation completion
 and the final report include all topology pass/failure outcomes. The package
 retains a failed or partial schedule, not just successful event-log entries.
+The requested profile includes the `runtime_diagnostics_enabled` boolean. A
+disabled run retains `NOT_REQUESTED`/not-applicable status and does not fabricate
+raw diagnostic artifacts or complete numeric collection.
 
 For each generation batch, record requested and attempted counts before the
 outer business transaction; record committed movement identity immediately after

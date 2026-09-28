@@ -63,7 +63,9 @@ def parse_flat_counters(text):
     result = {}
     for line in text.splitlines():
         fields = line.split()
-        _check(len(fields) == 2 and re.fullmatch(r'[a-z][a-z0-9_]*', fields[0]) is not None,
+        # Linux v6.17 also emits core_sched.force_idle_usec. Preserve future
+        # numeric fields without treating dotted namespaces as malformed data.
+        _check(len(fields) == 2 and re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*', fields[0]) is not None,
                'Malformed kernel counter')
         _check(fields[0] not in result, 'Duplicate kernel counter')
         result[fields[0]] = _unsigned(fields[1])

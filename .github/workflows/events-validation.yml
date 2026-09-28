@@ -26,6 +26,10 @@ on:
         description: 'Repetitions per crash boundary (staging target: 20)'
         type: number
         default: 20
+      runtime_diagnostics:
+        description: 'Opt in to timed CPU/SQL/PostgreSQL/container measurements (diagnostic and capacity probes)'
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -41,6 +45,7 @@ jobs:
       EVENTS_DURATION: ${{ github.event.inputs.duration || '0' }}
       FAULT_REPETITIONS: ${{ github.event.inputs.fault_repetitions || '1' }}
       EVENTS_TIER: ${{ github.event.inputs.tier || 'smoke' }}
+      RUNTIME_DIAGNOSTICS: ${{ github.event.inputs.runtime_diagnostics || 'false' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -86,7 +91,13 @@ jobs:
             CONSUMER_SECONDS=5
             FAULT_EVENTS=20
           fi
-          python benchmarks/events/acceptance.py --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
+          DIAGNOSTIC_ARGS=()
+          case "$RUNTIME_DIAGNOSTICS" in
+            true) DIAGNOSTIC_ARGS+=(--runtime-diagnostics) ;;
+            false) ;;
+            *) echo 'Invalid runtime diagnostics boolean'; exit 2 ;;
+          esac
+          python benchmarks/events/acceptance.py --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
       - name: Verify actual offsets topic replication and topic configuration
         if: always()
         run: |
