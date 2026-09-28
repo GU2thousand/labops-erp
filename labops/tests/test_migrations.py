@@ -8,7 +8,7 @@ class UpgradeMigrationTests(TransactionTestCase):
     def test_existing_ledger_and_local_outbox_survive_upgrade(self):
         executor=MigrationExecutor(connection)
         before=[('labops','0003_laborder_sample_sampleevent_testcatalog_and_more')]
-        latest=[('labops','0004_reliable_events')]
+        latest=executor.loader.graph.leaf_nodes('labops')
         try:
             executor.migrate(before)
             apps=executor.loader.project_state(before).apps

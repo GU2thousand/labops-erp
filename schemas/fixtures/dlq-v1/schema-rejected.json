@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "delivery_id": "50000000-0000-4000-8000-000000000001",
+  "consumer_name": "analytics",
+  "source_cluster": "staging-redpanda",
+  "source_generation": "2026-09-27T12:00:00Z",
+  "failure_class": "permanent",
+  "original_hash": "fa675b8e6537158e92cf7f8c582d1e32b84a0197f781a95e3b37c67851a5bd80",
+  "event": {
+    "event_id": "invalid-uuid",
+    "schema_version": 999,
+    "payload": {
+      "lines": []
+    }
+  },
+  "attempts": 1,
+  "error": "Unsupported inventory schema_version",
+  "failed_at": "2026-09-27T12:00:00Z",
+  "delivery_key": "staging-redpanda:2026-09-27:labops.inventory.v1:0:12"
+}

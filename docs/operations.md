@@ -1,6 +1,6 @@
 # LabOps operations
 
-This Compose stack is a local development and repeatable validation environment. PostgreSQL is the system of record. The default stack runs PostgreSQL, a one-shot migration service, a two-worker Gunicorn web service, and the operations worker. Named volumes preserve data across container replacement. Host ports bind to loopback only.
+This Compose stack is a local development and repeatable validation environment. PostgreSQL is the system of record. The default stack runs PostgreSQL, a one-shot migration service, a two-worker Gunicorn web service, and the operations worker. Named volumes preserve data across container replacement. Host ports bind to loopback only. The [inventory event guide](events/README.md) contains current contract/security/restore boundaries and [acceptance status](events/acceptance.md); same-host validation is distinct from production deployment.
 
 ## Start the baseline
 
@@ -27,12 +27,12 @@ The seed creates fictional records and known development credentials (`admin@lab
 
 ## Existing database upgrade and projection cutover
 
-Take and test a backup first. Stop application writers and event consumers during the cutover. Run migrations and rebuild the analytics projection from the authoritative posted ledger before restarting normal work:
+Take and test a backup first. Follow [cutover](events/cutover.md): freeze inventory writers, wait for in-flight transactions, then drain old local and Kafka routes while their services still work. Record unresolved RETRY/DEAD owners and the final backup/offset/business watermark. After that drain, stop inventory writers and event workers before the explicit projection rebuild. The operations worker serves imports/alerts as well; quiesce inventory-producing tasks and resume unrelated work under the maintenance policy.
 
 ```sh
-docker compose stop web worker publisher notification-consumer analytics-consumer
+docker compose --profile events stop web worker publisher notification-consumer analytics-consumer retry-worker dlq-publisher
 docker compose run --rm migrate
-docker compose run --rm --no-deps web python manage.py rebuild_inventory_projection
+docker compose run --rm --no-deps web python manage.py rebuild_inventory_projection --actor 'oncall@example.invalid' --reason 'Frozen ledger cutover checkpoint' --authorization 'CUTOVER-123'
 docker compose run --rm --no-deps web python manage.py reconcile_stock
 docker compose up -d
 ```
@@ -41,16 +41,21 @@ If event profiles are enabled, include the same profile flags used for normal st
 
 ## Kafka / Redpanda events
 
-In `.env`, set `LABOPS_EVENT_TRANSPORT=kafka`, then enable the full profile:
+First follow the [fresh-cluster development boundary](../infra/events/dev/README.md).
+The pinned 26.2.2 broker uses a new volume; it must not mount retained 25.1 data.
+Preserve old history and drain/map its routes before acknowledging a new empty
+development cluster. In `.env`, explicitly set `LABOPS_EVENT_TRANSPORT=kafka` and
+`LABOPS_EVENTS_FRESH_CLUSTER_ACK=accept-new-empty-development-cluster` only for
+that reviewed fresh-cluster boundary, then enable the full profile:
 
 ```sh
 docker compose --profile events up -d --build
-docker compose --profile events logs --tail=100 topics publisher notification-consumer analytics-consumer
+docker compose --profile events logs --tail=100 topics publisher notification-consumer analytics-consumer retry-worker dlq-publisher
 docker compose exec redpanda rpk group describe labops.notification.v1 --brokers redpanda:9092
 docker compose exec redpanda rpk group describe labops.analytics.v1 --brokers redpanda:9092
 ```
 
-The profile creates inventory and DLQ topics with three partitions and starts independent notification and analytics consumer groups. The normal operations worker stays active for imports, alerts, and locally routed events. Each event retains the transport selected at creation; changing the setting does not move existing rows to another transport. Keep the publisher and consumers running until existing Kafka work drains before disabling the profile. Leave the transport `local` when the profile is not running, or events will accumulate in the outbox.
+The profile creates and verifies inventory and DLQ topics with three partitions, explicit delete/retention policies and development RF1. Existing config mismatches fail rather than being skipped. It starts independent notification/analytics groups plus separate retry and DLQ workers. The normal operations worker stays active for imports, alerts, and locally routed events. Each event retains the transport selected at creation; changing the setting does not move existing rows to another transport. Keep the corresponding publisher, consumers and recovery workers running until retained Kafka work drains before disabling the profile. Leave the transport `local` when the profile is not running, or events will accumulate in the outbox. [RF3 validation](../infra/events/validation/README.md) and [production deployment reference](../infra/events/production/README.md) are separate paths.
 
 Internal clients use `redpanda:9092`; host clients use `127.0.0.1:19093`. The single broker uses replication factor one and is appropriate for local tests, not replicated production durability. Publisher retries and consumer deduplication provide at-least-once delivery. A broker acknowledgement followed by process failure can produce duplicate events; the database uniqueness key `(consumer_name, event_id)` prevents duplicate database effects for each consumer.
 
@@ -58,16 +63,16 @@ Internal clients use `redpanda:9092`; host clients use `127.0.0.1:19093`. The si
 
 ```sh
 docker compose exec web python manage.py outbox_events inspect
-docker compose exec web python manage.py outbox_events retry --id EVENT_UUID --reason 'Broker restored after outage'
+docker compose exec web python manage.py outbox_events retry --id EVENT_UUID --reason 'Broker restored after outage' --actor 'oncall@example.invalid' --authorization 'INCIDENT-123'
 docker compose exec web python manage.py event_failures inspect
-docker compose exec web python manage.py event_failures retry --id DELIVERY_UUID --reason 'Underlying data or consumer issue corrected'
-docker compose exec web python manage.py event_failures resolve --id DELIVERY_UUID --reason 'Documented operator disposition'
+docker compose exec web python manage.py event_failures retry --id DELIVERY_UUID --reason 'Consumer dependency restored; original envelope retained' --actor 'oncall@example.invalid' --authorization 'INCIDENT-123'
+docker compose exec web python manage.py event_failures resolve --id DELIVERY_UUID --reason 'Documented operator disposition' --actor 'oncall@example.invalid' --authorization 'INCIDENT-123'
 docker compose exec redpanda rpk topic consume labops.inventory.dlq.v1 --brokers redpanda:9092 --num 1
 ```
 
 Publisher events that exhaust retries enter DEAD and remain durable. Use `outbox_events retry` after correcting the fault; it records an audit reason. An administrator can also retry through `POST /api/v1/events/{id}/retry`. These are publisher outbox rows, separate from consumer failed deliveries.
 
-For consumer failures, `retry` preserves the original event identity and schedules the durable failed delivery for the publisher retry loop. `resolve` records an operator decision and does not apply the event. Keep the reason meaningful. Do not create new event IDs to force replay: that bypasses deduplication. A DEAD delivery is copied to the DLQ topic for inspection; the database failed-delivery record is the operator recovery record.
+For consumer failures, `retry` preserves the original event identity and schedules the durable failed delivery for the independent `retry_events` worker. Stop relevant retry/DLQ workers and wait for live leases before manual disposition. `resolve` records an operator decision and does not apply the event. Recovery writes retain append-only actor/reason/authorization and before/after audit evidence. Do not change original content or create new IDs to force replay. The separate `publish_dlq` worker mirrors DEAD records with stable delivery IDs; PostgreSQL remains the recovery truth. See [bounded dry-run/replay commands](events/operator-commands.md).
 
 ## Optional Redis
 
@@ -89,7 +94,9 @@ docker compose --profile events --profile redis --profile observability up -d --
 
 Grafana automatically provisions Prometheus and Jaeger data sources and the **LabOps Operations** dashboard. It displays request and database latency, request errors, idempotency replays, outbox delay, consumer failures, reconciliation, cache results, rate-limit rejections, and Kafka consumer lag. Traces flow from each application process through the OTel collector into Jaeger; Prometheus does not store traces. Local Jaeger trace storage is in memory and resets on container replacement. Prometheus retains metrics for 15 days on its volume. Rules evaluate availability, ledger mismatch, outbox delay, failed delivery and sustained Kafka lag above 100 messages; configure an Alertmanager separately if external notifications are desired.
 
-Prometheus sends the shared `METRICS_TOKEN` as a bearer token to `/metrics`. Avoid putting that token into browser query strings. Gunicorn workers share Prometheus counters through per-container multiprocess files, cleared once when the master starts. Scrapes combine those counters with database-derived gauges. The `/metrics` reconciliation gauge scans the ledger, so account for its cost when profiling large datasets. Process-local counters from standalone workers are not aggregated into the web endpoint; durable backlog/failure gauges do cover their database state. Redpanda `/public_metrics` and the Kafka exporter are scraped when the events profile is running; their targets are intentionally down otherwise. The events profile includes pinned `danielqsj/kafka-exporter:v1.9.0`, a 128 MiB-limited internal service on port 9308. It reads committed offsets and partition high watermarks through the broker protocol for `labops.*` consumer groups, including disconnected groups. No exporter port is exposed on the host. See the [exporter documentation](https://github.com/danielqsj/kafka_exporter/tree/v1.9.0) for metric semantics.
+Prometheus sends the shared `METRICS_TOKEN` as a bearer token to `/metrics`. Avoid putting that token into browser query strings. Gunicorn workers share Prometheus counters through per-container multiprocess files, cleared once when the master starts. Scrapes combine those counters with database-derived gauges. The web `/metrics` reconciliation gauge scans the ledger, so account for its cost when profiling large datasets. Event workers now have separate authenticated private `/metrics` endpoints on each container's port 9100; these collect role heartbeat, effect/publish latency, lease/schema failures, commit/rebalance outcomes and durable counts without a ledger reconciliation scan. They are not aggregated into the web endpoint. The **LabOps inventory events** dashboard distinguishes worker scrape age, broker lag, parked RETRY and DEAD business work. Real alert triggering/recovery and telemetry cost still require current execution evidence.
+
+Redpanda `/public_metrics` and the Kafka exporter are scraped when the events profile is running; their targets are intentionally down otherwise. The events profile includes pinned `danielqsj/kafka-exporter:v1.9.0`, a 128 MiB-limited internal service on port 9308. It reads committed offsets and partition high watermarks through the broker protocol for `labops.*` consumer groups, including disconnected groups. No exporter port is exposed on the host. See the [exporter documentation](https://github.com/danielqsj/kafka_exporter/tree/v1.9.0) for metric semantics. Production must use the restricted exporter identity and explicit expected-target alerts so a disabled profile cannot conceal an unavailable required broker.
 
 The dashboard sums `kafka_consumergroup_lag` by consumer group and topic and shows group members, scrape health, broker discovery and lag sample age. Sample age measures scrape freshness, not event processing latency. New groups appear only after committing offsets; missing samples do not mean zero lag. Use the exporter health panel to distinguish a scrape failure from a drained queue, and `rpk group describe` to cross-check individual partitions. The high-lag alert intentionally does not fire when the optional event profile is disabled. Kafka lag measures unconsumed broker records; events parked in durable retries or DLQ are tracked separately by `consumer_failures`, so zero Kafka lag alone does not establish successful business processing.
 
@@ -113,7 +120,7 @@ docker compose run --rm --no-deps -e POSTGRES_DB=labops_restore web python manag
 docker compose run --rm --no-deps -e POSTGRES_DB=labops_restore web python manage.py reconcile_stock
 ```
 
-Inspect restored application records before accepting the backup. Schedule backups and define retention and recovery objectives for the deployment. For a real recovery, stop all writers and consumers, restore into a fresh database, verify it, update `POSTGRES_DB` consistently, then recreate the application services. When restoring an older database snapshot while Kafka retains newer offsets, explicitly plan consumer offset rewind and event replay; a database restore alone is not a complete event-system recovery. Keep database and event retention long enough for that procedure. Never use `docker compose down -v` unless intentionally deleting all local database and broker data.
+Inspect restored application records before accepting the backup. Schedule backups and define retention and recovery objectives for the deployment. For a real recovery, follow the [restore watermark procedure](events/restore.md): prefer PostgreSQL PITR to a documented legal business state, restore original outbox/dedupe/failed/audits/users/master relations, rebuild analytics from the legal posted ledger and checkpoint retained event IDs/checksums. Kafka deltas cannot reconstruct business truth missing after an older snapshot; record actual RPO loss and quarantine unmatched post-watermark records. Do not blindly rewind/reset live groups or apply retained deltas to missing ledger rows. Restore into a fresh database, verify it, update database settings consistently and perform the canary cutover. Keep database and event retention long enough for the tested procedure. Never use `docker compose down -v` on retained application data.
 
 ## Validation and fault drills
 

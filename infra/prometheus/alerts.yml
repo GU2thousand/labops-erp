@@ -26,3 +26,62 @@ groups:
         for: 5m
         labels: {severity: warning}
         annotations: {summary: 'LabOps consumer group is more than 100 messages behind'}
+      - alert: EventWorkerUnavailable
+        expr: up{job="labops-events-workers"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: 'A required events worker metrics endpoint is unavailable'}
+      - alert: EventWorkerHeartbeatStale
+        expr: time() - labops_worker_heartbeat_timestamp_seconds > 120
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'An events worker has stopped making progress'}
+      - alert: EventWorkerDatabaseUnavailable
+        expr: labops_worker_database_available == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'Events worker cannot read durable delivery state'}
+      - alert: DurableRetryDelayed
+        expr: max by (consumer) (labops_worker_retry_oldest_seconds) > 900
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'An unresolved durable retry is older than fifteen minutes'}
+      - alert: EventDeadDeliveries
+        expr: max by (consumer, status) (labops_worker_failed_deliveries{status="DEAD"}) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations: {summary: 'Dead deliveries need audited operator resolution even when Kafka lag is zero'}
+      - alert: EventOutboxDead
+        expr: max by (status) (labops_worker_outbox_events{status="DEAD"}) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'A committed business event exhausted publish retries'}
+      - alert: EventOffsetCommitFailure
+        expr: sum by (consumer) (increase(labops_worker_offset_commits_total{outcome="failure"}[5m])) > 0
+        labels: {severity: warning}
+        annotations: {summary: 'A synchronous consumer offset commit failed; replay may occur'}
+      - alert: KafkaExporterUnavailable
+        expr: up{job="kafka-exporter"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: 'Consumer-group lag evidence is unavailable'}
+      - alert: RedpandaMetricsUnavailable
+        expr: up{job="redpanda"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: 'A required broker metrics endpoint is unavailable'}
+      - alert: RedpandaQuorumUnavailable
+        expr: redpanda_cluster_unavailable_partitions > 0 or redpanda_cluster_health_leaderless_partitions > 0 or redpanda_cluster_health_no_elected_controller > 0
+        for: 30s
+        labels: {severity: critical}
+        annotations: {summary: 'Redpanda has partitions without a Raft quorum or an elected controller'}
+      - alert: RedpandaReplicationDegraded
+        expr: redpanda_cluster_health_under_replicated_partitions > 0 or redpanda_cluster_health_nodes_down > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: 'Redpanda replicas or brokers are unavailable'}
+      - alert: RedpandaDiskLow
+        expr: redpanda_storage_disk_free_space_alert > 0 or redpanda_storage_disk_free_bytes / redpanda_storage_disk_total_bytes < 0.15
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: 'Broker disk free space is low; writes may be rejected'}

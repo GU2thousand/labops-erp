@@ -1,0 +1,102 @@
+name: Kafka RF3 acceptance
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: 'Unique inventory events (staging target: 90000)'
+        type: number
+        default: 90000
+      rate:
+        description: 'Target inventory events/sec (staging target: 50)'
+        type: number
+        default: 50
+      duration:
+        description: 'Minimum workload seconds (staging target: 1800)'
+        type: number
+        default: 1800
+      fault_repetitions:
+        description: 'Repetitions per crash boundary (staging target: 20)'
+        type: number
+        default: 20
+  schedule:
+    - cron: '23 6 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: events-rf3-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  same-host-rf3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      EVENTS_COUNT: ${{ github.event.inputs.events || '60' }}
+      EVENTS_RATE: ${{ github.event.inputs.rate || '10' }}
+      EVENTS_DURATION: ${{ github.event.inputs.duration || '0' }}
+      FAULT_REPETITIONS: ${{ github.event.inputs.fault_repetitions || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install fixed clients
+        run: pip install -r requirements.txt
+      - name: Verify events monitoring rules and firing/recovery behavior
+        run: |
+          docker run --rm --entrypoint /bin/promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" prom/prometheus:v3.3.0 check rules /etc/prometheus/alerts.yml
+          docker run --rm --entrypoint /bin/promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" -w /etc/prometheus prom/prometheus:v3.3.0 test rules /etc/prometheus/events-alerts.test.yml
+      - name: Create isolated secrets and configuration
+        run: |
+          RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
+          echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          python infra/events/validation/prepare.py --run-id "$RUN_ID"
+          mkdir -p "infra/events/validation/evidence/$RUN_ID/logs"
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml config --quiet
+      - name: Start three brokers and PostgreSQL
+        run: |
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml up -d
+          python infra/events/validation/wait_ready.py --env-file infra/events/validation/generated/client.env --timeout 180
+      - name: Create and verify identities, ACLs and RF3 topics
+        run: |
+          python infra/events/admin.py users --env-file infra/events/validation/generated/client.env --identities infra/events/validation/generated/secrets.json --report "infra/events/validation/evidence/$EVENTS_RUN_ID/users.json"
+          python infra/events/admin.py topics --env-file infra/events/validation/generated/client.env --report "infra/events/validation/evidence/$EVENTS_RUN_ID/topics-before.json"
+          python infra/events/admin.py acls --env-file infra/events/validation/generated/client.env --identities infra/events/validation/generated/secrets.json --report "infra/events/validation/evidence/$EVENTS_RUN_ID/acls.json"
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics up -d kafka-exporter
+      - name: Real business effects and fault matrix
+        run: |
+          set -a
+          . infra/events/validation/generated/client.env
+          set +a
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            SINGLE_BROKER_SECONDS=300
+            ALL_BROKER_SECONDS=600
+            CONSUMER_SECONDS=600
+            FAULT_EVENTS=30000
+          else
+            SINGLE_BROKER_SECONDS=5
+            ALL_BROKER_SECONDS=5
+            CONSUMER_SECONDS=5
+            FAULT_EVENTS=20
+          fi
+          python benchmarks/events/acceptance.py --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
+      - name: Verify actual offsets topic replication and topic configuration
+        if: always()
+        run: |
+          python infra/events/admin.py topics --env-file infra/events/validation/generated/client.env --verify-only --verify-offsets --report "infra/events/validation/evidence/$EVENTS_RUN_ID/topics-after.json"
+      - name: Collect bounded evidence without secrets
+        if: always()
+        run: |
+          python infra/events/validation/collect.py --env-file infra/events/validation/generated/client.env --run-id "$EVENTS_RUN_ID" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kafka-rf3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: infra/events/validation/evidence/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Remove only this disposable project after evidence upload
+        if: always()
+        run: docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics down --volumes

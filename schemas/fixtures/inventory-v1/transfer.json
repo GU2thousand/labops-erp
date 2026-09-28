@@ -1,0 +1,32 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000004",
+  "event_type": "inventory.transfer.posted",
+  "aggregate_type": "stockmovement",
+  "aggregate_id": "10000000-0000-4000-8000-000000000004",
+  "aggregate_version": 1,
+  "schema_version": 1,
+  "occurred_at": "2026-09-27T12:00:00.000000+00:00",
+  "trace_context": {
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  },
+  "payload": {
+    "movement_id": "10000000-0000-4000-8000-000000000004",
+    "movement_type": "TRANSFER",
+    "title": "Transfer posted",
+    "body": "MOV-4",
+    "recipients": [
+      "20000000-0000-4000-8000-000000000001"
+    ],
+    "lines": [
+      {
+        "batch_id": "30000000-0000-4000-8000-000000000001",
+        "warehouse_id": "40000000-0000-4000-8000-000000000001",
+        "delta_qty": "1.000001",
+        "unit_cost": "0.000003"
+      }
+    ],
+    "_trace_context": {
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    }
+  }
+}

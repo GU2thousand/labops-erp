@@ -93,6 +93,8 @@ def traced_consumer(fn):
     from opentelemetry.propagate import extract
     @wraps(fn)
     def wrapped(consumer,event,*args,**kwargs):
-        with tracer.start_as_current_span('consumer.'+consumer,context=extract(event.get('trace_context',{})),kind=trace.SpanKind.CONSUMER):
+        carrier = event.get('trace_context', {}) if isinstance(event, dict) else {}
+        if not isinstance(carrier, dict): carrier = {}
+        with tracer.start_as_current_span('consumer.'+consumer,context=extract(carrier),kind=trace.SpanKind.CONSUMER):
             return fn(consumer,event,*args,**kwargs)
     return wrapped

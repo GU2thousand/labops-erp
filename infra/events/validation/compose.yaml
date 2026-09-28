@@ -1,0 +1,71 @@
+name: ${LABOPS_VALIDATION_PROJECT:?Run prepare.py and use generated/client.env}
+x-broker: &broker
+  image: ${REDPANDA_IMAGE:?Run prepare.py}
+  command: [redpanda, start, --config, /etc/redpanda/redpanda.yaml, --smp=1, --memory=1G, --reserve-memory=0M, --overprovisioned, --check=false, --unsafe-bypass-fsync=false]
+  environment:
+    RP_BOOTSTRAP_USER: ${RP_BOOTSTRAP_USER:?Run prepare.py}
+  restart: 'no'
+  mem_limit: 1200m
+  cpus: 1.0
+  stop_grace_period: 30s
+services:
+  redpanda-0:
+    <<: *broker
+    ports: ['127.0.0.1:19092:19092', '127.0.0.1:19644:9644']
+    volumes:
+      - redpanda-0:/var/lib/redpanda/data
+      - ./generated/redpanda-0.yaml:/etc/redpanda/redpanda.yaml:ro
+      - ./generated/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
+      - ./generated/tls:/etc/labops-tls:ro
+  redpanda-1:
+    <<: *broker
+    ports: ['127.0.0.1:29092:19092', '127.0.0.1:29644:9644']
+    volumes:
+      - redpanda-1:/var/lib/redpanda/data
+      - ./generated/redpanda-1.yaml:/etc/redpanda/redpanda.yaml:ro
+      - ./generated/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
+      - ./generated/tls:/etc/labops-tls:ro
+  redpanda-2:
+    <<: *broker
+    ports: ['127.0.0.1:39092:19092', '127.0.0.1:39644:9644']
+    volumes:
+      - redpanda-2:/var/lib/redpanda/data
+      - ./generated/redpanda-2.yaml:/etc/redpanda/redpanda.yaml:ro
+      - ./generated/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
+      - ./generated/tls:/etc/labops-tls:ro
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    profiles: [metrics]
+    entrypoint: ['/bin/sh', '-ec']
+    command:
+      - |
+        exec /bin/kafka_exporter --kafka.server=redpanda-0:9092 --kafka.server=redpanda-1:9092 --kafka.server=redpanda-2:9092 --sasl.enabled --sasl.username=exporter --sasl.password="$${KAFKA_EXPORTER_PASSWORD}" --sasl.mechanism=sha256 --tls.enabled --tls.ca-file=/etc/labops-ca/ca.crt --group.filter="^$${KAFKA_GROUP_PREFIX}\..*" --topic.filter="^$${KAFKA_GROUP_PREFIX}\.inventory.*" --topic.workers=2 --refresh.metadata=15s
+    environment:
+      KAFKA_EXPORTER_PASSWORD: ${KAFKA_EXPORTER_PASSWORD:?Run prepare.py}
+      KAFKA_GROUP_PREFIX: ${KAFKA_GROUP_PREFIX:?Run prepare.py}
+      GOMAXPROCS: '1'
+      GOMEMLIMIT: 96MiB
+    volumes: ['./generated/tls/ca.crt:/etc/labops-ca/ca.crt:ro']
+    ports: ['127.0.0.1:19308:9308']
+    mem_limit: 128m
+    restart: 'no'
+  postgres:
+    image: postgres:17-alpine
+    command: [postgres, -c, track_commit_timestamp=on]
+    environment:
+      POSTGRES_USER: labops
+      POSTGRES_DB: labops_events
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run prepare.py}
+    ports: ['127.0.0.1:55434:5432']
+    volumes: [postgres:/var/lib/postgresql/data]
+    mem_limit: 384m
+    healthcheck:
+      test: [CMD, pg_isready, -U, labops, -d, labops_events]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+volumes:
+  redpanda-0:
+  redpanda-1:
+  redpanda-2:
+  postgres:

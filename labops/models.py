@@ -191,6 +191,8 @@ class OutboxEvent(Base):
     aggregate_type = models.CharField(max_length=64)
     aggregate_id = models.UUIDField()
     payload_json = models.JSONField(default=dict)
+    # NULL denotes an unaudited legacy record; it must never imply a trusted hash.
+    payload_hash = models.CharField(max_length=64, null=True, blank=True)
     dedupe_key = models.CharField(max_length=255, unique=True)
     status = models.CharField(max_length=32, default='PENDING')
     attempts = models.PositiveIntegerField(default=0)
@@ -198,7 +200,15 @@ class OutboxEvent(Base):
     locked_until = models.DateTimeField(null=True)
     last_error = models.TextField(blank=True)
     processed_at = models.DateTimeField(null=True)
-    class Meta: indexes = [models.Index(fields=['status','next_attempt_at'])]
+    class Meta:
+        indexes = [models.Index(fields=['status','next_attempt_at']),
+                   models.Index(fields=['transport', 'status', 'next_attempt_at'], name='outbox_route_due_idx'),
+                   models.Index(fields=['aggregate_type', 'aggregate_id', 'aggregate_version'], name='outbox_aggregate_version_idx')]
+        constraints = [models.UniqueConstraint(
+            fields=['aggregate_type', 'aggregate_id', 'aggregate_version'],
+            condition=Q(aggregate_type='stockmovement', event_type__in=[
+                f'inventory.{kind}.posted' for kind in ['opening', 'receipt', 'issue', 'transfer', 'adjustment', 'reversal']]),
+            name='inventory_aggregate_version_uniq')]
 class Notification(Base):
     event = fk(OutboxEvent)
     user = fk(User)
@@ -254,6 +264,7 @@ class SampleEvent(Base):
 class ProcessedEvent(Base):
     consumer_name = models.CharField(max_length=64)
     event_id = models.UUIDField()
+    payload_hash = models.CharField(max_length=64, null=True, blank=True)
     class Meta:
         constraints = [models.UniqueConstraint(fields=['consumer_name', 'event_id'], name='consumer_event_unique')]
 
@@ -266,15 +277,68 @@ class InventoryProjection(models.Model):
 
 class FailedDelivery(Base):
     consumer_name = models.CharField(max_length=64)
-    delivery_key = models.CharField(max_length=255)
+    delivery_key = models.CharField(max_length=600)
+    source_cluster = models.CharField(max_length=128, default='legacy', blank=True)
+    source_generation = models.CharField(max_length=128, default='legacy', blank=True)
+    failure_class = models.CharField(max_length=32, default='transient')
     envelope = models.JSONField(default=dict)
+    original_hash = models.CharField(max_length=64, null=True, blank=True)
     attempts = models.PositiveIntegerField(default=1)
     status = models.CharField(max_length=16, default='RETRY')
     next_attempt_at = models.DateTimeField(default=timezone.now)
+    lease_token = models.UUIDField(null=True, blank=True)
+    locked_until = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True)
     dlq_published_at = models.DateTimeField(null=True)
+    dlq_lease_token = models.UUIDField(null=True, blank=True)
+    dlq_locked_until = models.DateTimeField(null=True, blank=True)
+    dlq_attempts = models.PositiveIntegerField(default=0)
+    dlq_next_attempt_at = models.DateTimeField(default=timezone.now)
     resolved_at = models.DateTimeField(null=True)
     resolution_note = models.TextField(blank=True)
     class Meta:
-        constraints = [models.UniqueConstraint(fields=['consumer_name', 'delivery_key'], name='consumer_delivery_unique')]
-        indexes = [models.Index(fields=['status', 'next_attempt_at'])]
+        constraints = [models.UniqueConstraint(fields=['consumer_name', 'source_cluster', 'source_generation', 'delivery_key'], name='consumer_source_delivery_unique')]
+        indexes = [models.Index(fields=['status', 'next_attempt_at']),
+                   models.Index(fields=['status', 'dlq_published_at', 'dlq_next_attempt_at'], name='delivery_dlq_due_idx')]
+
+
+class AppendOnlyAuditQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValueError('DeliveryAudit is append-only')
+    def delete(self):
+        raise ValueError('DeliveryAudit is append-only')
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValueError('DeliveryAudit is append-only')
+    def bulk_create(self, objs, batch_size=None, ignore_conflicts=False, update_conflicts=False,
+                    update_fields=None, unique_fields=None):
+        if update_conflicts:
+            raise ValueError('DeliveryAudit is append-only')
+        return super().bulk_create(objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts,
+                                   update_conflicts=False, update_fields=update_fields, unique_fields=unique_fields)
+
+
+class DeliveryAudit(Base):
+    """Append-only recovery evidence. PostgreSQL also enforces this with a trigger."""
+    delivery = optfk(FailedDelivery, related_name='audit_entries')
+    outbox = optfk(OutboxEvent, related_name='delivery_audit_entries')
+    actor = optfk(User, related_name='delivery_audit_entries')
+    actor_label = models.CharField(max_length=160, blank=True)
+    action = models.CharField(max_length=64)
+    outcome = models.CharField(max_length=32)
+    reason = models.TextField(blank=True)
+    before_json = models.JSONField(null=True, blank=True)
+    after_json = models.JSONField(null=True, blank=True)
+    original_hash = models.CharField(max_length=64, null=True, blank=True)
+    authorization_json = models.JSONField(default=dict)
+    objects = AppendOnlyAuditQuerySet.as_manager()
+    class Meta:
+        indexes = [models.Index(fields=['delivery', 'created_at'], name='delivery_audit_time_idx'),
+                   models.Index(fields=['outbox', 'created_at'], name='outbox_audit_time_idx')]
+    def save(self, *, force_insert=False, force_update=False, using=None, update_fields=None):
+        if not self._state.adding or force_update or update_fields is not None:
+            raise ValueError('DeliveryAudit is append-only')
+        # A new Python object carrying an existing primary key must attempt an
+        # INSERT and fail uniqueness, rather than Django's usual UPDATE fallback.
+        return super().save(force_insert=True, using=using)
+    def delete(self, *args, **kwargs):
+        raise ValueError('DeliveryAudit is append-only')
