@@ -98,6 +98,28 @@ effects. Exact eligible-recipient completion is checked in the same transaction.
 This groups rows within one event, and does not batch consumed events or offsets.
 These changes require another live probe and do not predict 50/s capacity.
 
+The subsequent ARM [run 36391294683](https://github.com/GU2thousand/labops-erp/actions/runs/36391294683)
+at `e23246a` also **failed**: all 3,000 commands/effects completed, but the
+77.073496419-second window (38.923886153/s) exceeded 63 seconds. Analytics
+p95/p99 were 6.49619/6.68469 seconds and notification p95/p99 were
+7.45375/7.62372 seconds. Both p99 results met 15 seconds; both p95 results
+exceeded five seconds. Exact counts and complete native diagnostics do not
+replace those failed rate and latency gates.
+
+Paired PostgreSQL timeout queries retain their original scope and budgets:
+the publisher/DLQ helper reads both previous session values together, applies
+both values together, and restores both together (three statements instead of
+six). A restore database error still closes the application connection and
+preserves an active body exception. Database-effect workers set both transaction-
+local values in one statement; the original atomic context remains, and SET
+LOCAL lasts until the outer transaction commits or rolls back. Publisher owner
+checks, lease checks, per-message broker ACK, conditional writeback and consumer
+offset/transaction boundaries are unchanged. The two `create_receipt` joined
+lookups load only supplier and request-line/item data used by existing checks.
+They add no joined row locks and retain the same lookup errors and guards.
+Receipt SUMs remain independent reads; no totals cache is introduced. These
+query reductions require fresh acceptance and do not forecast throughput.
+
 Runtime diagnostics are an explicit opt-in with `--runtime-diagnostics`.
 The default CLI and automatic 60-event smoke leave diagnostics disabled. The
 manual workflow's `runtime_diagnostics` boolean also defaults to `false`; the

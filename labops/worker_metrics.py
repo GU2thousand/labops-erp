@@ -152,19 +152,17 @@ def database_statement_budget(seconds):
         yield
         return
     with connection.cursor() as cursor:
-        cursor.execute('SHOW statement_timeout')
-        previous_statement = cursor.fetchone()[0]
-        cursor.execute('SHOW lock_timeout')
-        previous_lock = cursor.fetchone()[0]
-        cursor.execute("SELECT set_config('statement_timeout', %s, false)", [str(int(seconds * 1000))])
-        cursor.execute("SELECT set_config('lock_timeout', %s, false)", [str(settings.EVENT_DB_LOCK_TIMEOUT_MS)])
+        cursor.execute("SELECT current_setting('statement_timeout'), current_setting('lock_timeout')")
+        previous_statement, previous_lock = cursor.fetchone()
+        cursor.execute("SELECT set_config('statement_timeout', %s, false), set_config('lock_timeout', %s, false)",
+                       [str(int(seconds * 1000)), str(settings.EVENT_DB_LOCK_TIMEOUT_MS)])
     try:
         yield
     finally:
         try:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT set_config('statement_timeout', %s, false)", [previous_statement])
-                cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous_lock])
+                cursor.execute("SELECT set_config('statement_timeout', %s, false), set_config('lock_timeout', %s, false)",
+                               [previous_statement, previous_lock])
         except DatabaseError:
             connection.close()
 
@@ -210,6 +208,6 @@ def database_processing_budget():
     with transaction.atomic():
         if connection.vendor == 'postgresql':
             with connection.cursor() as cursor:
-                cursor.execute("SELECT set_config('statement_timeout', %s, true)", [str(settings.EVENT_RETRY_STATEMENT_TIMEOUT_MS)])
-                cursor.execute("SELECT set_config('lock_timeout', %s, true)", [str(settings.EVENT_RETRY_LOCK_TIMEOUT_MS)])
+                cursor.execute("SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+                               [str(settings.EVENT_RETRY_STATEMENT_TIMEOUT_MS), str(settings.EVENT_RETRY_LOCK_TIMEOUT_MS)])
         yield

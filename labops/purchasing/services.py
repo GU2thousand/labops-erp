@@ -3,6 +3,10 @@ from django.db.models import Sum
 from labops.common import *
 from labops.models import *
 
+def _related_obj(model,id,*relations):
+    try: return model.objects.select_related(*relations).get(pk=id)
+    except (model.DoesNotExist,ValueError,ValidationError): fail('NOT_FOUND','Record not found or no longer available',404)
+
 def request_scope(user,request,write=False):
     r=roles(user)
     if r & {'ADMIN','BUYER','STORE'}: return
@@ -125,14 +129,14 @@ def order_action(user,id,action,data,rid):
 @atomic_command
 def create_receipt(user,data,rid):
     allow(user,'ADMIN','STORE')
-    po=obj(PurchaseOrder,data.get('order_id'))
+    po=_related_obj(PurchaseOrder,data.get('order_id'),'supplier')
     require(po.status in ['CONFIRMED','CLOSED'],'ORDER_NOT_CONFIRMED','Receipts require a confirmed purchase order')
     require(po.supplier.is_active,'INACTIVE_SUPPLIER','Supplier is inactive')
     lines=data.get('lines',[]); require(isinstance(lines,list) and 0<len(lines)<=100,'EMPTY_LINES','Add 1 to 100 receipt lines')
     receipt=new(Receipt,user,rid,receipt_no=number('RCV'),order=po)
     totals=defaultdict(Decimal)
     for n,x in enumerate(lines,1):
-        line=obj(OrderLine,x.get('order_line_id')); require(line.order_id==po.id,'WRONG_ORDER','The receipt line does not belong to the selected order')
+        line=_related_obj(OrderLine,x.get('order_line_id'),'request_line__item'); require(line.order_id==po.id,'WRONG_ORDER','The receipt line does not belong to the selected order')
         item=line.request_line.item; require(item.is_active,'INACTIVE_ITEM','Item is inactive')
         warehouse=obj(Warehouse,x.get('warehouse_id')); require(warehouse.is_active,'INACTIVE_WAREHOUSE','Warehouse is inactive')
         q=qty(x.get('qty')); totals[line.id]+=q
