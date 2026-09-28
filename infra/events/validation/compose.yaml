@@ -54,7 +54,7 @@ services:
     entrypoint: ['/bin/sh', '-ec']
     command:
       - |
-        exec /bin/kafka_exporter --kafka.server=redpanda-0:9092 --kafka.server=redpanda-1:9092 --kafka.server=redpanda-2:9092 --sasl.enabled --sasl.username=exporter --sasl.password="$${KAFKA_EXPORTER_PASSWORD}" --sasl.mechanism=sha256 --tls.enabled --tls.ca-file=/etc/labops-ca/ca.crt --group.filter="^$${KAFKA_GROUP_PREFIX}\..*" --topic.filter="^$${KAFKA_GROUP_PREFIX}\.inventory.*" --topic.workers=2 --refresh.metadata=15s
+        exec /bin/kafka_exporter --kafka.server=redpanda-0:9092 --kafka.server=redpanda-1:9092 --kafka.server=redpanda-2:9092 --sasl.enabled --sasl.username=exporter --sasl.password="$${KAFKA_EXPORTER_PASSWORD}" --sasl.mechanism=scram-sha256 --tls.enabled --tls.ca-file=/etc/labops-ca/ca.crt --group.filter="^$${KAFKA_GROUP_PREFIX}\..*" --topic.filter="^$${KAFKA_GROUP_PREFIX}\.inventory.*" --topic.workers=2 --refresh.metadata=15s
     environment:
       KAFKA_EXPORTER_PASSWORD: ${KAFKA_EXPORTER_PASSWORD:?Run prepare.py}
       KAFKA_GROUP_PREFIX: ${KAFKA_GROUP_PREFIX:?Run prepare.py}
