@@ -6,14 +6,27 @@ broker records retain their event ID and are harmless to this database's effects
 import json
 import base64
 import logging
+import inspect
+from pathlib import Path
 import sqlite3
 import time
 import uuid
 from datetime import timedelta
 from decimal import Decimal
 from django.conf import settings
-from django.db import transaction, connection, DatabaseError, IntegrityError, OperationalError
+from django.db import transaction, connection, connections, router, DEFAULT_DB_ALIAS, DatabaseError, IntegrityError, OperationalError
+from django.db import models
 from django.db.models import Exists, OuterRef, Q
+from django.db.models.base import ModelBase
+from django.db.models.manager import Manager
+from django.db.models.query import QuerySet, ModelIterable
+from django.db.models.signals import pre_init, post_init, pre_save, post_save
+from django.db.models import base as model_base, manager as model_manager, query as model_query, fields as model_fields
+from django.db.models.query_utils import DeferredAttribute
+from django.utils.functional import cached_property
+from django.db.backends.postgresql import base as postgres_base, operations as postgres_operations, compiler as postgres_compiler
+from django.db.backends.base import operations as base_operations
+from django.db.models.sql import compiler as sql_compiler, subqueries as sql_subqueries, query as sql_query
 from django.db.models.expressions import RawSQL
 from django.utils import timezone
 from .locking import advisory
@@ -26,6 +39,233 @@ from .kafka_config import producer_config, source_identity
 from .worker_metrics import EVENTS, PUBLISH_ACK, EFFECT_LATENCY, LEASE_REJECTIONS, schema_rejected
 
 log = logging.getLogger('labops')
+
+# References are capabilities, not a cached eligibility decision. Every marker
+# operation rechecks the effective model/manager/fields/listeners below.
+_MARKER_MODEL_METHODS = {name: inspect.getattr_static(models.Model, name) for name in (
+    '__new__', '__init__', '__getattribute__', '__setattr__', 'from_db', 'save', 'save_base',
+    '_prepare_related_fields_for_save', '_save_parents', '_validate_force_insert', '_save_table', '_do_insert', '_is_pk_set',
+    '_get_pk_val')}
+_MARKER_MANAGER_METHODS = {name: inspect.getattr_static(Manager, name) for name in (
+    'get_queryset', 'get_or_create', 'get', 'create', '_insert')}
+_MARKER_QUERY_METHODS = {name: inspect.getattr_static(QuerySet, name) for name in (
+    '__init__', 'get_or_create', 'get', 'create', '_extract_model_params',
+    '_insert', 'filter', '_clone', 'db')}
+_MARKER_FIELD_METHODS = {kind: {name: inspect.getattr_static(kind, name) for name in (
+    'deconstruct', 'get_default', 'pre_save', 'get_db_prep_save',
+    'get_db_prep_value', 'get_prep_value', 'get_pk_value_on_save',
+    'to_python', 'value_from_object', '_get_default')}
+    for kind in (models.UUIDField, models.DateTimeField, models.CharField)}
+_MARKER_DEFAULTS = (uuid.uuid4, timezone.now)
+_MARKER_SOURCE_FILES = {module.__name__: str(Path(module.__file__).resolve()) for module in (
+    model_base, model_manager, model_query, model_fields, uuid, timezone,
+    postgres_base, postgres_operations, postgres_compiler, base_operations,
+    sql_compiler, sql_subqueries, sql_query)}
+_MARKER_INSERT_METHODS = tuple((kind, name, module, inspect.getattr_static(kind, name)) for kind, names, module in (
+    (sql_subqueries.InsertQuery, ('__init__', 'insert_values'), 'django.db.models.sql.subqueries'),
+    (sql_subqueries.InsertQuery, ('get_compiler',), 'django.db.models.sql.query'),
+    (postgres_compiler.SQLInsertCompiler, ('as_sql', 'execute_sql', 'prepare_value', 'pre_save_val', 'field_as_sql'), 'django.db.models.sql.compiler'),
+    (postgres_compiler.SQLInsertCompiler, ('assemble_as_sql',), 'django.db.backends.postgresql.compiler'),
+    (postgres_operations.DatabaseOperations, ('compiler', 'insert_statement'), 'django.db.backends.base.operations'),
+    (postgres_operations.DatabaseOperations, ('quote_name',), 'django.db.backends.postgresql.operations'),
+) for name in names)
+
+
+def _marker_callable(descriptor):
+    if isinstance(descriptor, (classmethod, staticmethod)):
+        return descriptor.__func__
+    if isinstance(descriptor, property):
+        return descriptor.fget
+    if isinstance(descriptor, cached_property):
+        return descriptor.func
+    return descriptor
+
+
+_MARKER_CALLABLE_STATES = {id(descriptor): (descriptor, _marker_callable(descriptor).__code__,
+        _marker_callable(descriptor).__module__, _marker_callable(descriptor).__qualname__)
+    for descriptor in (*_MARKER_MODEL_METHODS.values(), *_MARKER_MANAGER_METHODS.values(),
+        *_MARKER_QUERY_METHODS.values(), *(method for methods in _MARKER_FIELD_METHODS.values() for method in methods.values()),
+        *_MARKER_DEFAULTS, *(method for _, _, _, method in _MARKER_INSERT_METHODS))
+    if hasattr(_marker_callable(descriptor), '__code__')}
+
+
+def _marker_original_callable(descriptor, module, filename_module, name):
+    state = _MARKER_CALLABLE_STATES.get(id(descriptor))
+    function = _marker_callable(descriptor)
+    code = getattr(function, '__code__', None)
+    return (state is not None and state[0] is descriptor and code is state[1]
+            and function.__module__ == state[2] == module and function.__qualname__ == state[3]
+            and function.__qualname__.split('.')[-1] == name
+            and code.co_filename == _MARKER_SOURCE_FILES[filename_module])
+
+
+def _marker_framework_original():
+    # A wrapper installed before events imports must not become a "plain"
+    # reference merely because it is the effective function at import time.
+    for name, method in _MARKER_MODEL_METHODS.items():
+        if name in {'__new__', '__getattribute__', '__setattr__'}:
+            if method is not inspect.getattr_static(object, name):
+                return False
+        elif not _marker_original_callable(method, 'django.db.models.base', 'django.db.models.base', name):
+            return False
+    for name, method in _MARKER_MANAGER_METHODS.items():
+        module = 'django.db.models.manager' if name == 'get_queryset' else 'django.db.models.query'
+        if not _marker_original_callable(method, module, 'django.db.models.manager', name):
+            return False
+    if any(not _marker_original_callable(method, 'django.db.models.query', 'django.db.models.query', name)
+           for name, method in _MARKER_QUERY_METHODS.items()):
+        return False
+    if any(not _marker_original_callable(method, 'django.db.models.fields', 'django.db.models.fields', name)
+           for methods in _MARKER_FIELD_METHODS.values() for name, method in methods.items()):
+        return False
+    if any(inspect.getattr_static(kind, name) is not method
+           or not _marker_original_callable(method, module, module, name)
+           for kind, name, module, method in _MARKER_INSERT_METHODS):
+        return False
+    return (_marker_original_callable(_MARKER_DEFAULTS[0], 'uuid', 'uuid', 'uuid4')
+            and _marker_original_callable(_MARKER_DEFAULTS[1], 'django.utils.timezone', 'django.utils.timezone', 'now'))
+
+
+def _plain_processed_marker(manager):
+    """Unknown extensions retain the complete ordinary ORM lifecycle."""
+    try:
+        if (connection.vendor != 'postgresql' or connection.alias != DEFAULT_DB_ALIAS
+                or settings.DATABASE_ROUTERS or router.routers):
+            return False
+        if not _marker_framework_original():
+            return False
+        database = connections[DEFAULT_DB_ALIAS]
+        if (connection.settings_dict['ENGINE'] != 'django.db.backends.postgresql'
+                or type(database) is not postgres_base.DatabaseWrapper
+                or type(connection.ops) is not postgres_operations.DatabaseOperations
+                or connection.ops.compiler('SQLInsertCompiler') is not postgres_compiler.SQLInsertCompiler):
+            return False
+        options = database.settings_dict['OPTIONS']
+        if 'isolation_level' in options or 'options' in options:
+            return False
+        if database.connection is not None and (
+                database.isolation_level != postgres_base.IsolationLevel.READ_COMMITTED
+                or database.connection.isolation_level not in (None, postgres_base.IsolationLevel.READ_COMMITTED)):
+            return False
+        if type(ProcessedEvent) is not ModelBase or any(
+                inspect.getattr_static(ProcessedEvent, name) is not method
+                for name, method in _MARKER_MODEL_METHODS.items()):
+            return False
+        if inspect.getattr_static(ModelBase, '__call__') is not inspect.getattr_static(type, '__call__'):
+            return False
+        meta = ProcessedEvent._meta
+        if (meta.db_table != 'labops_processedevent' or meta.proxy or meta.parents or meta.swapped
+                or meta.concrete_model is not ProcessedEvent or meta.unique_together):
+            return False
+        if (type(manager) is not Manager or manager.model is not ProcessedEvent
+                or manager._db is not None or manager._hints
+                or manager._queryset_class is not QuerySet
+                or any(inspect.getattr_static(manager, name) is not method
+                       for name, method in _MARKER_MANAGER_METHODS.items())):
+            return False
+        for other in (ProcessedEvent._base_manager, ProcessedEvent._default_manager):
+            if (type(other) is not Manager or other.model is not ProcessedEvent
+                    or other._db is not None or other._hints or other._queryset_class is not QuerySet
+                    or any(inspect.getattr_static(other, name) is not method
+                           for name, method in _MARKER_MANAGER_METHODS.items())):
+                return False
+        if any(inspect.getattr_static(QuerySet, name) is not method
+               for name, method in _MARKER_QUERY_METHODS.items()):
+            return False
+        queryset = manager.get_queryset()
+        if (type(queryset) is not QuerySet or queryset.model is not ProcessedEvent
+                or queryset._db is not None or queryset._hints or queryset._for_write
+                or queryset._iterable_class is not ModelIterable):
+            return False
+        expected = (
+            ('id', models.UUIDField, {'primary_key': True, 'default': _MARKER_DEFAULTS[0], 'editable': False, 'serialize': False}),
+            ('created_at', models.DateTimeField, {'default': _MARKER_DEFAULTS[1], 'db_index': True}),
+            ('consumer_name', models.CharField, {'max_length': 64}),
+            ('event_id', models.UUIDField, {}),
+            ('payload_hash', models.CharField, {'max_length': 64, 'null': True, 'blank': True}),
+        )
+        fields = tuple(meta.local_concrete_fields)
+        if tuple(meta.concrete_fields) != fields or len(fields) != len(expected):
+            return False
+        for field, (name, kind, options) in zip(fields, expected):
+            if (type(field) is not kind or field.name != name or field.attname != name
+                    or field.column != name or field.model is not ProcessedEvent
+                    or field.generated or field.db_returning or hasattr(field, 'get_placeholder')
+                    or any(inspect.getattr_static(type(field) if method_name == '_get_default' else field, method_name) is not method
+                           for method_name, method in _MARKER_FIELD_METHODS[kind].items())):
+                return False
+            if field.deconstruct()[3] != options:
+                return False
+            descriptor = inspect.getattr_static(ProcessedEvent, name)
+            if type(descriptor) is not DeferredAttribute or descriptor.field is not field:
+                return False
+            # Field caches the callable when get_default is first used.
+            if '_get_default' in field.__dict__:
+                default = {'id': _MARKER_DEFAULTS[0], 'created_at': _MARKER_DEFAULTS[1],
+                           'consumer_name': str, 'event_id': model_fields.return_None,
+                           'payload_hash': model_fields.return_None}[name]
+                if field.__dict__['_get_default'] is not default:
+                    return False
+        if uuid.uuid4 is not _MARKER_DEFAULTS[0] or timezone.now is not _MARKER_DEFAULTS[1]:
+            return False
+        constraints = meta.constraints
+        if meta.db_returning_fields:
+            return False
+        if len(constraints) != 1 or type(constraints[0]) is not models.UniqueConstraint:
+            return False
+        constraint = constraints[0]
+        if (constraint.name != 'consumer_event_unique' or constraint.fields != ('consumer_name', 'event_id')
+                or constraint.condition is not None or constraint.deferrable is not None
+                or constraint.expressions or constraint.include or constraint.opclasses
+                or constraint.nulls_distinct is not None):
+            return False
+        return not any(signal.has_listeners(ProcessedEvent) for signal in (pre_init, post_init, pre_save, post_save))
+    except Exception:
+        # Admission failure cannot replace the business operation/error. Deadlines
+        # derive from BaseException and continue to leave the worker boundary.
+        return False
+
+
+def _processed_marker(consumer, event_id, digest):
+    manager = ProcessedEvent.objects
+    lookup = {'consumer_name': consumer, 'event_id': event_id}
+    if (type(consumer) is not str or consumer not in {'notification', 'analytics'}
+            or type(event_id) is not uuid.UUID or type(digest) is not str
+            or len(digest) != 64 or any(character not in '0123456789abcdef' for character in digest)
+            or not _plain_processed_marker(manager)):
+        return manager.get_or_create(**lookup, defaults={'payload_hash': digest})
+    try:
+        # Keep Django's insertion savepoint so ANY IntegrityError can recover
+        # through a fresh target lookup on a usable transaction.
+        with transaction.atomic():
+            marker = ProcessedEvent(**lookup, payload_hash=digest)
+            fields = ProcessedEvent._meta.local_concrete_fields
+            values = [field.get_db_prep_save(field.pre_save(marker, True), connection) for field in fields]
+            quote = connection.ops.quote_name
+            columns = ', '.join(quote(field.column) for field in fields)
+            with connection.cursor() as cursor:
+                cursor.execute(f'INSERT INTO {quote(ProcessedEvent._meta.db_table)} ({columns}) '
+                    f'VALUES (%s, %s, %s, %s, %s) ON CONFLICT ON CONSTRAINT {quote("consumer_event_unique")} '
+                    f'DO NOTHING RETURNING {quote("id")}', values)
+                created = cursor.fetchone() is not None
+            if created:
+                marker._state.db = DEFAULT_DB_ALIAS
+                marker._state.adding = False
+                return marker, True
+    except IntegrityError:
+        try:
+            return manager.get(**lookup), False
+        except ProcessedEvent.DoesNotExist:
+            pass
+        raise
+    # Read Committed may have waited for a row outside the INSERT snapshot.
+    # A separate statement observes that committed arbiter row.
+    try:
+        return manager.get(**lookup), False
+    except ProcessedEvent.DoesNotExist as exc:
+        # DO NOTHING produces no SQL exception to preserve. A concurrently
+        # deleted target still fails permanently, like ORM insert recovery.
+        raise IntegrityError('Processed marker disappeared after unique conflict') from exc
 
 
 class PayloadConflict(EventValidationError):
@@ -167,8 +407,7 @@ def process_envelope(consumer, event):
         envelope(original)  # verifies/backfills the immutable original checksum
         if original.payload_hash != digest:
             raise PayloadConflict()
-        marker, created = ProcessedEvent.objects.get_or_create(consumer_name=consumer, event_id=eid,
-                                                               defaults={'payload_hash': digest})
+        marker, created = _processed_marker(consumer, eid, digest)
         if not created:
             if marker.payload_hash and marker.payload_hash != digest: raise PayloadConflict()
             if not marker.payload_hash:

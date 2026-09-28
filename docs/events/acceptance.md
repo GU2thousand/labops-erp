@@ -703,3 +703,30 @@ Binary rollback can retain this additive index. Database rollback to `0006`
 removes only the matching expected index concurrently; a missing or mismatched
 catalog definition stops rollback. It does not remove existing indexes, change
 business data, or alter acceptance gates.
+
+Consumer deduplication retains its insertion savepoint. On the ordinary
+PostgreSQL five-field `ProcessedEvent` model, it inserts with the specific
+`consumer_event_unique` arbiter and reads an existing marker in a fresh statement
+when the insert does nothing. Any actual insertion `IntegrityError` rolls back
+that savepoint before the fresh lookup; if the pair is absent, the original
+exception is rethrown. If a concurrently deleted pair disappears after
+`DO NOTHING`, there is no original SQL exception: the consumer raises a new
+`IntegrityError` to retain permanent failure classification and durable parking.
+
+Admission is checked on every operation. Custom model/base lifecycle,
+managers/querysets, fields/defaults/descriptors, routing, backend insert behavior,
+or effective global/sender init/save listeners use the original ORM
+`get_or_create` once. Canonical callable provenance and current code identities
+also reject ordinary extensions installed before or after module import. The
+insert path accepts only the existing two consumer names, UUID identity and
+canonical checksum shape. Legacy NULL/empty hashes still backfill through the
+original ORM save. Notification insertion, business validation/reads, analytics
+locks and Fixed6 effects, constraint validation, outer durable transaction,
+processing limits, partition ownership and per-record synchronous offset commit
+remain unchanged. This is one fewer normal new-marker SELECT, not a measured
+throughput or latency improvement; the frozen acceptance gates still apply.
+The optimized path uses the managed default Read Committed session. Configured
+isolation/startup overrides and nonstandard wrapper/native isolation metadata
+fall back without an admission query. Arbitrary SQL `SET TRANSACTION` or session
+isolation changes outside the managed worker contract are not established by
+these metadata checks and are outside this optimized-path support boundary.
