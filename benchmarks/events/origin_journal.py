@@ -17,6 +17,7 @@ import time
 from uuid import UUID
 
 from benchmarks.events.generation_journal import COUNTERS, numeric_profile
+from benchmarks.events.writer_topology import resolve_profile_writer, writer_profile
 
 
 KINDS = ('RECEIPT', 'ISSUE', 'TRANSFER', 'REVERSAL')
@@ -106,15 +107,19 @@ def _plan(*, run_id, origin_id, profile, label, lane, indices, rate, context=Non
         raise ValueError('Invalid run identifier')
     _name(origin_id); _name(label)
     _integer(lane)
-    if lane >= 4 or isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+    requested = numeric_profile(profile)
+    selected = writer_profile(resolve_profile_writer(requested))
+    if 'writer_topology' in requested and rate != requested['rate'] / selected['lanes']:
+        raise ValueError('Origin nominal rate differs from frozen writer profile')
+    if lane >= selected['lanes'] or isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
         raise ValueError('Invalid origin lane or rate')
     if not isinstance(indices, (list, tuple)):
         raise ValueError('An origin requires its frozen index list')
     indices = [_integer(index) for index in indices]
-    if indices != sorted(set(indices)) or any((index // 4) % 4 != lane for index in indices):
+    if indices != sorted(set(indices)) or any((index // 4) % selected['lanes'] != lane for index in indices):
         raise ValueError('Frozen index allocation is duplicated or belongs to another lane')
     return {'schema_version': 1, 'run_id': run_id, 'origin_id': origin_id,
-            'requested_numeric_profile': numeric_profile(profile), 'label': label,
+            'requested_numeric_profile': requested, 'label': label,
             'lane': lane, 'indices': indices, 'target_rate': rate,
             'context': _context(context or {}),
             'commands': [{'ordinal': ordinal, 'global_index': index,
@@ -523,7 +528,8 @@ class CompositeGenerationJournal:
         context = value.get('context', {key: value[key] for key in CONTEXT_FIELDS if key in value})
         if 'rate' in value and 'target_rate' in value and value['rate'] != value['target_rate']:
             raise ValueError('Conflicting origin rate aliases')
-        rate = value.get('rate', value.get('target_rate', self.parent.profile['rate'] / 4))
+        lanes = writer_profile(resolve_profile_writer(self.parent.profile))['lanes']
+        rate = value.get('rate', value.get('target_rate', self.parent.profile['rate'] / lanes))
         if 'requested_numeric_profile' in value and _digest(value['requested_numeric_profile']) != _digest(self.parent.profile):
             raise ValueError('Origin requested profile differs from the parent')
         if 'schema_version' in value and (type(value['schema_version']) is not int or value['schema_version'] != 1):

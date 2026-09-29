@@ -118,6 +118,78 @@ class OriginJournalTests(unittest.TestCase):
     def assert_counts(self, summary, **expected):
         self.assertEqual({name: summary[name] for name in expected}, expected)
 
+    def six_composite(self):
+        self._group += 1
+        directory = self.root / ('six-group-' + str(self._group))
+        parent = GenerationJournal(directory / 'parent', RUN_ID,
+            requested_profile(writer_topology='writers-6', writer_topology_version='writer-topology-v1'))
+        self.addCleanup(parent.finalize)
+        return CompositeGenerationJournal(parent)
+
+    def six_origin(self, composite, *, lane, indices):
+        value = self.plan(composite, origin_id='six_origin_' + str(lane), lane=lane, indices=indices)
+        del value['rate']  # Nominal metadata must derive from the frozen parent's selected six.
+        canonical = composite.add_origin_plan(value)
+        child = OriginJournal(value['path'], run_id=RUN_ID, origin_id=value['origin_id'],
+            profile=composite.profile, label=value['label'], lane=lane, indices=indices,
+            rate=canonical['target_rate'], context=value['context'])
+        self.addCleanup(child.finalize)
+        return child, child.begin_batch(len(indices), canonical['target_rate'], value['label'])
+
+    def test_six_partial_origins_keep_idle_reservations_and_parent_nominal_rate(self):
+        from benchmarks.events.concurrent_generation import allocate_lane_indices
+        composite = self.six_composite()
+        allocation = allocate_lane_indices(6, lanes=6, start_index=22)
+        for lane, indices in enumerate(allocation):
+            child, batch = self.six_origin(composite, lane=lane, indices=indices)
+            self.assertEqual(child.plan['target_rate'], 50 / 6)
+            self.assertEqual(child.plan['requested_numeric_profile'], composite.profile)
+            for index in indices:
+                self.identify(child, batch, index)
+            child.finish_success(batch)
+            child.finalize()
+        report = composite.summary()
+        self.assertEqual(len(report['batches']), 6)
+        self.assertEqual(sorted(batch['requested'] for batch in report['batches']), [0, 0, 0, 0, 2, 4])
+        self.assertTrue(all(batch['status'] == 'succeeded' for batch in report['batches']))
+        self.assert_counts(report['totals'], requested=6, committed=6, identified_events=6, unattempted=0)
+        self.assertEqual(report['requested_numeric_profile']['writer_topology'], 'writers-6')
+
+    def test_six_origin_rejects_wrong_extra_lane_mapping_rate_or_parent_profile(self):
+        for corruption in ('indices', 'rate', 'profile'):
+            with self.subTest(corruption=corruption):
+                composite = self.six_composite()
+                value = self.plan(composite, origin_id='extra_5', lane=5, indices=(20, 21, 22, 23))
+                value['rate'] = 50 / 6
+                if corruption == 'indices': value['indices'] = [0]
+                elif corruption == 'rate': value['rate'] = 12.5
+                else: value['requested_numeric_profile'] = requested_profile()
+                with self.assertRaises(ValueError):
+                    composite.add_origin_plan(value)
+                self.assertEqual(composite.summary()['batches'], [])
+                self.assertFalse(Path(value['path']).exists())
+
+    def test_six_corrupt_saved_profile_retains_known_commit_and_full_reserved_denominator(self):
+        composite = self.six_composite()
+        child, batch = self.six_origin(composite, lane=5, indices=(20, 21, 22, 23))
+        self.identify(child, batch, 20)
+        child.finalize()
+        path = child.directory / 'origin-plan.json'
+        saved = json.loads(path.read_text())
+        saved['requested_numeric_profile']['writer_topology'] = 'writers-4'
+        path.write_text(json.dumps(saved, sort_keys=True) + '\n')
+        observed = next(row for row in composite.summary()['batches'] if row.get('origin_id') == 'six_origin_5')
+        self.assert_counts(observed, requested=4, attempted=1, committed=1, identified_events=1,
+            unattempted=0, attempted_unknown=3, commit_unknown=3)
+        self.assert_counts(observed['raw_totals'], requested=4, attempted=1, committed=1,
+            identified_events=1, unattempted=3)
+        self.assertTrue(observed['requested_partition_complete'])
+        self.assertFalse(observed['attempted_accounting_complete'])
+        self.assertEqual(composite.summary()['requested_numeric_profile']['writer_topology'], 'writers-6')
+        self.assertEqual(observed['status'], 'failed')
+        self.assertIn({'stage': 'origin_plan_read', 'error_type': 'ValueError'}, observed['evidence_errors'])
+        self.assertEqual(composite.committed_attempts()[0]['movement_id'], original_ids(20)[0])
+
     def test_full_origin_freezes_exact_profile_and_command_identity(self):
         composite = self.composite()
         child, batch = self.origin(composite, indices=(0, 1, 2, 3))

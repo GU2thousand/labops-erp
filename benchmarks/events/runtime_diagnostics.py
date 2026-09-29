@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import Counter
 import copy
 from decimal import Decimal
+from functools import partial
 import json
 import math
 import os
@@ -18,6 +19,8 @@ import re
 import resource
 import threading
 import time
+
+from benchmarks.events.writer_topology import DEFAULT_WRITER_PRESET, generator_roles
 
 
 INTERVAL_SECONDS = 1.0
@@ -380,7 +383,9 @@ def system_facts():
     return facts
 
 
-def process_snapshot():
+def process_snapshot(*, writer_topology=DEFAULT_WRITER_PRESET):
+    lane_names = {role.replace('generator-', 'paced-business-lane-')
+                  for role in generator_roles(writer_topology)}
     usage = resource.getrusage(resource.RUSAGE_SELF)
     result = {'user_cpu_seconds': usage.ru_utime, 'system_cpu_seconds': usage.ru_stime,
         'max_rss_bytes': usage.ru_maxrss*(1 if platform.system() == 'Darwin' else 1024),
@@ -403,7 +408,7 @@ def process_snapshot():
         ident = thread.native_id
         if ident is None:
             continue
-        name = thread.name if thread.name in {'MainThread', 'runtime-diagnostics'} or re.fullmatch(r'paced-business-lane-[0-3]', thread.name) else 'other'
+        name = thread.name if thread.name in {'MainThread', 'runtime-diagnostics'} or thread.name in lane_names else 'other'
         try:
             data = _read(f'/proc/self/task/{ident}/stat')
             fields = data[data.rfind(')')+2:].split()
@@ -563,7 +568,8 @@ class RuntimeDiagnostics:
                  interval_seconds=INTERVAL_SECONDS, max_samples=MAX_SAMPLES,
                  expected_resource_roles=None, known_stopped_roles=(),
                  database_sampler=None, process_reader=None, host_reader=None, facts_reader=None,
-                 managed_process_sampler=None, consumer_topology='single', expected_process_profile=None):
+                 managed_process_sampler=None, consumer_topology='single',
+                 writer_topology=DEFAULT_WRITER_PRESET, expected_process_profile=None):
         if not isinstance(scenario, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,95}', scenario):
             raise ValueError('Expected an authored diagnostic scenario')
         if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, (int, float)) or not math.isfinite(interval_seconds) or interval_seconds <= 0:
@@ -577,8 +583,9 @@ class RuntimeDiagnostics:
             raise ValueError('Expected an owned process sampling callback')
         self.managed_process_sampler = managed_process_sampler
         from benchmarks.events.consumer_topology import topology_profile
-        topology_profile(consumer_topology)
+        topology_profile(consumer_topology, writer_topology=writer_topology)
         self.consumer_topology = consumer_topology
+        self.writer_topology = writer_topology
         self.expected_process_profile = copy.deepcopy(expected_process_profile)
         self.expected_resource_roles = tuple(sorted(CONTAINER_ROLES if expected_resource_roles is None else expected_resource_roles))
         self.known_stopped_roles = tuple(sorted(known_stopped_roles))
@@ -587,7 +594,7 @@ class RuntimeDiagnostics:
                 or set(self.expected_resource_roles) & set(self.known_stopped_roles)):
             raise ValueError('Invalid running/stopped container contract')
         self.database_sampler = database_sampler or PostgreSQLSampler(database_alias)
-        self.process_reader = process_reader or process_snapshot
+        self.process_reader = process_reader or partial(process_snapshot, writer_topology=writer_topology)
         self.host_reader = host_reader or host_snapshot
         self.facts_reader = facts_reader or system_facts
         self._stop = threading.Event()
@@ -652,6 +659,7 @@ class RuntimeDiagnostics:
                     sample['managed_processes'] = self._safe_read(
                         lambda: sanitize_process_resources(self.managed_process_sampler(),
                             consumer_topology=self.consumer_topology,
+                            writer_topology=self.writer_topology,
                             expected_profile=self.expected_process_profile), 'managed_process_sample')
                 duration, cpu_duration = time.monotonic()-began, time.thread_time()-cpu
                 sample['sampler_wall_seconds'] = duration
@@ -711,6 +719,7 @@ class RuntimeDiagnostics:
             self._final_managed_processes = self._safe_read(
                 lambda: sanitize_process_resources(self.managed_process_sampler(),
                     consumer_topology=self.consumer_topology,
+                    writer_topology=self.writer_topology,
                     expected_profile=self.expected_process_profile),
                 'final_managed_processes', final_interruptions)
         if interruption is None and final_interruptions:
@@ -793,6 +802,7 @@ class RuntimeDiagnostics:
             managed_processes = summarize_process_resources(
                 [sample.get('managed_processes') for sample in self._samples],
                 getattr(self, '_final_managed_processes', None), consumer_topology=self.consumer_topology,
+                writer_topology=self.writer_topology,
                 expected_profile=self.expected_process_profile)
         collection_complete = bool(lifecycle_complete and not self._truncated
             and wall is not None and all(value is not None for value in cpu_delta['values'].values())

@@ -45,8 +45,8 @@ Automatic jobs and the manual default use `runner_arch=x64` on
 self-hosted runner contexts fail admission before Docker. GitHub documents both
 as [standard runners for public repositories](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories),
 whose standard usage is free. This comparison keeps the same application,
-workload, four lanes and acceptance gates. It does not establish independent-host
-HA or explain performance differences by architecture alone.
+workload, default four-writer profile and acceptance gates. It does not establish
+independent-host HA or explain performance differences by architecture alone.
 
 Before dependencies and services, `runner-profile.json` freezes the selected
 label, actual `RUNNER_ARCH` and platform architecture, Python version, source
@@ -176,10 +176,11 @@ manual workflow's `runtime_diagnostics` boolean also defaults to `false`; the
 planned 512-event diagnostic, 3,000-event probe and full runs explicitly set it
 to `true` or pass the CLI flag. The requested profile freezes that choice before
 environment/setup. Disabling diagnostics changes instrumentation scope; it does
-not change the four lanes, queue capacity four, global target rate, 5% generation
-window or any business/fault denominator. No four-process execution mode is
-selected by the diagnostics flag: process/thread selection follows the separately
-frozen count policy below, including when diagnostics are disabled.
+not change the independently frozen writer topology, queue capacity four, global
+target rate, 5% generation window or any business/fault denominator. No execution
+mode or writer count is selected by the diagnostics flag: process/thread selection
+follows the separately frozen count policy below, including when diagnostics are
+disabled.
 
 When disabled, the report records `runtime_diagnostics_enabled=false`,
 `runtime_diagnostics_applicable=false`, `runtime_diagnostics_status=NOT_REQUESTED`
@@ -255,13 +256,71 @@ claim therefore requires a separately frozen compatible policy or an explicitly
 audited operator recovery. Production policy and recovery SLA remain deployment
 decisions requiring executed staging evidence.
 
+## Frozen writer topology
+
+`--writer-topology` and the manual workflow's `writer_topology` input accept only
+`writers-4` (default) or `writers-6`. Automatic jobs retain `writers-4`; eight
+writers and arbitrary lane counts are not admitted. Six writers are the selected
+new acceptance candidate, **unqualified until actual PostgreSQL integration and
+native RF3 evidence pass**. Selection or unit tests do not establish capacity.
+
+New requested profiles record both `writer_topology` and
+`writer_topology_version=writer-topology-v1`, including the explicit default.
+Legacy profiles resolve to four only when both fields are absent, preserving
+their original serialized shape and digest semantics. If either field is
+present, both must validate; unknown IDs, partial pairs, wrong versions or a
+different selection in a dependent profile fail admission. The selection is
+frozen in `writer-topology.json` and jointly validated with the consumer profile
+before environment loading, services or database setup. The workflow runs the
+standard-library topology helpers immediately after checkout, before Python
+setup. The existing runner hardware/runtime admission follows Python setup and
+still precedes dependency installation or Docker. Function profiling ON with
+`writers-6` is rejected before setup; its four-writer
+attribution scope is not expanded. Runtime diagnostics remain an independent
+predeclared choice.
+
+Let `L` be four or six from that admitted profile. Requested, execution, consumer,
+business-lane, origin and process-resource evidence must agree on `L`; the
+consumer profile's existing `writer_lanes` field now records this selected
+count. Consumer membership remains independently frozen. Six writers may compose
+with either `single` or `notification-dual`, without changing publisher count,
+consumer group membership, inventory partitions or per-record synchronous ACK.
+Each applicable native diagnostic sample must cover every selected generator,
+including `generator-4` and `generator-5` for six. Optional thread observations
+use the same selected `paced-business-lane-0..L-1` role set. A missing extra lane,
+shrunk observer profile, reused identity or incomplete close/reap/session proof
+cannot become complete numeric coverage.
+
+The capacity request remains one global 50/s on the same native
+four-logical-CPU runner and original effective service limits. A 3,000-command
+probe must finish within the original inclusive 63 seconds and retain 3,000
+complete durable latency samples per logical consumer, p95 <=5s and p99 <=15s.
+Exact effects, security, accounting, fault, cleanup and full-tier gates remain
+unchanged. Correctness smoke at global 10/s cannot qualify 50/s capacity. The
+following is a request template for the reviewed implementation, not an executed
+or passing result; `reviewed-ref` must identify that exact source:
+
+```sh
+gh workflow run events-validation.yml --repo GU2thousand/labops-erp --ref reviewed-ref \
+  -f tier=smoke -f events=3000 -f rate=50 -f duration=60 -f fault_repetitions=1 \
+  -f runner_arch=arm64 -f writer_topology=writers-6 -f consumer_topology=notification-dual \
+  -f runtime_diagnostics=true -f diagnostic_profile=false
+```
+
+The corresponding acceptance CLI selection is `--writer-topology writers-6`
+with `--consumer-topology notification-dual`; all original numeric, outage and drain
+arguments remain explicit for the requested tier. Returning to four requires a
+new explicit invocation and its own evidence. Never relabel a failed six-writer
+run, change its denominator or carry earlier-source results to this candidate.
+
 ## Frozen consumer topology
 
 `--consumer-topology` accepts `single` (default) or the explicit
 `notification-dual` preset. `consumer-topology.json` freezes profile version
 `consumer-topology-v1` before environment/setup; the workflow freezes it before
-services. Both presets keep four writers, one publisher, one analytics member
-and the existing three inventory partitions. The dual preset starts
+services. Both presets compose the selected writer count `L` with one publisher,
+one analytics member and the existing three inventory partitions. The dual preset
+starts
 `notification` and `notification-1` in the same existing notification group.
 Production consumption retains one durable database transaction followed by an
 immediate synchronous offset commit for each record. Function profiling ON with
@@ -292,8 +351,8 @@ and broker coordinate, retaining process/log provenance. Worker count does not
 change effect or latency denominators; a delivery log still precedes ACK and
 cannot replace committed-offset evidence.
 
-The dual preset is a new topology candidate, currently unexecuted and without a
-capacity claim. The preceding `single` capacity
+The dual preset requires its own executed evidence and supplies no capacity
+claim for a newly selected writer profile. The preceding `single` capacity
 [run 36486112533](https://github.com/GU2thousand/labops-erp/actions/runs/36486112533)
 at `cc4569ac` remains **FAIL**: 3,000 commands took 75.694751744 seconds
 (39.632866624/s), and notification p95 was 8.656019926 seconds. A fresh unprofiled
@@ -307,24 +366,49 @@ code gain, independent-host HA or production release.
 
 ## Frozen business execution profile and known results
 
-Before environment/setup, the CLI freezes an automatic selection policy:
-capacity-scenario batches of **512 or more commands** use exactly four fresh
-`spawn` children (`spawn-lanes-v1`); smaller capacity batches use the existing
-four thread lanes (`parallel-lanes-v1`). Thus 512/3,000-command probes and full
+Before environment/setup, the CLI freezes the selected writer topology and an
+automatic execution policy: capacity-scenario batches of **512 or more commands**
+use exactly `L` fresh `spawn` children (`spawn-lanes-v1`); smaller capacity batches
+use `L` FIFO thread lanes (`parallel-lanes-v1`). Thus 512/3,000-command probes and
+full
 90,000 steady/30,000 fault inputs select spawn; default 60-command steady and
-20-command fault inputs retain threads. The hosted spawn probe at `605c9d3`
-failed: 3,000 commands took 93.519 seconds (32.079/s), with analytics p99
-18.297 seconds and notification p99 25.105 seconds. All 3,000 original events
-and both consumers completed with exact effects and no ledger mismatch; this
-does not satisfy the rate or latency gates. Both modes have four FIFO worker lanes,
-each with queue capacity four. Assign an entire
-four-command cycle to lane `(global_index//4)%4`; command kind follows
+20-command fault inputs retain threads. Both modes have `L` FIFO worker lanes,
+each with queue capacity four, and one global output/IPC credit limit of 16.
+Input queue slots total 16 for four lanes or 24 for six; output credits do not
+increase with writer count. Assign an entire
+four-command cycle to lane `(global_index//4)%L`; command kind follows
 `global_index%4` as receipt, issue, transfer, reversal. Each complete cycle retains
 that exact mix and its own batch/issue state. Global indices and lane state persist
 across batches. Small fault fixtures explicitly use serial execution with the
 same global-index/lane mapping, identified as `serial_fault_fixture` in their
 workload result. A small drill may split a cycle across calls; its persistent lane
 state completes the original cycle rather than resetting the command mix.
+
+Spawn result frames retain the existing 60,000-byte protocol limit and carry
+complete cleanup metadata in one atomic datagram. Before spawning, both owned
+socket endpoints use per-socket send capacity 60,000 bytes and receive capacity
+120,000 bytes, with both endpoints registered for cleanup before option setup.
+This corrects a harness transport mismatch: the first local six-writer PostgreSQL
+regression's 48-command spawn batch committed all 48 but failed to deliver cleanup
+receipts; its later continuation was unreached. The mixed-mode test committed
+transfer 26 and cancelled reversal 27. Retained sequence numbers and finalized journals locate the failure
+after owning cleanup returned; the exact failed frame and errno were not captured.
+A separate native macOS synthetic probe observed default 2,048-byte send and
+4,096-byte receive buffers, `EMSGSIZE` for a 4,096-byte send, and exact 4,096- and
+60,000-byte round trips with the configured buffers. Receive capacity 60,000 alone
+failed that boundary probe, so the bounded 120,000-byte receive setting includes
+datagram/address overhead. The probe changed no global kernel setting and does
+not establish database, workload or capacity acceptance. The same 16 global
+output credits, four input slots per lane, service CPU/memory limits and required
+close/reap/session checks remain. See
+[Apple's socket buffer options](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setsockopt.2.html)
+and [XNU's local datagram buffer implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c).
+
+The historical four-writer spawn probe at `605c9d3` failed: 3,000 commands took
+93.519 seconds (32.079/s), with analytics p99 18.297 seconds and notification p99
+25.105 seconds. All 3,000 original events and both consumers completed with exact
+effects and no ledger mismatch; this does not satisfy the rate or latency gates
+and is not evidence for the six-writer candidate.
 
 Each lane uses independent project, task, approved material request, purchase
 order and order-line records created through the ordinary application services.
@@ -335,16 +419,28 @@ shared read-only; business aggregates and per-cycle batch balances belong to
 their lane. `business-lane-topology.json` records the actual project/task/order/
 order-line IDs, shared context and lock scope.
 
-One scheduler applies the requested **global** rate. At 50/s, 12.5/s per lane is a
-nominal average, not four independent 50/s schedulers or a 200/s workload. Bounded
+Increasing `L` creates more legal project/task/order/order-line fixtures and
+distributes posted receipt history and same-order work over more aggregates.
+Each lane retains the original ordered quantity formula
+`(events + fault_events*4 + fault_repetitions*20 + 1000)*4`; it is not divided
+by `L`. Shared actor/item/warehouses and receipt/issue/transfer/reversal quantities
+remain unchanged. This changes data, contention, total ordered ceiling and
+connection/setup footprint. A passing six-writer run would qualify that declared
+profile; comparing it with four does not isolate a pure concurrency gain. No
+CPU, SQL, ACK or throughput improvement is forecast.
+
+One scheduler applies the requested **global** rate once. At 50/s, `50/L` per lane
+is nominal metadata (12.5/s for four, approximately 8.333/s for six), not an
+independent pacing clock in each child. Bounded
 queues apply backpressure; each queue's four slots exclude its in-flight command.
 For each capacity batch, elapsed starts before lane-batch or spawn-plan setup and
 includes actual business commits/observations, owning database close and worker
 completion. Threads include joins; spawn additionally includes spawn/init, origin
 persistence, reaping and PostgreSQL session settlement. Enabled diagnostic discovery and cleanup also consume that
-same clock. Spawn pacing begins after all four READY handshakes; readiness
+same clock. Spawn pacing begins after all `L` READY handshakes; readiness
 overhead still consumes the unchanged completion window. Initial shared business
-fixture setup precedes this clock and is excluded. Report completed commands divided by that elapsed time and
+fixture setup precedes this clock and is excluded; record its increased cost
+separately for the new profile. Report completed commands divided by that elapsed time and
 the corresponding schedule lateness. Enqueuing 50 commands/s alone cannot pass
 the frozen generation-rate gate.
 
@@ -463,16 +559,19 @@ evidence at their frozen denominators and clock boundaries.
 
 ### Measurement-only capacity diagnosis
 
-An explicitly enabled bounded diagnostic keeps the selected four lanes, queue capacity four, legal
-business services/locks, global 50/s target and 5% completion-window gate. A
+An explicitly enabled bounded diagnostic keeps the selected writer topology,
+queue capacity four, legal business services/locks, global 50/s target and 5%
+completion-window gate. A
 512-event request is a diagnostic input, not the 90,000-event acceptance target.
 It may fail the rate gate and still retain useful raw measurements. A diagnostic
 does not qualify a slower input rate as 50/s or establish long-run capacity.
 
 The independent `--diagnostic-profile` opt-in and workflow `diagnostic_profile`
 input default to false; the existing runtime diagnostics policy is unchanged.
-A manual 512-command request at 50/s uses the normal four spawn lanes and queue
-capacity four. Enabling profiling always sets `qualification_admissible=false`,
+A manual 512-command function-profile request at 50/s uses the default four spawn
+lanes and queue capacity four; a nondefault writer or consumer profile with
+function profiling ON is rejected before setup. Enabling profiling always sets
+`qualification_admissible=false`,
 even if business/count/rate/latency gates pass or profiling errors trigger a
 fallback. Profile startup, export, cleanup and join consume the elapsed clock;
 each generator must persist its required profile before owning database cleanup
@@ -630,9 +729,10 @@ For each run write a new unique directory and preserve failures as well as passe
 
 ```text
 evidence/<run-id>/
-  requested-profile.json   # exclusively created numeric request before env/setup
-  generation-execution-profile.json # frozen lane/cycle/queue/rate execution model
-  consumer-topology.json   # exclusively frozen preset/member/partition/ACK contract
+  requested-profile.json   # numeric request and writer ID/version before env/setup
+  writer-topology.json     # exclusively frozen writer preset/version/L/constraints
+  generation-execution-profile.json # frozen selected lanes/cycle/queue/rate model
+  consumer-topology.json   # preset/member/partition/ACK contract and selected writer_lanes
   worker-processes.jsonl   # role/generation/PID/start/client/log/delivery/metrics identity
   consumer-pool-readiness.jsonl # exact owned STABLE assignment and live-process proof
   group-assignment-observations.jsonl # raw membership, failures and deadline outcomes
@@ -691,7 +791,9 @@ harness. A startup failure therefore retains its original request and marks the
 database as unobserved. Never derive requested counts from `events.jsonl`, completed
 effects or whichever scenarios happened to run.
 
-The execution profile is likewise frozen before environment/setup. Actual lane
+The execution profile is likewise frozen before environment/setup. New requests
+retain both validated writer ID/version fields across dependent profiles; only
+an absent legacy pair resolves to default four. Actual lane
 and per-batch topology evidence must match that profile; generation completion
 and the final report include all topology pass/failure outcomes. The package
 retains a failed or partial schedule, not just successful event-log entries.

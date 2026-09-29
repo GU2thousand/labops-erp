@@ -5,16 +5,24 @@ from pathlib import Path
 import re
 
 
+if __package__:
+    from .writer_topology import DEFAULT_WRITER_PRESET, WRITER_PRESETS, writer_profile
+else:
+    from writer_topology import DEFAULT_WRITER_PRESET, WRITER_PRESETS, writer_profile
+
+
 PRESETS = ('single', 'notification-dual')
 DEFAULT_PRESET = 'single'
 
 
-def topology_profile(preset=DEFAULT_PRESET, *, diagnostic_profile=False):
+def topology_profile(preset=DEFAULT_PRESET, *, diagnostic_profile=False,
+                     writer_topology=DEFAULT_WRITER_PRESET):
     if preset not in PRESETS or type(diagnostic_profile) is not bool:
         raise ValueError('Invalid consumer topology request')
     if diagnostic_profile and preset != DEFAULT_PRESET:
         raise ValueError('Nondefault consumer topology requires function profiling OFF')
-    return {'version': 'consumer-topology-v1', 'preset': preset, 'writer_lanes': 4,
+    writers = writer_profile(writer_topology, diagnostic_profile=diagnostic_profile)
+    return {'version': 'consumer-topology-v1', 'preset': preset, 'writer_lanes': writers['lanes'],
         'publisher_members': 1, 'notification_members': 2 if preset == 'notification-dual' else 1,
         'analytics_members': 1, 'inventory_partitions': 3,
         'ack_policy': 'original per-record durable database transaction then immediate synchronous offset commit',
@@ -33,8 +41,9 @@ def worker_roles(preset=DEFAULT_PRESET):
     return ('publisher', *consumer_roles('notification', preset), 'analytics', 'retry', 'dlq')
 
 
-def freeze_topology(path, run_id, preset=DEFAULT_PRESET, *, diagnostic_profile=False):
-    profile = topology_profile(preset, diagnostic_profile=diagnostic_profile)
+def freeze_topology(path, run_id, preset=DEFAULT_PRESET, *, diagnostic_profile=False,
+                    writer_topology=DEFAULT_WRITER_PRESET):
+    profile = topology_profile(preset, diagnostic_profile=diagnostic_profile, writer_topology=writer_topology)
     value = {'run_id': run_id, **profile}
     path = Path(path)
     if path.exists():
@@ -92,12 +101,13 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preset', choices=PRESETS, default=DEFAULT_PRESET)
+    parser.add_argument('--writer-topology', choices=WRITER_PRESETS, default=DEFAULT_WRITER_PRESET)
     parser.add_argument('--diagnostic-profile', choices=('true', 'false'), default='false')
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     try:
         freeze_topology(args.output, args.run_id, args.preset,
-                        diagnostic_profile=args.diagnostic_profile == 'true')
+                        diagnostic_profile=args.diagnostic_profile == 'true', writer_topology=args.writer_topology)
     except ValueError as error:
         parser.error(str(error))

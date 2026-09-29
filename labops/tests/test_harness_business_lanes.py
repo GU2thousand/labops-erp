@@ -8,6 +8,7 @@ from decimal import Decimal
 import io
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -29,21 +30,30 @@ from labops.purchasing.services import received_qty
 class ObservedConnections:
     """Observe the real thread-local close without replacing database work."""
 
-    def __init__(self):
+    def __init__(self, *, record_backend_identity=False):
         self.closed = []
         self.lock = threading.Lock()
+        self.record_backend_identity = record_backend_identity
 
     def close_all(self):
         wrapper = connections['default']
         current = threading.current_thread()
+        raw_connection = wrapper.connection
         before = {
             'thread': current,
             'thread_id': current.ident,
             'wrapper_id': id(wrapper),
             'wrapper': wrapper,
-            'backend_pid': wrapper.connection.info.backend_pid,
+            'backend_pid': raw_connection.info.backend_pid if raw_connection else None,
             'in_atomic_block': wrapper.in_atomic_block,
         }
+        if self.record_backend_identity:
+            before['backend_start'] = None
+            if raw_connection is not None:
+                with wrapper.cursor() as cursor:
+                    cursor.execute('SELECT backend_start FROM pg_stat_activity WHERE pid = %s',
+                                   [before['backend_pid']])
+                    before['backend_start'] = cursor.fetchone()[0]
         connections.close_all()
         before['connection_closed'] = wrapper.connection is None
         with self.lock:
@@ -58,15 +68,44 @@ class HarnessBusinessLaneTests(TransactionTestCase):
         # classes. Restore the same singleton required by legal opening stock.
         models.RuntimeState.objects.get_or_create(pk=1)
 
-    def make_harness(self, directory):
+    def writer_evidence_directory(self, name):
+        supplied = os.environ.get('LABOPS_WRITER_PROOF_EVIDENCE')
+        if supplied:
+            directory = Path(supplied) / name
+            directory.mkdir(parents=True, exist_ok=False)
+            return directory
+        temporary = tempfile.TemporaryDirectory(prefix='labops-' + name + '-')
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name)
+
+    def make_harness(self, directory, *, writer_topology=None,
+                     writer_topology_version=None, event_count=32):
         harness = object.__new__(Harness)
         harness.args = SimpleNamespace(
-            run_id='lanes-pg-integration', events=32, rate=1000.0, duration=0.0,
+            run_id='lanes-pg-integration', events=event_count, rate=1000.0, duration=0.0,
             fault_repetitions=1, fault_events=4, duplicate_events=1,
             poison_events=1, broker_fault_seconds=1.0, outage_seconds=1.0,
             consumer_outage_seconds=1.0, drain_timeout=900.0,
             evidence_dir=directory, generated_dir=directory, tier='smoke',
         )
+        if writer_topology is not None:
+            harness.args.writer_topology = writer_topology
+        if writer_topology_version is not None:
+            harness.args.writer_topology_version = writer_topology_version
+        if writer_topology is not None:
+            lane_count = harness.writer_lanes
+            profile = {'scope': 'real PostgreSQL thread fixture below the CLI capacity threshold',
+                'writer_topology': writer_topology, 'writer_topology_version': writer_topology_version,
+                'lane_count': lane_count, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+                'generator_topology': 'parallel-lanes-v1', 'process_generation': False,
+                'generation_counts': [lane_count * 8, 2, lane_count * 4 - 2],
+                'generation_modes': ['threads', 'serial', 'threads'],
+                'capacity_target_proven': False, 'kafka_publication_proven': False}
+            with (directory / 'fixture-execution-profile.json').open('x') as output:
+                json.dump(profile, output, sort_keys=True)
+                output.write('\n')
+                output.flush()
+                os.fsync(output.fileno())
         harness.evidence = directory
         harness.generation = GenerationJournal(
             directory, harness.args.run_id, numeric_profile(harness.args))
@@ -79,7 +118,7 @@ class HarnessBusinessLaneTests(TransactionTestCase):
         harness.settings = settings
         harness.call_command = call_command
         harness.connection = connection  # Resolves the owning lane's real wrapper.
-        harness.connections = ObservedConnections()
+        harness.connections = ObservedConnections(record_backend_identity=writer_topology is not None)
         harness.models, harness.api, harness.services = models, events, services
         harness.admin = models.User.objects.get(email='admin@labops.local')
         harness.reviewer = models.User.objects.get(email='reviewer@labops.local')
@@ -90,7 +129,8 @@ class HarnessBusinessLaneTests(TransactionTestCase):
         harness.batch = models.Batch.objects.filter(item__is_active=True).order_by('created_at').first()
         return harness
 
-    def assert_business_cycles(self, harness, movements, cycles=2):
+    def assert_business_cycles(self, harness, movements, cycles=2, *, lane_count=4):
+        self.assertEqual(len(harness.business_lanes), lane_count)
         batches = set()
         for lane, data in enumerate(harness.business_lanes):
             with self.subTest(lane=lane):
@@ -103,7 +143,7 @@ class HarnessBusinessLaneTests(TransactionTestCase):
                 self.assertEqual(received_qty(data['order_line']), Decimal(4 * cycles))
                 self.assertIsNone(data['cycle_issue'])
                 lane_batches = set()
-                for receipt_index in (lane * 4 + cycle * 16 for cycle in range(cycles)):
+                for receipt_index in (lane * 4 + cycle * lane_count * 4 for cycle in range(cycles)):
                     receipt, issue, transfer, reversal = (
                         movements[receipt_index + offset] for offset in range(4))
                     self.assertEqual(receipt.type, 'RECEIPT')
@@ -145,20 +185,133 @@ class HarnessBusinessLaneTests(TransactionTestCase):
                 self.assertEqual(len(lane_batches), cycles)
                 self.assertTrue(batches.isdisjoint(lane_batches))
                 batches.update(lane_batches)
-        self.assertEqual(len(batches), 4 * cycles)
+        self.assertEqual(len(batches), lane_count * cycles)
         return batches
 
+    def assert_closed_thread_sessions(self, observations, main_backend_pid):
+        self.assertTrue(all(row['connection_closed'] and not row['in_atomic_block']
+                            and not row['thread'].is_alive() for row in observations))
+        identities = [(row['backend_pid'], row['backend_start']) for row in observations
+                      if row['backend_pid'] is not None]
+        self.assertNotIn(main_backend_pid, {pid for pid, _start in identities})
+        self.assertTrue(all(start is not None for _pid, start in identities))
+        queries = []
+        with connection.cursor() as cursor:
+            for pid, backend_start in identities:
+                sql = 'SELECT count(*) FROM pg_stat_activity WHERE pid = %s AND backend_start = %s'
+                cursor.execute(sql, [pid, backend_start])
+                actual_count = cursor.fetchone()[0]
+                queries.append({'sql': sql, 'parameters': [pid, backend_start.isoformat()],
+                                'actual_count': actual_count})
+                self.assertEqual(actual_count, 0)
+        return queries
+
+    def write_writer_business_proof(self, directory, harness, movements, ids, *, modes,
+                                    generation_counts, baseline_movements, session_queries,
+                                    process_batches=(), continuity=()):
+        # These rows are queried from the real transaction database after both
+        # original and duplicate deliveries; they are not synthetic totals.
+        with connection.cursor() as cursor:
+            sql = 'SELECT pg_backend_pid(), current_database()'
+            cursor.execute(sql)
+            parent_identity = cursor.fetchone()
+        outbox = models.OutboxEvent.objects.filter(pk__in=ids).order_by('id')
+        batches = {str(batch_id) for row in movements.values()
+                   for batch_id in row.lines.values_list('batch_id', flat=True)}
+        rows = {
+            'fixture_scope': 'real PostgreSQL commands and effects; no Kafka publication or capacity qualification',
+            'writer_topology': harness.args.writer_topology,
+            'writer_topology_version': harness.args.writer_topology_version,
+            'lane_count': len(harness.business_lanes),
+            'actual_command_count': len(harness.events),
+            'actual_per_kind': dict(Counter(item['kind'] for item in harness.events)),
+            'actual_per_lane': dict(Counter(item['business_lane'] for item in harness.events)),
+            'parent_process_pid': os.getpid(),
+            'parent_identity_query': {'sql': sql, 'actual_row': list(parent_identity)},
+            'modes': list(modes), 'generation_counts': list(generation_counts),
+            'baseline_movement_count': baseline_movements,
+            'actual_movement_count': models.StockMovement.objects.count(),
+            'events': harness.events,
+            'generation_topologies': harness.generation_topologies,
+            'unfinished_cycle_continuity': list(continuity),
+            'business_lanes': [{'lane': lane, **{key + '_id': str(data[key].id)
+                                for key in ('project', 'task', 'order', 'order_line')},
+                                'cycle_issue_id': str(data['cycle_issue'].id) if data['cycle_issue'] else None,
+                                'batch_id': str(data['batch'].id) if data['batch'] else None}
+                               for lane, data in enumerate(harness.business_lanes)],
+            'projects': list(models.Project.objects.filter(pk__in=[data['project'].id for data in harness.business_lanes])
+                             .order_by('id').values('id', 'status')),
+            'tasks': list(models.Task.objects.filter(pk__in=[data['task'].id for data in harness.business_lanes])
+                          .order_by('id').values('id', 'status', 'project_id', 'assignee_id')),
+            'orders': list(models.PurchaseOrder.objects.filter(pk__in=[data['order'].id for data in harness.business_lanes])
+                           .order_by('id').values('id', 'status')),
+            'order_lines': list(models.OrderLine.objects.filter(pk__in=[data['order_line'].id for data in harness.business_lanes])
+                                .order_by('id').values('id', 'order_id', 'qty')),
+            'receipts': list(models.Receipt.objects.filter(order_id__in=[data['order'].id for data in harness.business_lanes])
+                             .order_by('id').values('id', 'order_id', 'status')),
+            'receipt_lines': list(models.ReceiptLine.objects.filter(order_line_id__in=[data['order_line'].id for data in harness.business_lanes])
+                                  .order_by('id').values('id', 'receipt_id', 'order_line_id', 'batch_id', 'warehouse_id', 'qty')),
+            'movements': list(models.StockMovement.objects.filter(pk__in=[row.id for row in movements.values()])
+                              .order_by('id').values('id', 'type', 'status', 'idempotency_key',
+                                                     'request_hash', 'receipt_id', 'reversal_of_id')),
+            'movement_lines': list(models.StockMovementLine.objects.filter(movement_id__in=[row.id for row in movements.values()])
+                                   .order_by('id').values('id', 'movement_id', 'batch_id', 'warehouse_id',
+                                                          'task_id', 'delta_qty', 'receipt_line_id',
+                                                          'reversal_of_line_id', 'transfer_pair_no')),
+            'outbox': list(outbox.values('id', 'event_type', 'aggregate_id', 'status', 'payload_hash')),
+            'consumer_markers': list(models.ProcessedEvent.objects.filter(event_id__in=ids)
+                                   .order_by('consumer_name', 'event_id')
+                                   .values('consumer_name', 'event_id', 'payload_hash')),
+            'notifications': list(models.Notification.objects.filter(event_id__in=ids)
+                                 .order_by('event_id', 'user_id').values('event_id', 'user_id', 'title')),
+            'balances': list(models.StockBalance.objects.filter(batch_id__in=batches)
+                             .order_by('batch_id', 'warehouse_id').values('batch_id', 'warehouse_id', 'on_hand_qty')),
+            'projections': list(models.InventoryProjection.objects.filter(batch_id__in=batches)
+                                .order_by('batch_id', 'warehouse_id').values('batch_id', 'warehouse_id', 'quantity')),
+            'actual_snapshot_after_duplicates': harness.snapshot(ids),
+            'actual_reconciliation': services.reconcile(),
+            'owned_thread_close_observations': [
+                {key: value for key, value in row.items() if key not in ('thread', 'wrapper')}
+                | {'thread_name': row['thread'].name, 'thread_alive': row['thread'].is_alive(),
+                   'wrapper_connection_is_none': row['wrapper'].connection is None}
+                for row in getattr(harness.connections, 'closed', ())],
+            'owned_session_absence_queries': session_queries,
+            'process_batches': list(process_batches),
+        }
+        with (directory / 'writer-business-proof.json').open('x') as output:
+            json.dump(rows, output, indent=2, sort_keys=True, default=str)
+            output.write('\n')
+            output.flush()
+            os.fsync(output.fileno())
+
     def test_four_lanes_commit_real_commands_and_preserve_consumer_effects(self):
-        temporary = tempfile.TemporaryDirectory(prefix='labops-real-lanes-')
-        self.addCleanup(temporary.cleanup)
-        directory = Path(temporary.name)
+        self.exercise_business_lanes()
+
+    def test_six_lanes_commit_real_commands_and_preserve_consumer_effects(self):
+        self.exercise_business_lanes(lane_count=6, writer_topology='writers-6',
+                                     writer_topology_version='writer-topology-v1')
+
+    def exercise_business_lanes(self, *, lane_count=4, writer_topology=None,
+                                writer_topology_version=None):
+        first_count = lane_count * 8
+        continued_count = lane_count * 4 - 2
+        total = lane_count * 12
+        if writer_topology is None:
+            temporary = tempfile.TemporaryDirectory(prefix='labops-real-lanes-')
+            self.addCleanup(temporary.cleanup)
+            directory = Path(temporary.name)
+        else:
+            directory = self.writer_evidence_directory('six-thread')
         # Commit the demo and ledger-derived baseline before enabling Kafka
         # outbox mode; worker connections must be able to see these records.
         with override_settings(EVENT_TRANSPORT='local'):
             output = io.StringIO()
             call_command('seed_demo', stdout=output)
             call_command('rebuild_inventory_projection', stdout=output)
-        harness = self.make_harness(directory)
+        harness = (self.make_harness(directory) if writer_topology is None else
+                   self.make_harness(directory, writer_topology=writer_topology,
+                                     writer_topology_version=writer_topology_version,
+                                     event_count=first_count))
         self.assertEqual(harness.snapshot()['mismatches'], [])
         baseline_movements = models.StockMovement.objects.count()
         self.assertEqual(models.OutboxEvent.objects.filter(transport='kafka').count(), 0)
@@ -171,25 +324,25 @@ class HarnessBusinessLaneTests(TransactionTestCase):
         with override_settings(EVENT_TRANSPORT='kafka'):
             harness.prepare_order()
             for key in ('project', 'task', 'order', 'order_line'):
-                self.assertEqual(len({data[key].id for data in harness.business_lanes}), 4)
-            ids, workload = harness.generate(32, 'steady', rate=1000.0)
+                self.assertEqual(len({data[key].id for data in harness.business_lanes}), lane_count)
+            ids, workload = harness.generate(first_count, 'steady', rate=1000.0)
 
-        self.assertEqual(workload['input'], 32)
-        self.assertEqual(workload['completed_commands'], 32)
+        self.assertEqual(workload['input'], first_count)
+        self.assertEqual(workload['completed_commands'], first_count)
         self.assertEqual(workload['generator_topology'], 'parallel-lanes-v1')
-        self.assertEqual(workload['lane_count'], 4)
+        self.assertEqual(workload['lane_count'], lane_count)
         self.assertEqual(workload['queue_capacity_per_lane'], 4)
         self.assertEqual(workload['target_rate'], 1000.0)
-        self.assertEqual(len(ids), 32)
-        self.assertEqual(len(set(ids)), 32)
-        self.assertEqual([item['global_index'] for item in harness.events], list(range(32)))
+        self.assertEqual(len(ids), first_count)
+        self.assertEqual(len(set(ids)), first_count)
+        self.assertEqual([item['global_index'] for item in harness.events], list(range(first_count)))
         self.assertEqual([item['event_id'] for item in harness.events], ids)
         self.assertEqual(Counter(item['kind'] for item in harness.events),
-                         {'RECEIPT': 8, 'ISSUE': 8, 'TRANSFER': 8, 'REVERSAL': 8})
+                         {kind: lane_count * 2 for kind in ('RECEIPT', 'ISSUE', 'TRANSFER', 'REVERSAL')})
         self.assertEqual(Counter(item['business_lane'] for item in harness.events),
-                         {0: 8, 1: 8, 2: 8, 3: 8})
+                         {lane: 8 for lane in range(lane_count)})
         for item in harness.events:
-            self.assertEqual(item['business_lane'], (item['global_index'] // 4) % 4)
+            self.assertEqual(item['business_lane'], (item['global_index'] // 4) % lane_count)
             self.assertEqual(item['scenario'], 'steady')
             self.assertTrue(str(item['insert_transaction_xid']).isdigit())
             self.assertGreater(item['payload_bytes'], 0)
@@ -202,37 +355,37 @@ class HarnessBusinessLaneTests(TransactionTestCase):
                 self.assertIsNone(committed_at)
 
         outbox = list(models.OutboxEvent.objects.filter(transport='kafka'))
-        self.assertEqual(len(outbox), 32)
+        self.assertEqual(len(outbox), first_count)
         self.assertEqual({str(row.id) for row in outbox}, set(ids))
         self.assertTrue(all(row.event_type.startswith('inventory.') for row in outbox))
         self.assertTrue(all(row.status == 'PENDING' and row.payload_hash for row in outbox))
         movement_ids = {item['movement_id'] for item in harness.events}
-        self.assertEqual(len(movement_ids), 32)
+        self.assertEqual(len(movement_ids), first_count)
         self.assertEqual({str(row.aggregate_id) for row in outbox}, movement_ids)
-        self.assertEqual(models.StockMovement.objects.count(), baseline_movements + 32)
+        self.assertEqual(models.StockMovement.objects.count(), baseline_movements + first_count)
         movements = {item['global_index']: models.StockMovement.objects.get(pk=item['movement_id'])
                      for item in harness.events}
         self.assertEqual({row.idempotency_key for row in movements.values()},
-                         {f'{harness.args.run_id}:{index}' for index in range(32)})
-        self.assert_business_cycles(harness, movements)
+                         {f'{harness.args.run_id}:{index}' for index in range(first_count)})
+        self.assert_business_cycles(harness, movements, lane_count=lane_count)
 
         summary = harness.generation.summary()
         self.assertEqual(summary['totals'], {
-            'requested': 32, 'attempted': 32, 'committed': 32,
+            'requested': first_count, 'attempted': first_count, 'committed': first_count,
             'failed_before_commit': 0, 'post_commit_observation_failed': 0,
-            'identified_events': 32, 'unattempted': 0,
+            'identified_events': first_count, 'unattempted': 0,
             'pending_before_commit': 0, 'pending_observation': 0,
         })
-        self.assertEqual(len(summary['batches']), 4)
+        self.assertEqual(len(summary['batches']), lane_count)
         self.assertTrue(all(batch['requested'] == batch['committed'] == 8
                             and batch['status'] == 'succeeded' for batch in summary['batches']))
         attempts = harness.generation.committed_attempts()
-        self.assertEqual(len(attempts), 32)
+        self.assertEqual(len(attempts), first_count)
         self.assertEqual({item['event_id'] for item in attempts}, set(ids))
         self.assertEqual({item['movement_id'] for item in attempts}, movement_ids)
         journal = [json.loads(line) for line in harness.generation.journal_path.read_text().splitlines()]
-        self.assertEqual(Counter(row['action'] for row in journal)['command_committed'], 32)
-        self.assertEqual(Counter(row['action'] for row in journal)['event_identified'], 32)
+        self.assertEqual(Counter(row['action'] for row in journal)['command_committed'], first_count)
+        self.assertEqual(Counter(row['action'] for row in journal)['event_identified'], first_count)
         self.assertEqual(json.loads(harness.generation.summary_path.read_text()), summary)
 
         observations = [json.loads(line) for line in
@@ -242,20 +395,20 @@ class HarnessBusinessLaneTests(TransactionTestCase):
         self.assertTrue(scheduling['worker_threads_joined'])
         self.assertTrue(scheduling['worker_completion_observed'])
         for field in ('scheduled_indices', 'started_indices', 'completed_indices'):
-            self.assertEqual(scheduling[field], list(range(32)))
+            self.assertEqual(scheduling[field], list(range(first_count)))
         self.assertEqual(scheduling['failed_count'], 0)
         self.assertEqual(scheduling['cancelled_count'], 0)
         self.assertEqual(scheduling['unscheduled_count'], 0)
         self.assertEqual(scheduling['lane_shutdowns'],
-                         [{'lane': lane, 'passed': True, 'error_type': None} for lane in range(4)])
+                         [{'lane': lane, 'passed': True, 'error_type': None} for lane in range(lane_count)])
         closed = harness.connections.closed
-        self.assertEqual(len(closed), 4)
+        self.assertEqual(len(closed), lane_count)
         for field in ('thread_id', 'wrapper_id', 'backend_pid'):
-            self.assertEqual(len({row[field] for row in closed}), 4)
+            self.assertEqual(len({row[field] for row in closed}), lane_count)
         self.assertTrue(all(row['connection_closed'] and not row['in_atomic_block']
                             and not row['thread'].is_alive() for row in closed))
         self.assertEqual({row['thread'].name for row in closed},
-                         {f'paced-business-lane-{lane}' for lane in range(4)})
+                         {f'paced-business-lane-{lane}' for lane in range(lane_count)})
         self.assertNotIn(main_pid, {row['backend_pid'] for row in closed})
         with connection.cursor() as cursor:
             cursor.execute('SELECT pg_backend_pid()')
@@ -267,38 +420,38 @@ class HarnessBusinessLaneTests(TransactionTestCase):
         with override_settings(EVENT_TRANSPORT='kafka'):
             serial_ids, serial_workload = harness.generate(2, 'fixture_serial', rate=1000.0)
             self.assertEqual(serial_workload['generator_topology'], 'serial_fault_fixture')
-            self.assertEqual([item['global_index'] for item in harness.events[-2:]], [32, 33])
+            self.assertEqual([item['global_index'] for item in harness.events[-2:]], [first_count, first_count + 1])
             original_issue = harness.business_lanes[0]['cycle_issue']
             original_batch = harness.business_lanes[0]['batch']
             self.assertIsNotNone(original_issue)
             self.assertEqual(str(original_issue.id), harness.events[-1]['movement_id'])
-            continued_ids, continued_workload = harness.generate(14, 'steady', rate=1000.0)
+            continued_ids, continued_workload = harness.generate(continued_count, 'steady', rate=1000.0)
         self.assertEqual(continued_workload['generator_topology'], 'parallel-lanes-v1')
-        self.assertEqual(continued_workload['completed_commands'], 14)
+        self.assertEqual(continued_workload['completed_commands'], continued_count)
         ids += serial_ids + continued_ids
-        self.assertEqual(len(ids), 48)
-        self.assertEqual(len(set(ids)), 48)
-        self.assertEqual([item['global_index'] for item in harness.events], list(range(48)))
+        self.assertEqual(len(ids), total)
+        self.assertEqual(len(set(ids)), total)
+        self.assertEqual([item['global_index'] for item in harness.events], list(range(total)))
         self.assertEqual([item['event_id'] for item in harness.events], ids)
         self.assertEqual(Counter(item['kind'] for item in harness.events),
-                         {'RECEIPT': 12, 'ISSUE': 12, 'TRANSFER': 12, 'REVERSAL': 12})
+                         {kind: lane_count * 3 for kind in ('RECEIPT', 'ISSUE', 'TRANSFER', 'REVERSAL')})
         self.assertEqual(Counter(item['business_lane'] for item in harness.events),
-                         {0: 12, 1: 12, 2: 12, 3: 12})
+                         {lane: 12 for lane in range(lane_count)})
         movements = {item['global_index']: models.StockMovement.objects.get(pk=item['movement_id'])
                      for item in harness.events}
-        self.assertEqual(movements[35].reversal_of_id, original_issue.id)
-        self.assertEqual(movements[34].lines.first().batch_id, original_batch.id)
+        self.assertEqual(movements[first_count + 3].reversal_of_id, original_issue.id)
+        self.assertEqual(movements[first_count + 2].lines.first().batch_id, original_batch.id)
         self.assertEqual({row.idempotency_key for row in movements.values()},
-                         {f'{harness.args.run_id}:{index}' for index in range(48)})
-        self.assertEqual(models.StockMovement.objects.count(), baseline_movements + 48)
+                         {f'{harness.args.run_id}:{index}' for index in range(total)})
+        self.assertEqual(models.StockMovement.objects.count(), baseline_movements + total)
         outbox = list(models.OutboxEvent.objects.filter(transport='kafka'))
-        self.assertEqual(len(outbox), 48)
+        self.assertEqual(len(outbox), total)
         self.assertEqual({str(row.id) for row in outbox}, set(ids))
         self.assertEqual({str(row.aggregate_id) for row in outbox},
                          {str(row.id) for row in movements.values()})
-        batches = self.assert_business_cycles(harness, movements, cycles=3)
-        for item in harness.events[32:]:
-            self.assertEqual(item['business_lane'], (item['global_index'] // 4) % 4)
+        batches = self.assert_business_cycles(harness, movements, cycles=3, lane_count=lane_count)
+        for item in harness.events[first_count:]:
+            self.assertEqual(item['business_lane'], (item['global_index'] // 4) % lane_count)
             committed_at = item['outbox_transaction_commit_at']
             if tracks_commits:
                 self.assertIsNotNone(committed_at)
@@ -309,16 +462,16 @@ class HarnessBusinessLaneTests(TransactionTestCase):
 
         final_summary = harness.generation.summary()
         for field in ('requested', 'attempted', 'committed', 'identified_events'):
-            self.assertEqual(final_summary['totals'][field], 48)
+            self.assertEqual(final_summary['totals'][field], total)
         for field in ('failed_before_commit', 'post_commit_observation_failed',
                       'unattempted', 'pending_before_commit', 'pending_observation'):
             self.assertEqual(final_summary['totals'][field], 0)
         self.assertEqual([batch['requested'] for batch in final_summary['batches']],
-                         [8, 8, 8, 8, 2, 2, 4, 4, 4])
+                         [8] * lane_count + [2, 2] + [4] * (lane_count - 1))
         self.assertTrue(all(batch['status'] == 'succeeded' for batch in final_summary['batches']))
         self.assertEqual(json.loads(harness.generation.summary_path.read_text()), final_summary)
         attempts = harness.generation.committed_attempts()
-        self.assertEqual(len(attempts), 48)
+        self.assertEqual(len(attempts), total)
         self.assertEqual({item['event_id'] for item in attempts}, set(ids))
         self.assertEqual({item['movement_id'] for item in attempts},
                          {str(row.id) for row in movements.values()})
@@ -328,28 +481,39 @@ class HarnessBusinessLaneTests(TransactionTestCase):
                      for row in journal if row['action'] == 'command_committed'}
         identified = {(row['batch_id'], row['attempt_id']): row['event_id']
                       for row in journal if row['action'] == 'event_identified'}
-        self.assertEqual(len(committed), 48)
-        self.assertEqual(len(identified), 48)
+        self.assertEqual(len(committed), total)
+        self.assertEqual(len(identified), total)
         self.assertEqual(committed.keys(), identified.keys())
+        if writer_topology is not None:
+            self.assertEqual(set(identified.values()), set(ids))
+            self.assertEqual(set(committed.values()), {str(row.id) for row in movements.values()})
+            attempted = {(row['batch_id'], row['attempt_id'])
+                         for row in journal if row['action'] == 'command_attempted'}
+            self.assertEqual(Counter(row['action'] for row in journal)['command_attempted'], total)
+            self.assertEqual(attempted, committed.keys())
         actual_event_movements = {str(row.id): str(row.aggregate_id) for row in outbox}
         for attempt_key, eid in identified.items():
             self.assertEqual(actual_event_movements[eid], committed[attempt_key])
-        self.assertEqual(Counter(row['action'] for row in journal)['batch_succeeded'], 9)
+        self.assertEqual(Counter(row['action'] for row in journal)['batch_succeeded'], lane_count * 2 + 1)
         second_observations = [json.loads(line) for line in
                                (directory / 'generation-schedule-002.jsonl').read_text().splitlines()]
         second_summary = next(row for row in second_observations if row['kind'] == 'summary')
         self.assertTrue(second_summary['passed'])
         self.assertTrue(second_summary['worker_threads_joined'])
         self.assertTrue(second_summary['worker_completion_observed'])
-        self.assertEqual(second_summary['completed_indices'], list(range(34, 48)))
+        self.assertEqual(second_summary['completed_indices'], list(range(first_count + 2, total)))
         self.assertEqual(second_summary['lane_shutdowns'],
-                         [{'lane': lane, 'passed': True, 'error_type': None} for lane in range(4)])
-        self.assertEqual(len(harness.connections.closed), 8)
-        continued_closed = harness.connections.closed[4:]
+                         [{'lane': lane, 'passed': True, 'error_type': None} for lane in range(lane_count)])
+        self.assertEqual(len(harness.connections.closed), lane_count * 2)
+        continued_closed = harness.connections.closed[lane_count:]
         for field in ('thread_id', 'wrapper_id', 'backend_pid'):
-            self.assertEqual(len({row[field] for row in continued_closed}), 4)
+            self.assertEqual(len({row[field] for row in continued_closed}), lane_count)
         self.assertTrue(all(row['connection_closed'] and not row['in_atomic_block']
                             and not row['thread'].is_alive() for row in continued_closed))
+
+        session_queries = []
+        if writer_topology is not None:
+            session_queries = self.assert_closed_thread_sessions(harness.connections.closed, main_pid)
 
         for consumer in ('notification', 'analytics'):
             for eid in ids:
@@ -362,8 +526,8 @@ class HarnessBusinessLaneTests(TransactionTestCase):
                              {harness.source.id: Decimal('3'), harness.target.id: Decimal('1')})
         after = harness.snapshot(ids)
         self.assertEqual(after['mismatches'], [])
-        self.assertEqual(after['dedupe_count'], 96)
-        self.assertEqual(after['consumer_counts'], {'notification': 48, 'analytics': 48})
+        self.assertEqual(after['dedupe_count'], total * 2)
+        self.assertEqual(after['consumer_counts'], {'notification': total, 'analytics': total})
         self.assertGreater(after['expected_notification_count'], 0)
         self.assertEqual(after['notification_count'], after['expected_notification_count'])
         self.assertEqual(models.FailedDelivery.objects.count(), 0)
@@ -373,9 +537,20 @@ class HarnessBusinessLaneTests(TransactionTestCase):
                     models.OutboxEvent.objects.get(pk=eid))))
         self.assertEqual(harness.snapshot(ids), after)
         self.assertEqual(services.reconcile(), [])
-        print(json.dumps({'real_pg_business_lanes': 4, 'commands': 48,
-                          'generation_counts': [32, 2, 14],
-                          'committed_journal_records': 48, 'kafka_outbox_rows': 48,
-                          'tracked_commit_timestamps': 48 if tracks_commits else 0,
-                          'closed_thread_connections': 8, 'consumer_markers': 96,
+        if writer_topology is not None:
+            self.write_writer_business_proof(directory, harness, movements, ids,
+                modes=['threads', 'serial', 'threads'],
+                generation_counts=[first_count, 2, continued_count],
+                baseline_movements=baseline_movements, session_queries=session_queries,
+                continuity=[{'preceding_issue_index': first_count + 1,
+                    'original_issue_id': str(original_issue.id), 'original_batch_id': str(original_batch.id),
+                    'continued_transfer_index': first_count + 2,
+                    'actual_transfer_batch_ids': list(movements[first_count + 2].lines.values_list('batch_id', flat=True)),
+                    'continued_reversal_index': first_count + 3,
+                    'actual_reversal_of_id': str(movements[first_count + 3].reversal_of_id)}])
+        print(json.dumps({'real_pg_business_lanes': lane_count, 'commands': total,
+                          'generation_counts': [first_count, 2, continued_count],
+                          'committed_journal_records': total, 'kafka_outbox_rows': total,
+                          'tracked_commit_timestamps': total if tracks_commits else 0,
+                          'closed_thread_connections': lane_count * 2, 'consumer_markers': total * 2,
                           'duplicate_effects': 0, 'reconciliation_mismatches': 0}, sort_keys=True))

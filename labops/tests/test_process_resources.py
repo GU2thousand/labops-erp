@@ -10,6 +10,7 @@ from benchmarks.events.process_resources import (
     process_resources_profile, sanitize_process_resources, summarize_process_resources,
 )
 from benchmarks.events.consumer_topology import worker_roles
+from benchmarks.events.writer_topology import generator_roles
 
 
 def stat_text(pid, *, start=42, user=20, system=10, rss=8, comm='PRIVATE ) process (name)'):
@@ -19,12 +20,15 @@ def stat_text(pid, *, start=42, user=20, system=10, rss=8, comm='PRIVATE ) proce
 
 
 class ProcessFixture:
-    def __init__(self, *, required_workers=('publisher',), stopped=(), consumer_topology='single'):
+    def __init__(self, *, required_workers=('publisher',), stopped=(), consumer_topology='single',
+                 writer_topology='writers-4'):
         self.files, self.reads, self.clock_value = {}, [], 100.0
         self.consumer_topology = consumer_topology
-        self.pids = {role: 1001 + index for index, role in enumerate(GENERATOR_ROLES + worker_roles(consumer_topology))}
-        self.catalog = ProcessResources(required_roles=GENERATOR_ROLES + tuple(required_workers),
-            known_stopped_roles=stopped, consumer_topology=consumer_topology,
+        self.writer_topology = writer_topology
+        self.generator_roles = generator_roles(writer_topology)
+        self.pids = {role: 1001 + index for index, role in enumerate(self.generator_roles + worker_roles(consumer_topology))}
+        self.catalog = ProcessResources(required_roles=self.generator_roles + tuple(required_workers),
+            known_stopped_roles=stopped, consumer_topology=consumer_topology, writer_topology=writer_topology,
             read_text=self.read, clock_ticks=100, page_size=4096,
             monotonic=self.clock)
 
@@ -54,7 +58,7 @@ class ProcessFixture:
     def start(self, role):
         self.set(role)
         self.catalog.register(role, self.pids[role])
-        self.catalog.ready(role, child_snapshot=self.child(role) if role in GENERATOR_ROLES else None)
+        self.catalog.ready(role, child_snapshot=self.child(role) if role in self.generator_roles else None)
 
     def start_all(self):
         for role in self.catalog.profile()['required_roles']:
@@ -69,14 +73,97 @@ class ProcessFixture:
         return result
 
     def finish_generators(self):
-        for role in GENERATOR_ROLES:
+        for role in self.generator_roles:
             self.finish(role)
 
     def clean(self):
-        return sanitize_process_resources(self.catalog.sample(), consumer_topology=self.consumer_topology)
+        return sanitize_process_resources(self.catalog.sample(), consumer_topology=self.consumer_topology,
+                                          writer_topology=self.writer_topology)
 
 
 class ProcessResourceTests(unittest.TestCase):
+    def test_six_writers_require_independent_extra_generator_receipts_and_counters(self):
+        fixture = ProcessFixture(required_workers=('notification', 'notification-1'),
+            consumer_topology='notification-dual', writer_topology='writers-6')
+        fixture.start_all()
+        sample = fixture.clean()
+        fixture.finish_generators()
+        final = fixture.clean()
+        result = summarize_process_resources([sample], final, consumer_topology='notification-dual',
+            writer_topology='writers-6', expected_profile=fixture.catalog.profile())
+        self.assertTrue(result['collection_complete'])
+        self.assertEqual(result['generator_complete_roles'], list(generator_roles('writers-6')))
+        self.assertEqual(set(result['generator_cpu_deltas']), set(generator_roles('writers-6')))
+        self.assertEqual(result['profile']['consumer_topology']['writer_lanes'], 6)
+        rows = {row['role']: row for row in final['processes']}
+        self.assertEqual(len({rows[role]['pid'] for role in generator_roles('writers-6')}), 6)
+        for role in ('generator-4', 'generator-5'):
+            self.assertEqual(rows[role]['ready_snapshot']['source'], 'child_origin')
+            self.assertEqual(rows[role]['final_snapshot']['source'], 'child_origin')
+            self.assertAlmostEqual(result['generator_cpu_deltas'][role]['user_cpu_seconds'], .1)
+            self.assertAlmostEqual(result['generator_cpu_deltas'][role]['system_cpu_seconds'], .05)
+
+    def test_six_default_role_contract_cannot_shrink_to_four_generators(self):
+        profile = process_resources_profile(writer_topology='writers-6')
+        self.assertEqual(profile['required_roles'], list(generator_roles('writers-6')))
+        with self.assertRaises(ValueError):
+            process_resources_profile(GENERATOR_ROLES, writer_topology='writers-6')
+        fixture = ProcessFixture(writer_topology='writers-6')
+        value = fixture.catalog.sample()
+        value['profile']['required_roles'] = list(GENERATOR_ROLES)
+        self.assertFalse(sanitize_process_resources(value, writer_topology='writers-6')['observed'])
+        self.assertFalse(summarize_process_resources([value], value,
+            writer_topology='writers-6')['collection_complete'])
+        value['profile'].pop('required_roles')
+        self.assertFalse(sanitize_process_resources(value, writer_topology='writers-6')['observed'])
+
+    def test_six_catalog_cannot_be_relabelled_or_omit_an_extra_owned_generator(self):
+        fixture = ProcessFixture(writer_topology='writers-6')
+        value = fixture.catalog.sample()
+        self.assertFalse(sanitize_process_resources(value)['observed'])
+        for role in ('generator-4', 'generator-5'):
+            with self.subTest(role=role):
+                missing = {**value, 'processes': [row for row in value['processes'] if row['role'] != role]}
+                self.assertFalse(sanitize_process_resources(missing, writer_topology='writers-6')['observed'])
+        value['profile']['consumer_topology']['writer_lanes'] = 4
+        self.assertFalse(sanitize_process_resources(value, writer_topology='writers-6')['observed'])
+
+    def test_extra_generator_requires_child_origin_ready_and_final_receipts(self):
+        fixture = ProcessFixture(writer_topology='writers-6')
+        fixture.set('generator-4')
+        fixture.catalog.register('generator-4', fixture.pids['generator-4'])
+        with self.assertRaisesRegex(ValueError, 'originate in the child'):
+            fixture.catalog.ready('generator-4')
+        fixture.catalog.ready('generator-4', fixture.child('generator-4'))
+        raw = fixture.catalog.sample()
+        row = next(row for row in raw['processes'] if row['role'] == 'generator-4')
+        row['ready_snapshot']['source'] = 'kernel_proc_stat'
+        self.assertFalse(sanitize_process_resources(raw, writer_topology='writers-6')['observed'])
+        with self.assertRaisesRegex(ValueError, 'Generator cannot be excluded'):
+            fixture.catalog.finalize('generator-4', exitcode=0, cleaned=True, known_stopped=True)
+        with self.assertRaises(ValueError):
+            fixture.catalog.register('generator-6', 9000)
+
+    def test_extra_generator_missing_close_or_actual_reap_never_qualifies(self):
+        for boundary in ('missing_final', 'not_cleaned', 'not_reaped', 'nonzero_exit'):
+            with self.subTest(boundary=boundary):
+                fixture = ProcessFixture(writer_topology='writers-6')
+                fixture.start_all()
+                live = fixture.clean()
+                for role in generator_roles('writers-6'):
+                    if role != 'generator-5':
+                        fixture.finish(role)
+                fixture.set('generator-5', user=30, system=15)
+                fixture.catalog.finalize('generator-5',
+                    None if boundary == 'missing_final' else fixture.child('generator-5'),
+                    exitcode=None if boundary == 'not_reaped' else (-9 if boundary == 'nonzero_exit' else 0),
+                    cleaned=boundary != 'not_cleaned')
+                report = summarize_process_resources([live], fixture.clean(), writer_topology='writers-6')
+                self.assertFalse(report['collection_complete'])
+                self.assertNotIn('generator-5', report['generator_complete_roles'])
+                self.assertIsNone(report['generator_cpu_deltas']['generator-5']['user_cpu_seconds'])
+                self.assertIn('GeneratorReadyFinalReapProofIncomplete', report['error_type_counts'])
+
     def test_dual_second_member_is_required_and_independently_measured(self):
         fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')
         fixture.start_all()

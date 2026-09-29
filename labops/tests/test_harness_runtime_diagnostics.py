@@ -29,13 +29,14 @@ class HarnessProcessCleanupCatalogTests(SimpleTestCase):
                 h.create_process_catalog('steady')
         reader.assert_not_called()
 
-    def run_observer(self, script):
+    def run_observer(self, script, *, writer_topology='writers-4'):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        fixture = ProcessFixture(required_workers=())
+        fixture = ProcessFixture(required_workers=(), writer_topology=writer_topology)
         h = object.__new__(Harness)
         h.evidence = Path(directory.name)
-        h.args = SimpleNamespace(run_id='cleanup-catalog-control')
+        h.args = SimpleNamespace(run_id='cleanup-catalog-control',
+            writer_topology=writer_topology, writer_topology_version='writer-topology-v1')
         h._next_command_index = 0
         h.events, h.workers, h.generation_topologies = [], {}, []
         h.process_generation_enabled = h.runtime_diagnostics_enabled = True
@@ -52,14 +53,17 @@ class HarnessProcessCleanupCatalogTests(SimpleTestCase):
         h.admin, h.source, h.target = [SimpleNamespace(id=name) for name in ('admin', 'source', 'target')]
         h.business_lanes = [{**{name: SimpleNamespace(id=f'{name}-{lane}')
             for name in ('task', 'project', 'order', 'order_line')},
-            'batch': None, 'cycle_issue': None} for lane in range(4)]
+            'batch': None, 'cycle_issue': None} for lane in range(len(fixture.generator_roles))]
         h.settle_process_sessions = Mock(return_value=True)
         h.merge_origin_events = Mock()
         h.restore_process_lane_state = Mock()
         h.process_database_facts = Mock()
 
         def driver(count, rate, worker, bootstrap, *, start_index, on_observation,
-                   on_process_started, on_process_ready):
+                   on_process_started, on_process_ready, lanes, writer_topology):
+            self.assertEqual(writer_topology, fixture.writer_topology)
+            self.assertEqual(lanes, len(fixture.generator_roles))
+            self.assertEqual([plan['lane'] for plan in bootstrap['plans']], list(range(lanes)))
             for plan in bootstrap['plans']:
                 lane, role = plan['lane'], f'generator-{plan["lane"]}'
                 fixture.set(role)
@@ -74,7 +78,7 @@ class HarnessProcessCleanupCatalogTests(SimpleTestCase):
 
         with patch('benchmarks.events.process_generation.run_paced_processes', side_effect=driver):
             try:
-                h._generate_processes(16, 'steady', rate=50)
+                h._generate_processes(4 * len(fixture.generator_roles), 'steady', rate=50)
             except AssertionError:
                 raise
             except Exception as error:
@@ -94,7 +98,7 @@ class HarnessProcessCleanupCatalogTests(SimpleTestCase):
                  'exitcode': code})
 
     def finish_others(self, fixture, observe, target=2):
-        for lane in range(4):
+        for lane in range(len(fixture.generator_roles)):
             if lane != target:
                 self.cleanup(fixture, observe, lane)
                 del fixture.files[f'/proc/{fixture.pids[f"generator-{lane}"]}/stat']
@@ -216,6 +220,55 @@ class HarnessProcessCleanupCatalogTests(SimpleTestCase):
 
                 _h, _fixture, error = self.run_observer(script)
                 self.assertIsInstance(error, RuntimeError)
+
+    def test_six_writer_extra_child_close_is_observed_and_requires_actual_reap(self):
+        reached = []
+        def script(fixture, observe):
+            self.assertEqual(len(fixture.generator_roles), 6)
+            live = fixture.clean()
+            self.finish_others(fixture, observe, target=5)
+            receipt = self.cleanup(fixture, observe, 5)
+            path = f'/proc/{fixture.pids["generator-5"]}/stat'
+            del fixture.files[path]
+            reads = len(fixture.reads)
+            between = fixture.clean()
+            row = next(row for row in between['processes'] if row['role'] == 'generator-5')
+            self.assertEqual((row['stage'], row['cleaned'], row['exitcode']), ('cleaned', True, None))
+            self.assertEqual(row['final_snapshot'], receipt['process_snapshot'])
+            self.assertNotIn(path, fixture.reads[reads:])
+            self.assertFalse(summarize_process_resources([live, between], between,
+                writer_topology='writers-6')['collection_complete'])
+            self.exit(fixture, observe, 5)
+            result = summarize_process_resources([live, between], fixture.clean(), writer_topology='writers-6')
+            self.assertTrue(result['collection_complete'])
+            self.assertIn('generator-5', result['generator_complete_roles'])
+            reached.append(True)
+
+        h, _fixture, error = self.run_observer(script, writer_topology='writers-6')
+        self.assertEqual(reached, [True])
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(h.generation_topologies[-1]['passed'])
+
+    def test_six_writer_extra_child_missing_connection_close_stays_incomplete(self):
+        reached = []
+        def script(fixture, observe):
+            live = fixture.clean()
+            self.finish_others(fixture, observe, target=4)
+            observe({'kind': 'cleanup_complete', 'lane': 4, 'pid': fixture.pids['generator-4'],
+                'metadata': {'connection_closed': False, 'process_snapshot': fixture.child('generator-4'),
+                             'lane_state': {'batch_id': None, 'cycle_issue_id': None}}})
+            between = fixture.clean()
+            row = next(row for row in between['processes'] if row['role'] == 'generator-4')
+            self.assertEqual((row['stage'], row['cleaned']), ('running', False))
+            self.exit(fixture, observe, 4)
+            result = summarize_process_resources([live, between], fixture.clean(), writer_topology='writers-6')
+            self.assertFalse(result['collection_complete'])
+            self.assertNotIn('generator-4', result['generator_complete_roles'])
+            reached.append(True)
+
+        _h, _fixture, error = self.run_observer(script, writer_topology='writers-6')
+        self.assertEqual(reached, [True])
+        self.assertIsInstance(error, RuntimeError)
 
 
 class Clock:
@@ -443,6 +496,7 @@ class HarnessRuntimeDiagnosticsTests(SimpleTestCase):
             result, workload = h.generate(32, 'steady')
         factory.assert_called_once_with(path, scenario='steady',
             consumer_topology='single',
+            writer_topology='writers-4',
             resource_sampler=h.container_resources.snapshot, known_stopped_roles=(),
             expected_resource_roles=DEFAULT_SERVICES)
         self.assertIs(result, ids)
@@ -864,7 +918,9 @@ class HarnessRuntimeDiagnosticsTests(SimpleTestCase):
         h.runtime_diagnostics = [{'scenario': 'steady', 'artifact': 'runtime-diagnostics-001.json',
             'elapsed_seconds': 19, 'summary': {'collection_complete': True,
                                              'lifecycle_complete': True, 'sample_count': 2}}]
-        h.generation_topologies = [{'scenario': 'steady', 'passed': True}]
+        h.generation_topologies = [{'scenario': 'steady', 'passed': True,
+            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'assignment': '(global_index//4)%4'}]
         h.children, h.logs, h.shutdowns, h.supervisor_restarts = [], [], [], []
         h.workers, h.cases, h.delivery_proofs = {}, [], []
         h.started_at = 0

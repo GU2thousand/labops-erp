@@ -18,9 +18,10 @@ import time
 
 from benchmarks.events.container_diagnostics import parse_proc_stat
 from benchmarks.events.consumer_topology import DEFAULT_PRESET, worker_roles, topology_profile
+from benchmarks.events.writer_topology import DEFAULT_WRITER_PRESET, generator_roles
 
 
-GENERATOR_ROLES = tuple(f'generator-{lane}' for lane in range(4))
+GENERATOR_ROLES = generator_roles()
 WORKER_ROLES = ('publisher', 'notification', 'analytics', 'retry', 'dlq')
 PROCESS_ROLES = GENERATOR_ROLES + WORKER_ROLES
 COUNTERS = ('user_cpu_seconds', 'system_cpu_seconds', 'rss_bytes')
@@ -53,16 +54,19 @@ def _error(error):
     return name if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', name) else 'Exception'
 
 
-def process_resources_profile(required_roles=GENERATOR_ROLES, known_stopped_roles=(), *, consumer_topology=DEFAULT_PRESET):
+def process_resources_profile(required_roles=None, known_stopped_roles=(), *,
+                              consumer_topology=DEFAULT_PRESET, writer_topology=DEFAULT_WRITER_PRESET):
+    generators = generator_roles(writer_topology)
     workers = worker_roles(consumer_topology)
-    roles = GENERATOR_ROLES + workers
-    required, stopped = tuple(required_roles), tuple(known_stopped_roles)
+    roles = generators + workers
+    required = generators if required_roles is None else tuple(required_roles)
+    stopped = tuple(known_stopped_roles)
     _check(len(required) == len(set(required)) and set(required).issubset(roles)
-           and set(GENERATOR_ROLES).issubset(required), 'Invalid required process roles')
+           and set(generators).issubset(required), 'Invalid required process roles')
     _check(len(stopped) == len(set(stopped)) and set(stopped).issubset(workers),
            'Invalid stopped process roles')
     return {'version': 'scoped-process-resources-v1', 'planned_roles': list(roles),
-        'consumer_topology': topology_profile(consumer_topology),
+        'consumer_topology': topology_profile(consumer_topology, writer_topology=writer_topology),
         'required_roles': list(required), 'known_stopped_roles': list(stopped),
         'stages': ['planned', 'startup', 'running', 'cleaned', 'exited'],
         'identity_scope': 'coordinator supplied exact PID plus process start ticks; no discovery',
@@ -140,14 +144,15 @@ class ProcessResources:
     The caller must supply final receipts from its child message channel and
     actual reap results, not cached samples or invented exit states.
     """
-    def __init__(self, *, required_roles=GENERATOR_ROLES, known_stopped_roles=(),
-                 consumer_topology=DEFAULT_PRESET,
+    def __init__(self, *, required_roles=None, known_stopped_roles=(),
+                 consumer_topology=DEFAULT_PRESET, writer_topology=DEFAULT_WRITER_PRESET,
                  proc_root='/proc', read_text=None, clock_ticks=None, page_size=None,
                  monotonic=None):
         self._profile = process_resources_profile(required_roles, known_stopped_roles,
-            consumer_topology=consumer_topology)
+            consumer_topology=consumer_topology, writer_topology=writer_topology)
+        self.generator_roles = generator_roles(writer_topology)
         self.worker_roles = worker_roles(consumer_topology)
-        self.process_roles = GENERATOR_ROLES + self.worker_roles
+        self.process_roles = self.generator_roles + self.worker_roles
         self.proc_root = Path(proc_root).resolve()
         self.read_text = read_text or (lambda path: Path(path).read_text(encoding='utf-8'))
         self.clock_ticks = _uint(os.sysconf('SC_CLK_TCK') if clock_ticks is None else clock_ticks, positive=True)
@@ -255,7 +260,7 @@ class ProcessResources:
             live = self._read(row)
             try:
                 _check(live['status'] == 'available', 'Ready process counters unavailable')
-                _check(role not in GENERATOR_ROLES or child_snapshot is not None,
+                _check(role not in self.generator_roles or child_snapshot is not None,
                        'Generator ready receipt must originate in the child')
                 ready = self._receipt(row, child_snapshot) if child_snapshot is not None else live
                 _check(all(live[name] >= ready[name] for name in COUNTERS[:2]), 'Ready child CPU exceeds fresh process counters')
@@ -321,21 +326,25 @@ class ProcessResources:
             return {'observed': True, 'profile': self.profile(), 'processes': rows}
 
 
-def sanitize_process_resources(value, *, consumer_topology=DEFAULT_PRESET, expected_profile=None):
+def sanitize_process_resources(value, *, consumer_topology=DEFAULT_PRESET,
+                               writer_topology=DEFAULT_WRITER_PRESET, expected_profile=None):
     """Whitelist the callback boundary and validate its role contract afresh."""
     invalid = {'observed': False, 'profile': None, 'processes': None,
         'errors': [{'stage': 'process_catalog', 'error_type': 'InvalidProcessCatalog'}]}
     if not isinstance(value, dict) or value.get('observed') is not True:
         return invalid
+    generators = generator_roles(writer_topology)
     workers = worker_roles(consumer_topology)
-    roles = GENERATOR_ROLES + workers
+    roles = generators + workers
     profile, rows = value.get('profile'), value.get('processes')
     if not isinstance(profile, dict) or not isinstance(rows, list) or len(rows) > len(roles)*128:
         return invalid
     try:
+        _check(isinstance(profile.get('required_roles'), (list, tuple)),
+               'Missing required process roles')
         clean_profile = process_resources_profile(profile.get('required_roles'), profile.get('known_stopped_roles'),
-            consumer_topology=consumer_topology)
-        _check(profile.get('consumer_topology') == topology_profile(consumer_topology)
+            consumer_topology=consumer_topology, writer_topology=writer_topology)
+        _check(profile.get('consumer_topology') == topology_profile(consumer_topology, writer_topology=writer_topology)
                and profile.get('planned_roles') == list(roles), 'Process topology profile changed')
         clean_profile['clock_ticks_per_second'] = _uint(profile.get('clock_ticks_per_second'), positive=True)
         clean_profile['page_size_bytes'] = _uint(profile.get('page_size_bytes'), positive=True)
@@ -395,7 +404,7 @@ def sanitize_process_resources(value, *, consumer_topology=DEFAULT_PRESET, expec
                 _check(source in ('kernel_proc_stat', 'child_origin'), 'Invalid process observation source')
                 _check(field not in ('value', 'registration_snapshot') or source == 'kernel_proc_stat',
                        'A child receipt cannot replace a fresh kernel observation')
-                _check(role not in GENERATOR_ROLES or field not in ('ready_snapshot', 'final_snapshot')
+                _check(role not in generators or field not in ('ready_snapshot', 'final_snapshot')
                        or source == 'child_origin', 'Generator receipt must originate in child')
                 observed_pid = _uint(observation.get('pid'), positive=True)
                 observed_start = None if observation.get('start_time_ticks') is None else _uint(observation['start_time_ticks'])
@@ -429,7 +438,8 @@ def sanitize_process_resources(value, *, consumer_topology=DEFAULT_PRESET, expec
     return {'observed': True, 'profile': clean_profile, 'processes': clean, 'errors': []}
 
 
-def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRESET, expected_profile=None):
+def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRESET,
+                                writer_topology=DEFAULT_WRITER_PRESET, expected_profile=None):
     """Per-sample live coverage plus final child ready/cleanup/reap proof."""
     result = {'supplied': True, 'collection_complete': False, 'profile': None,
         'live_sample_count': len(samples), 'live_sample_coverage_complete': bool(samples),
@@ -450,7 +460,9 @@ def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRE
                     if isinstance(name, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', name):
                         fail(name)
     contract, identities, latest_live, invalid_identities = None, {}, {}, set()
-    roles = GENERATOR_ROLES + worker_roles(consumer_topology)
+    generators = generator_roles(writer_topology)
+    roles = generators + worker_roles(consumer_topology)
+    selected_topology = topology_profile(consumer_topology, writer_topology=writer_topology)
     def continuity(row):
         key = (row['role'], row['generation'])
         if row['generation'] is None:
@@ -483,7 +495,9 @@ def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRE
         if expected_profile is not None and profile != expected_profile:
             result['live_sample_coverage_complete'] = False
             fail('OwnedProcessContractChanged')
-        if profile.get('consumer_topology') != topology_profile(consumer_topology):
+        if (profile.get('consumer_topology') != selected_topology
+                or profile.get('planned_roles') != list(roles)
+                or not set(generators).issubset(profile.get('required_roles', []))):
             result['live_sample_coverage_complete'] = False
             fail('ProcessCatalogTopologyChanged')
         if contract is None:
@@ -512,7 +526,9 @@ def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRE
     if contract is not None and final['profile'] != contract:
         result['live_sample_coverage_complete'] = False
         fail('ProcessCatalogContractChanged')
-    if final['profile'].get('consumer_topology') != topology_profile(consumer_topology):
+    if (final['profile'].get('consumer_topology') != selected_topology
+            or final['profile'].get('planned_roles') != list(roles)
+            or not set(generators).issubset(final['profile'].get('required_roles', []))):
         fail('ProcessCatalogTopologyChanged')
     if expected_profile is not None and final['profile'] != expected_profile:
         fail('OwnedProcessContractChanged')
@@ -538,7 +554,7 @@ def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRE
             if row['applicable'] and (row['value'] is None or row['value']['status'] != 'available'):
                 final_live_complete = False
                 fail('RequiredFinalLiveProcessCounterUnavailable')
-        if role in GENERATOR_ROLES:
+        if role in generators:
             row = rows[-1]
             ready, end = row['ready_snapshot'], row['final_snapshot']
             if end is not None and end['status'] == 'available':
@@ -583,6 +599,6 @@ def summarize_process_resources(samples, final, *, consumer_topology=DEFAULT_PRE
                     fail('RequiredWorkerProcessProofIncomplete')
     result['observed_live_roles'], result['error_type_counts'] = sorted(observed), errors
     result['collection_complete'] = bool(result['live_sample_coverage_complete'] and final_live_complete
-        and not errors and set(GENERATOR_ROLES).issubset(result['generator_complete_roles'])
-        and (set(result['required_roles'])-set(GENERATOR_ROLES)).issubset(result['worker_complete_roles']))
+        and not errors and set(generators).issubset(result['generator_complete_roles'])
+        and (set(result['required_roles'])-set(generators)).issubset(result['worker_complete_roles']))
     return result

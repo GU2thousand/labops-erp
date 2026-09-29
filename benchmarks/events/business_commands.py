@@ -14,6 +14,82 @@ import time
 from types import SimpleNamespace
 
 
+def validate_process_bootstrap(lane, bootstrap):
+    """Check every parent's lane plan before importing Django or opening paths."""
+    from benchmarks.events.writer_topology import resolve_profile_writer, writer_profile
+    from benchmarks.events.generation_journal import numeric_profile
+    from benchmarks.events.origin_journal import _plan
+    if not isinstance(bootstrap, dict) or 'profile' not in bootstrap:
+        raise ValueError('Missing parent writer profile')
+    preset = resolve_profile_writer(bootstrap['profile'])
+    selected = writer_profile(preset,
+        diagnostic_profile=bootstrap.get('diagnostic_profile_enabled', False))
+    lanes = selected['lanes']
+    if type(lane) is not int or lane not in range(lanes):
+        raise ValueError('Child lane is outside the selected writer profile')
+    if bootstrap.get('writer_topology', preset) != preset:
+        raise ValueError('Child writer selection differs from parent profile')
+    profile = numeric_profile(bootstrap['profile'])
+    for name in ('diagnostic_profile_enabled', 'runtime_diagnostics_enabled'):
+        if type(bootstrap.get(name)) is not bool or bootstrap[name] != profile[name]:
+            raise ValueError('Child diagnostic request differs from frozen parent')
+    rate = bootstrap.get('rate')
+    if type(rate) not in (int, float) or rate != profile['rate'] or rate <= 0:
+        raise ValueError('Child global rate differs from parent profile')
+    plans = bootstrap.get('plans')
+    if not isinstance(plans, list) or len(plans) != lanes:
+        raise ValueError('Child requires every ordered selected lane plan')
+    identifiers, applications, reserved = set(), set(), set()
+    context_ids = {key: set() for key in ('project_id', 'task_id', 'order_id', 'order_line_id')}
+    shared = None
+    for number, plan in enumerate(plans):
+        if not isinstance(plan, dict) or type(plan.get('lane')) is not int or plan['lane'] != number:
+            raise ValueError('Child lane plans must be ordered and unique')
+        required = {'run_id', 'origin_id', 'label', 'indices', 'rate', 'context',
+                    'application_name', 'database_name', 'directory', 'path'}
+        if not required.issubset(plan):
+            raise ValueError('Child lane plan is incomplete')
+        if plan.get('rate') != rate / lanes:
+            raise ValueError('Child nominal lane rate differs from parent profile')
+        canonical = _plan(run_id=plan['run_id'], origin_id=plan['origin_id'], profile=profile,
+            label=plan['label'], lane=number, indices=plan['indices'], rate=plan['rate'], context=plan['context'])
+        if 'requested_numeric_profile' in plan and numeric_profile(plan['requested_numeric_profile']) != profile:
+            raise ValueError('Child lane profile differs from frozen parent')
+        if 'commands' in plan and plan['commands'] != canonical['commands']:
+            raise ValueError('Child command identities differ from frozen allocation')
+        if (plan['origin_id'] in identifiers or plan['application_name'] in applications
+                or reserved.intersection(plan['indices'])
+                or plan['database_name'] != bootstrap['database_config']['NAME']):
+            raise ValueError('Child lane origin or owning namespace conflicts')
+        identifiers.add(plan['origin_id']); applications.add(plan['application_name'])
+        reserved.update(plan['indices'])
+        context = canonical['context']
+        if not set(context_ids).union({'actor_id', 'source_warehouse_id', 'target_warehouse_id',
+                'source_cluster', 'source_generation', 'topic', 'database_scope_digest',
+                'source_context_digest'}).issubset(context):
+            raise ValueError('Child lane context is incomplete')
+        values = (plan['run_id'], plan['label'], *(context[key] for key in
+            ('actor_id', 'source_warehouse_id', 'target_warehouse_id', 'source_cluster',
+             'source_generation', 'topic', 'database_scope_digest', 'source_context_digest')))
+        if shared is None:
+            shared = values
+        elif shared != values:
+            raise ValueError('Child lane shared context differs from parent scope')
+        for key, seen in context_ids.items():
+            if context[key] in seen:
+                raise ValueError('Child business fixtures are not distinct per lane')
+            seen.add(context[key])
+    if 'writer_topology' in profile and not {'start_index', 'requested_count'}.issubset(bootstrap):
+        raise ValueError('Child explicit writer request lacks input reservation')
+    if 'start_index' in bootstrap or 'requested_count' in bootstrap:
+        start, count = bootstrap.get('start_index'), bootstrap.get('requested_count')
+        if type(start) is not int or type(count) is not int or min(start, count) < 0:
+            raise ValueError('Child input reservation is invalid')
+        if reserved != set(range(start, start + count)):
+            raise ValueError('Child plans omit or add requested command indices')
+    return preset, lanes
+
+
 def execute_inventory_command(context, seq, label, batch, state, data, *, lane, scheduled_at):
     from django.utils import timezone
     from labops.purchasing.services import create_receipt
@@ -100,6 +176,7 @@ class InventoryProcessWorker:
         request_profile(diagnostic_profile_enabled, diagnostic_profile_engine)
         if diagnostic_profile_engine != bootstrap['profile'].get('diagnostic_profile_engine', 'cprofile'):
             raise ValueError('Child diagnostic engine differs from frozen requested profile')
+        _writer_topology, writer_lanes = validate_process_bootstrap(lane, bootstrap)
         import django
         os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
         os.environ['WORKER_METRICS_ENABLED'] = '0'
@@ -176,8 +253,8 @@ class InventoryProcessWorker:
         self.generation = OriginJournal(self.directory, run_id=self.plan['run_id'],
             origin_id=self.plan['origin_id'], profile=bootstrap['profile'],
             label=self.plan['label'], lane=lane, indices=self.plan['indices'],
-            rate=bootstrap['rate'] / 4, context=context)
-        self.batch = self.generation.begin_batch(len(self.plan['indices']), bootstrap['rate'] / 4,
+            rate=bootstrap['rate'] / writer_lanes, context=context)
+        self.batch = self.generation.begin_batch(len(self.plan['indices']), bootstrap['rate'] / writer_lanes,
                                                self.plan['label'])
         self._events = (self.directory / 'events.jsonl').open('x')
         if self.diagnostic_profile_enabled:

@@ -30,6 +30,10 @@ from benchmarks.events.consumer_topology import (
     PRESETS, DEFAULT_PRESET, topology_profile, freeze_topology, consumer_roles, worker_roles,
     assignment_result,
 )
+from benchmarks.events.writer_topology import (
+    WRITER_PRESETS, DEFAULT_WRITER_PRESET, WRITER_TOPOLOGY_VERSION,
+    writer_profile, resolve_profile_writer, freeze_writer_topology, generator_roles,
+)
 
 
 def write_json(path, value):
@@ -60,22 +64,31 @@ def load_environment(path):
 
 def freeze_generation_execution_profile(evidence, run_id, *, runtime_diagnostics=False,
                                         diagnostic_profile=False, diagnostic_profile_engine='cprofile',
-                                        consumer_topology=DEFAULT_PRESET):
+                                        consumer_topology=DEFAULT_PRESET,
+                                        writer_topology=DEFAULT_WRITER_PRESET):
     from benchmarks.events.process_generation import frozen_process_profile
     from benchmarks.events.runtime_diagnostics import diagnostics_profile
     from benchmarks.events.diagnostic_profile import request_profile
     request = request_profile(diagnostic_profile, diagnostic_profile_engine)
+    writers = writer_profile(writer_topology, diagnostic_profile=diagnostic_profile)
+    # Validate both requests before any path is created or evidence is opened.
+    topology_profile(consumer_topology, diagnostic_profile=diagnostic_profile,
+                     writer_topology=writer_topology)
+    freeze_writer_topology(Path(evidence) / 'writer-topology.json', run_id,
+                          writer_topology, diagnostic_profile=diagnostic_profile)
     topology = freeze_topology(Path(evidence) / 'consumer-topology.json', run_id,
-                              consumer_topology, diagnostic_profile=diagnostic_profile)
+                              consumer_topology, diagnostic_profile=diagnostic_profile,
+                              writer_topology=writer_topology)
     path = Path(evidence) / 'generation-execution-profile.json'
     with path.open('x') as out:
-        json.dump({'run_id': run_id, **frozen_process_profile(),
+        json.dump({'run_id': run_id, **frozen_process_profile(writer_topology=writer_topology),
+            'writer_profile': writers,
             'consumer_topology': topology,
             'diagnostic_profile': request,
             'qualification_admissible': not diagnostic_profile,
             'selection_policy': {'mode': 'automatic', 'spawn_minimum_batch_count': 512,
-                'smaller_capacity_batches': 'four FIFO thread lanes',
-                'capacity_batches_at_or_above_threshold': 'four fresh spawn clients',
+                'smaller_capacity_batches': str(writers['lanes']) + ' FIFO thread lanes',
+                'capacity_batches_at_or_above_threshold': str(writers['lanes']) + ' fresh spawn clients',
                 'test_only_force_override': False},
             'runtime_diagnostics': {**diagnostics_profile(),
                 'enabled': runtime_diagnostics, 'applicable': runtime_diagnostics,
@@ -152,11 +165,29 @@ def stable_committed_offsets(configs, topic, *, timeout=30, consumer_factory=Non
 
 
 class Harness:
+    @property
+    def writer_topology(self):
+        if not hasattr(self, '_writer_topology'):
+            self._writer_topology = resolve_profile_writer(getattr(self, 'args', {}))
+        return self._writer_topology
+
+    @property
+    def writer_lanes(self):
+        if not hasattr(self, '_writer_lanes'):
+            self._writer_lanes = writer_profile(self.writer_topology)['lanes']
+        return self._writer_lanes
+
     def __init__(self, args, generation=None):
+        self.args = args
+        selected = writer_profile(self.writer_topology,
+                                  diagnostic_profile=getattr(args, 'diagnostic_profile', False))
+        self._writer_lanes = selected['lanes']
         self.consumer_topology = getattr(args, 'consumer_topology', DEFAULT_PRESET)
         self.topology = topology_profile(self.consumer_topology,
-            diagnostic_profile=getattr(args, 'diagnostic_profile', False))
-        self.args = args
+            diagnostic_profile=getattr(args, 'diagnostic_profile', False),
+            writer_topology=self.writer_topology)
+        if generation is not None and resolve_profile_writer(generation.profile) != self.writer_topology:
+            raise ValueError('Supplied generation writer profile differs from admitted request')
         self.evidence = args.evidence_dir
         self.evidence.mkdir(parents=True, exist_ok=True)
         with (self.evidence / '.acceptance-started').open('x') as marker:
@@ -165,13 +196,14 @@ class Harness:
             (self.evidence / directory).mkdir(exist_ok=True)
         (self.evidence / 'errors.jsonl').touch(exist_ok=False)
         from benchmarks.events.generation_journal import GenerationJournal, numeric_profile
-        self.generation = generation or GenerationJournal(self.evidence, args.run_id, numeric_profile(args))
+        self.generation = generation if generation is not None else GenerationJournal(
+            self.evidence, args.run_id, numeric_profile(args))
         if generation is None:
             freeze_generation_execution_profile(self.evidence, args.run_id,
                 runtime_diagnostics=getattr(args, 'runtime_diagnostics', False),
                 diagnostic_profile=getattr(args, 'diagnostic_profile', False),
                 diagnostic_profile_engine=getattr(args, 'diagnostic_profile_engine', 'cprofile'),
-                consumer_topology=self.consumer_topology)
+                consumer_topology=self.consumer_topology, writer_topology=self.writer_topology)
         self.diagnostic_profile_enabled = getattr(args, 'diagnostic_profile', False)
         self.diagnostic_profile_engine = getattr(args, 'diagnostic_profile_engine', 'cprofile')
         self.publisher_profile_paths = []
@@ -778,13 +810,14 @@ class Harness:
         write_json(self.evidence / 'offsets-before.json', self.offsets())
 
     def prepare_order(self):
+        setup_began = time.monotonic()
         from django.utils import timezone
         from labops.purchasing import services
         from labops.projects import services as projects
         maximum = self.args.events + self.args.fault_events * 4 + self.args.fault_repetitions * 20 + 1000
         quantity = maximum * 4
         self.business_lanes = []
-        for lane in range(4):
+        for lane in range(self.writer_lanes):
             rid = self.args.run_id[:36] + '-setup-' + str(lane)
             project = projects.write_project(self.admin, {'code': 'AC-' + self.args.run_id + '-' + str(lane),
                 'name': 'Isolated acceptance lane ' + str(lane)}, rid)
@@ -804,26 +837,40 @@ class Harness:
                 {'expected_version': request.version}, rid)
             request = services.request_action(self.reviewer, request.id, 'decision',
                 {'expected_version': request.version, 'decision': 'APPROVE', 'reason': 'Isolated acceptance'}, rid)
+            request_line = request.lines.first()
             order = services.write_order(self.admin, {'supplier_id': str(self.models.Supplier.objects.first().id),
-                'lines': [{'request_line_id': str(request.lines.first().id), 'qty': quantity, 'unit_price': '1'}]}, rid)
+                'lines': [{'request_line_id': str(request_line.id), 'qty': quantity, 'unit_price': '1'}]}, rid)
             order = services.order_action(self.admin, order.id, 'confirm',
                 {'expected_version': order.version}, rid)
             self.business_lanes.append({'project': project, 'task': task,
+                                        'request': request, 'request_line': request_line,
                                         'order': order, 'order_line': order.lines.first(),
                                         'batch': None, 'cycle_issue': None})
         self.order = self.business_lanes[0]['order']
         self.order_line = self.business_lanes[0]['order_line']
         self.cycle_issue = None
+        fixture_keys = ('project', 'task', 'request', 'request_line', 'order', 'order_line')
+        assert all(len({data[key].id for data in self.business_lanes}) == self.writer_lanes
+                   for key in fixture_keys), 'Business lane fixtures must be distinct'
         write_json(self.evidence / 'business-lane-topology.json', {
-            'lane_count': 4, 'assignment': '(global_index//4)%4', 'position': 'global_index%4',
+            'writer_topology': self.writer_topology, 'writer_topology_version': WRITER_TOPOLOGY_VERSION,
+            'lane_count': self.writer_lanes, 'assignment': f'(global_index//4)%{self.writer_lanes}', 'position': 'global_index%4',
+            'per_lane_order_quantity': quantity,
+            'per_lane_order_quantity_formula': '(events + fault_events*4 + fault_repetitions*20 + 1000)*4',
+            'quantity_inputs': {'events': self.args.events, 'fault_events': self.args.fault_events,
+                               'fault_repetitions': self.args.fault_repetitions},
+            'fixture_identity_distinctness': True,
+            'fixture_setup_elapsed_seconds': time.monotonic() - setup_began,
+            'fixture_setup_elapsed_scope': 'before imports through legal fixture creation and distinctness validation; excludes topology persistence; outside generation clock',
             'cycle': ['RECEIPT', 'ISSUE', 'TRANSFER', 'REVERSAL'],
             'shared_durable_journal': True, 'per_lane_journal_batches': True,
             'shared_read_only_context': {'actor_id': str(self.admin.id),
                 'source_warehouse_id': str(self.source.id), 'target_warehouse_id': str(self.target.id),
                 'item_id': str(self.batch.item_id)},
             'lock_scope': 'normal application locks retained; independent project/task/order/orderline and per-cycle batch/balance',
-            'lanes': [{'lane': n, **{key + '_id': str(data[key].id)
-                for key in ('project', 'task', 'order', 'order_line')}}
+            'lanes': [{'lane': n, 'ordered_quantity': str(data['order_line'].qty),
+                'requested_quantity': str(data['request_line'].qty),
+                **{key + '_id': str(data[key].id) for key in fixture_keys}}
                 for n, data in enumerate(self.business_lanes)]})
 
     def generate(self, count, label, *, rate=None):
@@ -878,7 +925,7 @@ class Harness:
                            self._active_process_catalog.profile())
             observer = RuntimeDiagnostics(path, scenario=label,
                 consumer_topology=getattr(self, 'consumer_topology', DEFAULT_PRESET),
-                resource_sampler=resources.snapshot,
+                writer_topology=self.writer_topology, resource_sampler=resources.snapshot,
                 known_stopped_roles=stopped_roles,
                 expected_resource_roles=tuple(role for role in DEFAULT_SERVICES if role not in stopped_roles),
                 **process_options)
@@ -964,24 +1011,35 @@ class Harness:
     def _record_failed_generation_start(self, count, label, rate, start_index, error):
         """Retain an observer-start failure's entire reserved input denominator."""
         from benchmarks.events.concurrent_generation import allocate_lane_indices
-        allocation = allocate_lane_indices(count, start_index=start_index)
+        allocation = allocate_lane_indices(count, lanes=self.writer_lanes, start_index=start_index)
         self._next_command_index = start_index + count
         topology = {'scenario': label, 'generator_topology': 'parallel-lanes-v1',
             'requested': count, 'attempted': 0, 'committed': 0, 'identified_events': 0,
             'unattempted': count, 'start_global_index': start_index,
-            'global_target_rate': rate, 'nominal_per_lane_average_rate': rate / 4,
-            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
-            'assignment': '(global_index//4)%4', 'position': 'global_index%4',
+            'global_target_rate': rate, 'nominal_per_lane_average_rate': rate / self.writer_lanes,
+            'writer_topology': self.writer_topology, 'writer_topology_version': WRITER_TOPOLOGY_VERSION,
+            'lane_count': self.writer_lanes, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'assignment': f'(global_index//4)%{self.writer_lanes}', 'position': 'global_index%4',
             'passed': False, 'stage': 'runtime_diagnostics_startup',
-            'error_type': type(error).__name__, 'journal_batches': [], 'batches': []}
+            'error_type': type(error).__name__, 'secondary_errors': [],
+            'journal_batches': [{'lane': lane, 'batch_id': None, 'requested': len(indices),
+                'indices': list(indices), 'status': 'not_created'} for lane, indices in enumerate(allocation)],
+            'batches': []}
         self.generation_topologies.append(topology)
-        try:
-            for lane, indices in enumerate(allocation):
-                batch = self.generation.begin_batch(len(indices), rate / 4, label)
-                topology['journal_batches'].append({'lane': lane, 'batch_id': batch,
-                    'requested': len(indices)})
+        for lane, indices in enumerate(allocation):
+            try:
+                batch = self.generation.begin_batch(len(indices), rate / self.writer_lanes, label)
+                topology['journal_batches'][lane].update(batch_id=batch, status='created')
                 self.generation.finish_failure(batch, 'runtime_diagnostics_startup', type(error).__name__)
                 topology['batches'].append(self.generation.batch_summary(batch))
+            except BaseException as accounting_error:
+                if topology['journal_batches'][lane]['batch_id'] is None:
+                    topology['journal_batches'][lane]['status'] = 'creation_unknown'
+                self._generation_accounting_error = type(accounting_error).__name__
+                self.runtime_diagnostic_errors.append(type(accounting_error).__name__)
+                topology['secondary_errors'].append({'lane': lane, 'stage': 'startup_denominator',
+                    'error_type': type(accounting_error).__name__})
+        try:
             write_json(self.evidence / f'generation-topology-{len(self.generation_topologies):03d}.json', topology)
         except BaseException as accounting_error:
             self._generation_accounting_error = type(accounting_error).__name__
@@ -1000,7 +1058,7 @@ class Harness:
             while time.monotonic() < target:
                 time.sleep(min(.05, target - time.monotonic()))
             seq = start_index + index
-            lane = (seq // 4) % 4
+            lane = (seq // 4) % self.writer_lanes
             data = (self.business_lanes[lane] if hasattr(self, 'business_lanes') else {
                 'order': self.order, 'order_line': self.order_line,
                 'batch': getattr(self, 'batch', None), 'cycle_issue': self.cycle_issue})
@@ -1017,7 +1075,7 @@ class Harness:
         return ids, {'input': count, 'completed_commands': count, 'elapsed_seconds': elapsed,
                      'target_rate': rate, 'actual_command_rate': count / elapsed if elapsed else None,
                      'schedule_lateness_seconds': max(0, elapsed - count / rate),
-                     'generator_topology': 'serial_fault_fixture', 'lane_assignment': '(global_index//4)%4'}
+                     'generator_topology': 'serial_fault_fixture', 'lane_assignment': f'(global_index//4)%{self.writer_lanes}'}
 
     def _generate_concurrent(self, count, label, *, rate):
         if self.use_process_generation(count):
@@ -1033,20 +1091,55 @@ class Harness:
         began = time.monotonic()
         start_index = self._next_command_index
         self._next_command_index += count
-        allocation = allocate_lane_indices(count, start_index=start_index)
-        batches = [self.generation.begin_batch(len(indices), rate / 4, label) for indices in allocation]
-        states = [{'attempt': None, 'stage': 'initialization', 'error_type': None} for _ in range(4)]
+        allocation = allocate_lane_indices(count, lanes=self.writer_lanes, start_index=start_index)
+        batches = [None] * self.writer_lanes
+        states = [{'attempt': None, 'stage': 'initialization', 'error_type': None} for _ in range(self.writer_lanes)]
         number = len(self.generation_topologies) + 1
         topology = {'scenario': label, 'generator_topology': 'parallel-lanes-v1',
             'requested': count, 'global_target_rate': rate, 'start_global_index': start_index,
-            'nominal_per_lane_average_rate': rate / 4,
+            'nominal_per_lane_average_rate': rate / self.writer_lanes,
             'journal_batch_target_rate_scope': 'nominal per-lane average; global pacing is applied once by scheduler',
-            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
-            'assignment': '(global_index//4)%4', 'position': 'global_index%4',
-            'journal_batches': [{'lane': n, 'batch_id': batch, 'requested': len(allocation[n])}
-                                for n, batch in enumerate(batches)]}
+            'writer_topology': self.writer_topology, 'writer_topology_version': WRITER_TOPOLOGY_VERSION,
+            'lane_count': self.writer_lanes, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'assignment': f'(global_index//4)%{self.writer_lanes}', 'position': 'global_index%4',
+            'journal_batches': [{'lane': n, 'batch_id': None, 'requested': len(indices),
+                'indices': list(indices), 'status': 'not_created'} for n, indices in enumerate(allocation)],
+            'secondary_errors': []}
         self.generation_topologies.append(topology)
-        write_json(self.evidence / f'generation-topology-{number:03d}.json', topology)
+        planning_error = None
+        for lane, indices in enumerate(allocation):
+            try:
+                batches[lane] = self.generation.begin_batch(len(indices), rate / self.writer_lanes, label)
+                topology['journal_batches'][lane].update(batch_id=batches[lane], status='created')
+            except BaseException as accounting_error:
+                topology['journal_batches'][lane]['status'] = 'creation_unknown'
+                if planning_error is None:
+                    planning_error = accounting_error
+                self._generation_accounting_error = type(accounting_error).__name__
+                topology['secondary_errors'].append({'lane': lane, 'stage': 'thread_plan_startup',
+                    'error_type': type(accounting_error).__name__})
+        if planning_error is None:
+            try:
+                write_json(self.evidence / f'generation-topology-{number:03d}.json', topology)
+            except BaseException as accounting_error:
+                planning_error = accounting_error
+                self._generation_accounting_error = type(accounting_error).__name__
+        if planning_error is not None:
+            topology.update(passed=False, stage='thread_plan_startup', error_type=type(planning_error).__name__,
+                            attempted=0, committed=0, identified_events=0, unattempted=count)
+            for lane, batch in enumerate(batches):
+                if batch is not None:
+                    try:
+                        self.generation.finish_failure(batch, 'thread_plan_startup', type(planning_error).__name__)
+                    except BaseException as accounting_error:
+                        self._generation_accounting_error = type(accounting_error).__name__
+                        topology['secondary_errors'].append({'lane': lane, 'stage': 'thread_plan_closeout',
+                            'error_type': type(accounting_error).__name__})
+            try:
+                write_json(self.evidence / f'generation-topology-{number:03d}.json', topology)
+            except BaseException as accounting_error:
+                self._generation_accounting_error = type(accounting_error).__name__
+            raise planning_error
         observations = self.evidence / f'generation-schedule-{number:03d}.jsonl'
 
         def observe(value):
@@ -1065,7 +1158,8 @@ class Harness:
         try:
             # Django connections are thread-local. The shutdown callback runs
             # in its owning lane, after every in-flight transaction has returned.
-            items = run_paced_lanes(count, rate, execute, start_index=start_index,
+            items = run_paced_lanes(count, rate, execute, lanes=self.writer_lanes,
+                writer_topology=self.writer_topology, start_index=start_index,
                 on_observation=observe, on_lane_shutdown=lambda _lane: self.connections.close_all())
         except BaseException as exc:
             for lane, batch in enumerate(batches):
@@ -1093,7 +1187,7 @@ class Harness:
         # Raw event lines retain completion order; the in-memory catalogue keeps
         # globally assigned order for deterministic recovery fixtures.
         self.events.sort(key=lambda item: item['global_index'])
-        last = self.business_lanes[((start_index + count - 1) // 4) % 4]
+        last = self.business_lanes[((start_index + count - 1) // 4) % self.writer_lanes]
         self.batch, self.cycle_issue = last['batch'], last['cycle_issue']
         topology.update({'passed': True, 'elapsed_seconds': elapsed,
                          'batches': [self.generation.batch_summary(batch) for batch in batches]})
@@ -1102,20 +1196,21 @@ class Harness:
             'input': count, 'completed_commands': len(items), 'elapsed_seconds': elapsed,
             'target_rate': rate, 'actual_command_rate': count / elapsed if elapsed else None,
             'schedule_lateness_seconds': max(0, elapsed - count / rate),
-            'generator_topology': 'parallel-lanes-v1', 'lane_count': 4,
+            'generator_topology': 'parallel-lanes-v1', 'lane_count': self.writer_lanes,
             'queue_capacity_per_lane': 4, 'topology_artifact': f'generation-topology-{number:03d}.json',
             'elapsed_boundary': 'before lane batch setup through all worker commits/observations and joined connection cleanup'}
 
     def create_process_catalog(self, label):
-        from benchmarks.events.process_resources import ProcessResources, GENERATOR_ROLES
+        from benchmarks.events.process_resources import ProcessResources
         preset = getattr(self, 'consumer_topology', DEFAULT_PRESET)
         stopped = ('analytics',) if label == 'analytics_outage' else ()
         expected = ('publisher', *self.pool_roles('notification'), *self.pool_roles('analytics'))
         required = tuple(name for name in expected if name not in stopped)
         required += tuple(name for name in ('retry', 'dlq') if name in self.workers)
         assert all(name in self.workers for name in required), 'Frozen worker pool member is missing'
-        catalog = ProcessResources(required_roles=GENERATOR_ROLES + required,
-                                   known_stopped_roles=stopped, consumer_topology=preset)
+        catalog = ProcessResources(required_roles=generator_roles(self.writer_topology) + required,
+                                   known_stopped_roles=stopped, consumer_topology=preset,
+                                   writer_topology=self.writer_topology)
         for name in required:
             process = self.workers[name]
             if process.poll() is not None:
@@ -1132,16 +1227,20 @@ class Harness:
         began = time.monotonic()
         start_index = self._next_command_index
         self._next_command_index += count
-        allocation = allocate_lane_indices(count, start_index=start_index)
+        allocation = allocate_lane_indices(count, lanes=self.writer_lanes, start_index=start_index)
         number = len(self.generation_topologies) + 1
         path = self.evidence / f'generation-topology-{number:03d}.json'
         schedule_path = self.evidence / f'generation-schedule-{number:03d}.jsonl'
         topology = {'scenario': label, 'generator_topology': 'spawn-lanes-v1',
             'requested': count, 'global_target_rate': rate, 'start_global_index': start_index,
-            'lane_count': 4, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
-            'result_capacity_total': 16, 'assignment': '(global_index//4)%4',
-            'position': 'global_index%4', 'nominal_per_lane_average_rate': rate / 4,
+            'writer_topology': self.writer_topology, 'writer_topology_version': WRITER_TOPOLOGY_VERSION,
+            'lane_count': self.writer_lanes, 'cycle_length': 4, 'queue_capacity_per_lane': 4,
+            'result_capacity_total': 16, 'assignment': f'(global_index//4)%{self.writer_lanes}',
+            'position': 'global_index%4', 'nominal_per_lane_average_rate': rate / self.writer_lanes,
             'origin_plans': [], 'passed': False, 'secondary_errors': [],
+            'origin_reservations': [{'lane': lane, 'indices': list(indices),
+                'requested': len(indices), 'status': 'not_created'}
+                for lane, indices in enumerate(allocation)],
             'selection': 'test-only forced' if self.process_generation_enabled is True else 'automatic count>=512'}
         self.generation_topologies.append(topology)
         if not hasattr(self, 'process_batches'):
@@ -1149,15 +1248,16 @@ class Harness:
         self.process_batches.append(topology)
         plans, items = [], []
         records = {lane: {'lane': lane, 'pid': None, 'ready_metadata': None,
-                         'cleanup_metadata': None, 'exitcode': None} for lane in range(4)}
-        started_indices = {lane: set() for lane in range(4)}
+                         'cleanup_metadata': None, 'exitcode': None} for lane in range(self.writer_lanes)}
+        started_indices = {lane: set() for lane in range(self.writer_lanes)}
         original = None
         driver_entered = False
 
         def secondary(stage, error):
             nonlocal original
             topology['secondary_errors'].append({'stage': stage, 'error_type': type(error).__name__})
-            original = original or error
+            if original is None:
+                original = error
             self._generation_accounting_error = type(error).__name__
 
         try:
@@ -1189,17 +1289,26 @@ class Harness:
                     (self.args.run_id + ':' + origin_id).encode()).hexdigest()[:32]
                 directory = self.evidence / 'origins' / origin_id
                 plan = {'origin_id': origin_id, 'run_id': self.args.run_id, 'lane': lane,
-                    'label': label, 'indices': list(indices), 'rate': rate / 4,
+                    'label': label, 'indices': list(indices), 'rate': rate / self.writer_lanes,
                     'context': context, 'database_name': database_config['NAME'],
                     'application_name': application, 'directory': str(directory), 'path': str(directory)}
-                self.generation.add_origin_plan(plan)
+                reservation = topology['origin_reservations'][lane]
+                reservation.update(origin_id=origin_id, application_name=application)
+                try:
+                    self.generation.add_origin_plan(plan)
+                except BaseException:
+                    reservation['status'] = 'creation_unknown'
+                    raise
                 plans.append(plan)
+                reservation['status'] = 'created'
+                topology['origin_plans'] = list(plans)
             topology.update(origin_plans=plans, runtime_namespace=runtime_settings)
             write_json(path, topology)
             write_json(self.evidence / f'process-generation-plan-{number:03d}.json', {
                 'scenario': label, 'plans': plans, 'runtime_namespace': runtime_settings,
                 'database_scope_digest': database_scope_digest, 'private_database_config_included': False})
             bootstrap = {'plans': plans, 'profile': self.generation.profile, 'rate': rate,
+                'writer_topology': self.writer_topology, 'start_index': start_index, 'requested_count': count,
                 'database_config': database_config, 'runtime_settings': runtime_settings,
                 'runtime_diagnostics_enabled': getattr(self, 'runtime_diagnostics_enabled', False),
                 'diagnostic_profile_enabled': getattr(self, 'diagnostic_profile_enabled', False),
@@ -1256,8 +1365,8 @@ class Harness:
 
             driver_entered = True
             items = run_paced_processes(count, rate, inventory_process_worker, bootstrap,
-                start_index=start_index, on_observation=observe,
-                on_process_started=started, on_process_ready=ready)
+                start_index=start_index, lanes=self.writer_lanes, writer_topology=self.writer_topology,
+                on_observation=observe, on_process_started=started, on_process_ready=ready)
         except BaseException as exc:
             original = exc
         finally:
@@ -1265,12 +1374,16 @@ class Harness:
             planned_lanes = {plan['lane'] for plan in plans}
             # A failure while preparing a prefix of plans retains every other
             # requested input as unattempted, rather than losing denominators.
-            for lane in set(range(4)) - planned_lanes:
+            for lane in set(range(self.writer_lanes)) - planned_lanes:
                 try:
-                    batch = self.generation.begin_batch(len(allocation[lane]), rate / 4, label)
+                    batch = self.generation.begin_batch(len(allocation[lane]), rate / self.writer_lanes, label)
+                    topology['origin_reservations'][lane].update(
+                        fallback_batch_id=batch, fallback_status='created')
                     self.generation.finish_failure(batch, 'process_plan_startup',
                         type(original).__name__ if original else 'IncompleteProcessPlan')
                 except BaseException as error:
+                    if 'fallback_batch_id' not in topology['origin_reservations'][lane]:
+                        topology['origin_reservations'][lane]['fallback_status'] = 'creation_unknown'
                     secondary('startup_denominator', error)
             settled = not driver_entered
             if driver_entered:
@@ -1310,7 +1423,7 @@ class Harness:
                     and all(record['exitcode'] == 0 and record['cleanup_metadata']
                         and record['cleanup_metadata'].get('connection_closed') is True
                         for record in records.values())
-                    and len(topology['batches']) == 4
+                    and len(topology['batches']) == self.writer_lanes
                     and all(batch['status'] == 'succeeded'
                         and batch['requested'] == batch['committed'] == batch['identified_events']
                         and not any(batch.get(key, 0) for key in ('commit_unknown', 'attempted_unknown', 'integrity_failed'))
@@ -1336,13 +1449,13 @@ class Harness:
         if original is not None:
             raise original
         self.events.sort(key=lambda item: item['global_index'])
-        last = self.business_lanes[((start_index + count - 1) // 4) % 4]
+        last = self.business_lanes[((start_index + count - 1) // 4) % self.writer_lanes]
         self.batch, self.cycle_issue = last['batch'], last['cycle_issue']
         return [item['event_id'] for item in items], {'input': count, 'completed_commands': len(items),
             'elapsed_seconds': elapsed, 'target_rate': rate,
             'actual_command_rate': len(items) / elapsed if elapsed else None,
             'schedule_lateness_seconds': max(0, elapsed - count / rate),
-            'generator_topology': 'spawn-lanes-v1', 'lane_count': 4, 'queue_capacity_per_lane': 4,
+            'generator_topology': 'spawn-lanes-v1', 'lane_count': self.writer_lanes, 'queue_capacity_per_lane': 4,
             'topology_artifact': path.name,
             'elapsed_boundary': 'before plan/spawn/init through all commits, origin observations, owning cleanup/reap, session settlement and required evidence'}
 
@@ -2803,7 +2916,12 @@ class Harness:
             and not any(generation['totals'].get(key, 0) for key in ('commit_unknown', 'attempted_unknown', 'integrity_failed'))
             and not getattr(self, '_generation_accounting_error', None))
         topologies_complete = all(topology.get('passed') is True
-                                  for topology in getattr(self, 'generation_topologies', []))
+            and topology.get('lane_count') == self.writer_lanes
+            and topology.get('writer_topology', DEFAULT_WRITER_PRESET) == self.writer_topology
+            and topology.get('writer_topology_version', WRITER_TOPOLOGY_VERSION) == WRITER_TOPOLOGY_VERSION
+            and topology.get('cycle_length') == 4 and topology.get('queue_capacity_per_lane') == 4
+            and topology.get('assignment') == f'(global_index//4)%{self.writer_lanes}'
+            for topology in getattr(self, 'generation_topologies', []))
         diagnostics_enabled = getattr(self, 'runtime_diagnostics_enabled', False)
         diagnostics_complete = (bool(getattr(self, 'runtime_diagnostics', []))
             and not getattr(self, 'runtime_diagnostic_errors', [])
@@ -2832,7 +2950,9 @@ class Harness:
         report = {'passed': qualification_admissible and error is None and all(case.get('passed') for case in self.cases) and final_complete,
             'qualification_admissible': qualification_admissible,
             'diagnostic_profile': profile_evidence,
-            'consumer_topology': getattr(self, 'topology', topology_profile()),
+            'consumer_topology': getattr(self, 'topology', topology_profile(
+                getattr(self, 'consumer_topology', DEFAULT_PRESET), writer_topology=self.writer_topology)),
+            'writer_topology': writer_profile(self.writer_topology),
             'owned_worker_cleanup_complete': owned_cleanup_complete,
             'owned_worker_cleanup_errors': getattr(self, 'cleanup_errors', []),
             'owned_worker_close_observations': list(getattr(self, 'worker_closures', {}).values()),
@@ -2943,6 +3063,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-id', required=True)
     p.add_argument('--tier', choices=['smoke', 'full'], default='smoke')
+    p.add_argument('--writer-topology', choices=WRITER_PRESETS, default=DEFAULT_WRITER_PRESET,
+                   help='Explicit acceptance writer count; nondefault requires function profiling OFF')
     p.add_argument('--consumer-topology', choices=PRESETS, default=DEFAULT_PRESET,
                    help='Explicit frozen consumer preset; nondefault requires function profiling OFF')
     p.add_argument('--runtime-diagnostics', action='store_true',
@@ -2968,7 +3090,10 @@ def main():
     args = p.parse_args()
     try:
         request_profile(args.diagnostic_profile, args.diagnostic_profile_engine)
-        topology_profile(args.consumer_topology, diagnostic_profile=args.diagnostic_profile)
+        writer_profile(args.writer_topology, diagnostic_profile=args.diagnostic_profile)
+        topology_profile(args.consumer_topology, diagnostic_profile=args.diagnostic_profile,
+                         writer_topology=args.writer_topology)
+        args.writer_topology_version = WRITER_TOPOLOGY_VERSION
     except ValueError as error:
         p.error(str(error))
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', args.run_id):
@@ -3007,7 +3132,7 @@ def main():
         freeze_generation_execution_profile(args.evidence_dir, args.run_id,
             runtime_diagnostics=args.runtime_diagnostics, diagnostic_profile=args.diagnostic_profile,
             diagnostic_profile_engine=args.diagnostic_profile_engine,
-            consumer_topology=args.consumer_topology)
+            consumer_topology=args.consumer_topology, writer_topology=args.writer_topology)
         load_environment(args.generated_dir / 'client.env')
         for key in list(os.environ):
             if key.startswith('POSTGRES_') and key != 'POSTGRES_PASSWORD':

@@ -4,16 +4,18 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from benchmarks.events.runtime_diagnostics import (
     CommandDiagnostics, RuntimeDiagnostics, PostgreSQLSampler,
-    counter_delta, diagnostics_profile, sanitize_resources,
+    counter_delta, diagnostics_profile, process_snapshot, sanitize_resources,
 )
 from labops.tests.test_container_diagnostics import LinuxFixture, CGROUP_PATH, SERVICE
-from labops.tests.test_process_resources import ProcessFixture
+from labops.tests.test_process_resources import ProcessFixture, stat_text
 from benchmarks.events.process_resources import GENERATOR_ROLES
+from benchmarks.events.writer_topology import generator_roles
 
 
 class FakeConnection:
@@ -304,7 +306,97 @@ class DiagnosticContractTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_SETTING', json.dumps(result))
 
 
+class WriterThreadSnapshotTests(unittest.TestCase):
+    def test_own_thread_snapshot_whitelists_only_the_selected_writer_lane_names(self):
+        names = ('MainThread', 'runtime-diagnostics', 'paced-business-lane-0',
+            'paced-business-lane-3', 'paced-business-lane-4', 'paced-business-lane-5',
+            'paced-business-lane-6', 'paced-business-lane-04', 'PRIVATE arbitrary thread')
+        threads = [SimpleNamespace(name=name, native_id=2001 + index) for index, name in enumerate(names)]
+        def read(path):
+            if path == '/proc/self/status':
+                return 'VmRSS: 8 kB\n'
+            if path == '/proc/self/io':
+                return 'rchar: 12\nwchar: 24\n'
+            return stat_text(int(path.split('/')[-2]))
+        for preset in ('writers-4', 'writers-6'):
+            with self.subTest(preset=preset):
+                with patch('benchmarks.events.runtime_diagnostics.platform.system', return_value='Linux'), \
+                     patch('benchmarks.events.runtime_diagnostics.resource.getrusage',
+                           return_value=SimpleNamespace(ru_utime=1., ru_stime=.5, ru_maxrss=8)), \
+                     patch('benchmarks.events.runtime_diagnostics.threading.enumerate', return_value=threads), \
+                     patch('benchmarks.events.runtime_diagnostics.os.sysconf', return_value=100), \
+                     patch('benchmarks.events.runtime_diagnostics._read', side_effect=read) as reader:
+                    result = process_snapshot(writer_topology=preset)
+                self.assertEqual(result['errors'], [])
+                self.assertEqual([row['role'] for row in result['threads']],
+                    list(names[:4]) + (list(names[4:6]) if preset == 'writers-6' else ['other', 'other'])
+                    + ['other', 'other', 'other'])
+                self.assertEqual({call.args[0] for call in reader.call_args_list},
+                    {'/proc/self/status', '/proc/self/io'}
+                    | {f'/proc/self/task/{thread.native_id}/stat' for thread in threads})
+                self.assertNotIn('PRIVATE', json.dumps(result))
+
+    def test_runtime_default_process_reader_binds_selected_writer_preset(self):
+        with patch('benchmarks.events.runtime_diagnostics.process_snapshot') as snapshot:
+            diagnostics = RuntimeDiagnostics(Path('controlled-unused-runtime.json'), scenario='steady',
+                writer_topology='writers-6', database_sampler=FakeDatabaseSampler())
+            diagnostics.process_reader()
+        snapshot.assert_called_once_with(writer_topology='writers-6')
+        supplied = lambda: {'controlled': True}
+        diagnostics = RuntimeDiagnostics(Path('controlled-unused-runtime.json'), scenario='steady',
+            writer_topology='writers-6', database_sampler=FakeDatabaseSampler(), process_reader=supplied)
+        self.assertIs(diagnostics.process_reader, supplied)
+        self.assertEqual(diagnostics.process_reader(), {'controlled': True})
+
+
 class RuntimeSamplerTests(unittest.TestCase):
+    def test_six_writer_dual_catalog_passes_only_under_its_selected_writer_contract(self):
+        for selected in ('writers-4', 'writers-6'):
+            with self.subTest(selected=selected):
+                fixture = ProcessFixture(required_workers=('notification', 'notification-1'),
+                    consumer_topology='notification-dual', writer_topology='writers-6')
+                fixture.start_all()
+                sampled = threading.Event()
+                def snapshot():
+                    value = fixture.catalog.sample()
+                    sampled.set()
+                    return value
+                with tempfile.TemporaryDirectory() as directory:
+                    diagnostics, database = self.start(directory, roles=(),
+                        managed_process_sampler=snapshot, consumer_topology='notification-dual',
+                        writer_topology=selected, expected_process_profile=fixture.catalog.profile())
+                    with diagnostics:
+                        self.assertTrue(sampled.wait(timeout=2))
+                        fixture.finish_generators()
+                    report = diagnostics.summary()
+                self.assertEqual(report['collection_complete'], selected == 'writers-6')
+                self.assertEqual(report['managed_process_resources']['collection_complete'], selected == 'writers-6')
+                if selected == 'writers-6':
+                    self.assertEqual(report['managed_process_resources']['generator_complete_roles'],
+                                     list(generator_roles('writers-6')))
+                    self.assertTrue(set(generator_roles('writers-6')).issubset(
+                        report['managed_process_resources']['observed_live_roles']))
+
+    def test_six_writer_callback_cannot_shrink_selected_role_profile(self):
+        fixture = ProcessFixture(writer_topology='writers-6')
+        expected = fixture.catalog.profile()
+        fixture.start_all()
+        def snapshot():
+            value = fixture.catalog.sample()
+            value['profile']['required_roles'] = list(GENERATOR_ROLES) + ['publisher']
+            return value
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics, database = self.start(directory, roles=(), managed_process_sampler=snapshot,
+                writer_topology='writers-6', expected_process_profile=expected)
+            with diagnostics:
+                self.assertTrue(database.sampled.wait(timeout=2))
+                fixture.finish_generators()
+            report = diagnostics.summary()
+        self.assertTrue(report['lifecycle_complete'])
+        self.assertFalse(report['collection_complete'])
+        self.assertFalse(report['managed_process_resources']['collection_complete'])
+        self.assertFalse(report['final_managed_processes']['observed'])
+
     def test_dual_frozen_contract_passes_and_single_relabelling_is_incomplete(self):
         for selected in ('single', 'notification-dual'):
             fixture = ProcessFixture(required_workers=('notification', 'notification-1'), consumer_topology='notification-dual')

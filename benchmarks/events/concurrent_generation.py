@@ -8,6 +8,8 @@ import queue
 import threading
 import time
 
+from .writer_topology import DEFAULT_WRITER_PRESET, writer_profile
+
 
 PROFILE_VERSION = 'parallel-lanes-v1'
 DEFAULT_LANES = 4
@@ -15,17 +17,19 @@ DEFAULT_CYCLE_LENGTH = 4
 DEFAULT_QUEUE_CAPACITY = 4
 
 
-def paced_lanes_profile():
+def paced_lanes_profile(writer_topology=DEFAULT_WRITER_PRESET):
     """Return a fresh copy of the frozen acceptance scheduling profile."""
-    return {'version': PROFILE_VERSION, 'lanes': DEFAULT_LANES,
+    selected = writer_profile(writer_topology)
+    return {'version': PROFILE_VERSION, 'lanes': selected['lanes'],
             'cycle_length': DEFAULT_CYCLE_LENGTH,
             'queue_capacity': DEFAULT_QUEUE_CAPACITY}
 
 
-def frozen_generation_profile():
+def frozen_generation_profile(writer_topology=DEFAULT_WRITER_PRESET):
     """Describe the fixed full-workload design before runtime setup begins."""
-    return {**paced_lanes_profile(),
-            'assignment': '(global_index//4)%4',
+    selected = writer_profile(writer_topology)
+    return {**paced_lanes_profile(writer_topology),
+            'assignment': selected['assignment'],
             'position': 'global_index%4',
             'global_pacing': 'start_monotonic + scheduled_offset / requested_rate',
             'elapsed_includes_queue_wait': True,
@@ -60,7 +64,8 @@ def run_paced_lanes(count, rate, execute, *, lanes=DEFAULT_LANES,
                     cycle_length=DEFAULT_CYCLE_LENGTH,
                     queue_capacity=DEFAULT_QUEUE_CAPACITY, start_index=0,
                     monotonic=time.monotonic, sleep=time.sleep,
-                    on_observation=None, on_lane_shutdown=None):
+                    on_observation=None, on_lane_shutdown=None,
+                    writer_topology=DEFAULT_WRITER_PRESET):
     """Return callback results in global-index order after every worker joins.
 
     Global index ``start_index + i`` targets ``start_time + i / rate`` and maps
@@ -79,6 +84,9 @@ def run_paced_lanes(count, rate, execute, *, lanes=DEFAULT_LANES,
     Optional lane shutdown runs in that lane's own thread after its final work;
     every worker's cleanup finishes before joining, including after failures.
     """
+    selected = writer_profile(writer_topology)
+    if writer_topology != DEFAULT_WRITER_PRESET and (lanes, cycle_length, queue_capacity) != (selected['lanes'], 4, 4):
+        raise ValueError('Selected writer topology dimensions changed')
     _allocation_arguments(count, lanes, cycle_length, start_index)
     _integer(queue_capacity, 'queue_capacity', 1)
     if isinstance(rate, bool) or not isinstance(rate, (int, float)):
@@ -297,12 +305,12 @@ def run_paced_lanes(count, rate, execute, *, lanes=DEFAULT_LANES,
                          'completed_count': len(completed & assigned),
                          'failed_count': len(failed & assigned),
                          'cancelled_count': len(cancelled & assigned)})
-    actual_profile = {**frozen_generation_profile(), 'lanes': lanes,
+    actual_profile = {**frozen_generation_profile(writer_topology), 'lanes': lanes,
                       'cycle_length': cycle_length, 'queue_capacity': queue_capacity,
                       'assignment': f'(global_index//{cycle_length})%{lanes}',
                       'position': f'global_index%{cycle_length}'}
     summary = {'kind': 'summary', 'profile': actual_profile,
-               'frozen_acceptance_profile': frozen_generation_profile(),
+               'frozen_acceptance_profile': frozen_generation_profile(writer_topology),
                'lanes': lanes, 'cycle_length': cycle_length,
                'queue_capacity': queue_capacity, 'start_index': start_index,
                'requested_count': count, 'scheduled_count': len(scheduled),

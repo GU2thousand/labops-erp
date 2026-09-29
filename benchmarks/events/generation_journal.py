@@ -70,6 +70,12 @@ def numeric_profile(args) -> dict:
     request_profile(profiling, engine)
     if engine != 'cprofile':
         profile['diagnostic_profile_engine'] = engine
+    from benchmarks.events.writer_topology import resolve_profile_writer, WRITER_TOPOLOGY_VERSION
+    preset = resolve_profile_writer(args)
+    has_writer = 'writer_topology' in args if isinstance(args, Mapping) else hasattr(args, 'writer_topology')
+    if has_writer:
+        profile['writer_topology'] = preset
+        profile['writer_topology_version'] = WRITER_TOPOLOGY_VERSION
     return profile
 
 

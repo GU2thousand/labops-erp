@@ -44,6 +44,11 @@ on:
         type: choice
         options: [cprofile, python-profile-owned]
         default: cprofile
+      writer_topology:
+        description: 'Explicit writer profile; writers-6 requires function profiling OFF'
+        type: choice
+        options: [writers-4, writers-6]
+        default: writers-4
       consumer_topology:
         description: 'Predeclared consumer pool; notification-dual requires function profiling OFF'
         type: choice
@@ -68,11 +73,22 @@ jobs:
       DIAGNOSTIC_PROFILE: ${{ github.event.inputs.diagnostic_profile || 'false' }}
       DIAGNOSTIC_PROFILE_ENGINE: ${{ github.event.inputs.diagnostic_profile_engine || 'cprofile' }}
       CONSUMER_TOPOLOGY: ${{ github.event.inputs.consumer_topology || 'single' }}
+      WRITER_TOPOLOGY: ${{ github.event.inputs.writer_topology || 'writers-4' }}
       EVENTS_RUNNER_ARCH: ${{ github.event.inputs.runner_arch }}
       EVENTS_RUNNER_LABEL: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
       EVENTS_REPOSITORY_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Admit joint writer and consumer request before Python setup
+        run: |
+          case "$DIAGNOSTIC_PROFILE_ENGINE" in
+            cprofile) ;;
+            python-profile-owned) [ "$DIAGNOSTIC_PROFILE" = true ] || { echo 'Explicit Python engine requires profiling enabled'; exit 2; } ;;
+            *) echo 'Invalid diagnostic profile engine'; exit 2 ;;
+          esac
+          RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
+          python3 benchmarks/events/consumer_topology.py --preset "$CONSUMER_TOPOLOGY" --writer-topology "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/consumer-topology.json"
+          python3 benchmarks/events/writer_topology.py --preset "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/writer-topology.json"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -87,7 +103,7 @@ jobs:
           esac
           RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
           echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          python benchmarks/events/consumer_topology.py --preset "$CONSUMER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/consumer-topology.json"
+          python benchmarks/events/consumer_topology.py --preset "$CONSUMER_TOPOLOGY" --writer-topology "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/consumer-topology.json"
           python benchmarks/events/runner_profile.py --choice "$EVENTS_RUNNER_ARCH" --event-name "$GITHUB_EVENT_NAME" --requested-label "$EVENTS_RUNNER_LABEL" --runner-arch "$RUNNER_ARCH" --runner-environment "$RUNNER_ENVIRONMENT" --runner-os "$RUNNER_OS" --repository-visibility "$EVENTS_REPOSITORY_VISIBILITY" --source-sha "$GITHUB_SHA" --output "infra/events/validation/evidence/$RUN_ID/runner-profile.json"
       - name: Install fixed clients
         run: pip install -r requirements.txt
@@ -137,7 +153,7 @@ jobs:
             false) ;;
             *) echo 'Invalid diagnostic profile boolean'; exit 2 ;;
           esac
-          python benchmarks/events/acceptance.py --consumer-topology "$CONSUMER_TOPOLOGY" --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+          python benchmarks/events/acceptance.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
       - name: Verify actual offsets topic replication and topic configuration
         if: ${{ always() && steps.runner_profile.outcome == 'success' }}
         run: |
