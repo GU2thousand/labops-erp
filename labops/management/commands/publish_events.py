@@ -5,7 +5,18 @@ from django.db import DatabaseError, connections
 from labops.events import producer, publish_one
 from labops.publisher_shards import publisher_shard_owner, ShardOwnershipLost
 from labops.worker_metrics import (StopController, start_worker_metrics, stop_worker_metrics, heartbeat,
-                                   operation_deadline, database_statement_budget)
+                                   operation_deadline, database_statement_budget, PublisherBatchBudget, PublisherBudgetAdmission)
+
+
+def _budget_aliases():
+    return (producer, publish_one, operation_deadline, database_statement_budget, publisher_shard_owner)
+
+
+try:
+    _BUDGET_ADMISSION = PublisherBudgetAdmission(_budget_aliases())
+except Exception:
+    # Unknown framework capabilities cannot stop an otherwise valid command.
+    _BUDGET_ADMISSION = None
 
 
 class Command(BaseCommand):
@@ -27,31 +38,72 @@ class Command(BaseCommand):
             metrics = start_worker_metrics('publisher', port=options['metrics_port'])
             with StopController() as stop, publisher_shard_owner(options['shard_index'], options['shard_count']) as owner:
                 owner_lost = False
+                if (_BUDGET_ADMISSION is None or any(value is not expected for value, expected in
+                        zip(_budget_aliases(), _BUDGET_ADMISSION.aliases))):
+                    try:
+                        logging.getLogger('labops').info('publisher_budget_reuse_unsupported schema=1 reason=command_extension')
+                    except Exception:
+                        pass
                 try:
                     while not stop.stopped:
                         heartbeat('publisher')
                         batch_complete = False
+                        batch = PublisherBatchBudget(settings.EVENT_PUBLISH_DB_BUDGET_SECONDS, options['limit'],
+                            admission=lambda: _BUDGET_ADMISSION is not None and _BUDGET_ADMISSION.plain(broker, owner, _budget_aliases(), stop))
+                        batch_error = None
+                        batch_outcome = 'partial'
                         try:
-                            for _ in range(options['limit']):
-                                if stop.stopped:
-                                    break
-                                budget = settings.KAFKA_PRODUCER_QUEUE_WAIT_SECONDS + settings.KAFKA_PUBLISH_FLUSH_SECONDS + settings.EVENT_PUBLISH_DB_BUDGET_SECONDS
-                                with operation_deadline(min(budget, stop.remaining())):
-                                    # Verify the dedicated session before touching
-                                    # a possibly stale application DB connection.
-                                    owner.assert_owned()
-                                    with database_statement_budget(settings.EVENT_PUBLISH_DB_BUDGET_SECONDS):
-                                        published = publish_one(broker, shard_index=options['shard_index'], shard_count=options['shard_count'],
-                                                                ownership_check=owner.assert_owned)
-                                if not published:
-                                    break
-                            else:
-                                batch_complete = True
+                            try:
+                                for index in range(options['limit']):
+                                    if stop.stopped:
+                                        break
+                                    budget = settings.KAFKA_PRODUCER_QUEUE_WAIT_SECONDS + settings.KAFKA_PUBLISH_FLUSH_SECONDS + settings.EVENT_PUBLISH_DB_BUDGET_SECONDS
+                                    batch.before_deadline()
+                                    with operation_deadline(min(budget, stop.remaining())):
+                                        record_error = None
+                                        try:
+                                            # Every record keeps the dedicated owner
+                                            # check before application session access.
+                                            owner.assert_owned()
+                                            with batch.record(database_statement_budget, settings.EVENT_PUBLISH_DB_BUDGET_SECONDS) as record:
+                                                published = publish_one(broker, shard_index=options['shard_index'], shard_count=options['shard_count'],
+                                                                        ownership_check=owner.assert_owned)
+                                                record.complete(published)
+                                                record.retain(published is True and index + 1 < options['limit'] and not stop.stopped)
+                                        except BaseException as error:
+                                            record_error = error
+                                            raise
+                                        finally:
+                                            if record_error is not None:
+                                                batch.finish(record_error)
+                                    if not published:
+                                        batch_outcome = 'empty'
+                                        break
+                                else:
+                                    batch_complete = True
+                                    batch_outcome = 'full'
+                            except BaseException as error:
+                                batch_error = error
+                                batch_outcome = 'failed'
+                                raise
+                            finally:
+                                # Covers a stop between record deadlines as well as
+                                # an owner failure before the next record entered.
+                                cleanup_error = batch_error
+                                try:
+                                    batch.cleanup_gap(stop.remaining(), batch_error)
+                                except BaseException as error:
+                                    cleanup_error = batch_error if batch_error is not None else error
+                                    raise
+                                finally:
+                                    batch.receipt('failed' if cleanup_error is not None else (
+                                        'stopped' if stop.stopped else batch_outcome), cleanup_error)
                         except ShardOwnershipLost:
                             # A loop never silently reacquires after owner loss.
                             owner_lost = True
                             raise
                         except DatabaseError:
+                            batch_complete = False
                             # Only the application connection is replaceable.
                             # The independently owned shard session is never reacquired.
                             connections['default'].close()
@@ -59,6 +111,7 @@ class Command(BaseCommand):
                             if not options['loop']:
                                 raise
                         except Exception:
+                            batch_complete = False
                             logging.getLogger('labops').exception('publisher_failed')
                             if not options['loop']:
                                 raise
