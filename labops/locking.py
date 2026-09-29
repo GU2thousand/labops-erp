@@ -18,7 +18,8 @@ def advisory(key, *, shared=False):
 
 
 def rows(model, ids):
-    return list(model.objects.filter(pk__in={x for x in ids if x}).order_by('pk').select_for_update())
+    """Lock existing keys eagerly; internal callers discard the returned PKs."""
+    return list(model.objects.filter(pk__in={x for x in ids if x}).order_by('pk').select_for_update().values_list('pk', flat=True))
 
 
 def command_locks(name, values):
@@ -69,10 +70,18 @@ def command_locks(name, values):
         projects.update(m.LabOrder.objects.filter(pk=ident or data.get('order_id')).values_list('project_id', flat=True))
     if name == 'transition':  # sample
         projects.update(m.Sample.objects.filter(pk=ident).values_list('order__project_id', flat=True))
-    orders.update(m.Receipt.objects.filter(pk__in=receipts - {None}).values_list('order_id', flat=True))
-    requests.update(m.OrderLine.objects.filter(order_id__in=orders - {None}).values_list('request_line__request_id', flat=True))
-    projects.update(m.PurchaseRequest.objects.filter(pk__in=requests - {None}).values_list('project_id', flat=True))
-    projects.update(m.Task.objects.filter(pk__in=tasks - {None}).values_list('project_id', flat=True))
+    receipt_ids = receipts - {None}
+    if receipt_ids:
+        orders.update(m.Receipt.objects.filter(pk__in=receipt_ids).values_list('order_id', flat=True))
+    order_ids = orders - {None}
+    if order_ids:
+        requests.update(m.OrderLine.objects.filter(order_id__in=order_ids).values_list('request_line__request_id', flat=True))
+    request_ids = requests - {None}
+    if request_ids:
+        projects.update(m.PurchaseRequest.objects.filter(pk__in=request_ids).values_list('project_id', flat=True))
+    task_ids = tasks - {None}
+    if task_ids:
+        projects.update(m.Task.objects.filter(pk__in=task_ids).values_list('project_id', flat=True))
     for model, ids in [(m.Project, projects), (m.Task, tasks), (m.PurchaseRequest, requests),
                        (m.PurchaseOrder, orders), (m.Receipt, receipts), (m.StockMovement, movements)]:
         if ids - {None}:

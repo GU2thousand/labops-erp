@@ -1,0 +1,8 @@
+{
+  "redpanda_version": "v26.2.2",
+  "image": "redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96",
+  "registry": "registry-1.docker.io",
+  "digest_kind": "multi-platform manifest index",
+  "resolved_at": "2026-09-28",
+  "status": "reference; no production deployment performed"
+}

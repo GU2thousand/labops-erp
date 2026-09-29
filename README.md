@@ -19,13 +19,24 @@ docker compose exec web python manage.py seed_samples
 
 Open [LabOps](http://127.0.0.1:8001). Example accounts: `admin@labops.local`, `reviewer@labops.local`, `buyer@labops.local`, `store@labops.local`, and `tech@labops.local`; local demo password: `LabOpsDemo!2026`. Seeds refuse to overwrite existing data. Migration runs once in a dedicated startup service.
 
-For events, set `LABOPS_EVENT_TRANSPORT=kafka` in `.env`, then:
+For events, first follow the [fresh development cluster boundary](infra/events/dev/README.md)
+and preserve any old broker history. Set `LABOPS_EVENT_TRANSPORT=kafka` and, only
+for the reviewed empty development cluster,
+`LABOPS_EVENTS_FRESH_CLUSTER_ACK=accept-new-empty-development-cluster` in `.env`, then:
 
 ```bash
 docker compose --profile events up --build -d
 ```
 
 Optional Redis and observability profiles add rate limiting, catalog caching, Prometheus/Grafana and OTel/Jaeger. See [operations](docs/operations.md) for the required environment switches, startup, recovery, and ports. For an existing database, back up and follow the analytics [cutover procedure](docs/operations.md#existing-database-upgrade-and-projection-cutover) before starting consumers.
+
+The [inventory event upgrade guide](docs/events/README.md) covers immutable JSON
+contracts, independent retry/DLQ workers, least-privilege TLS/SCRAM, RF3 validation
+and ledger-based restore. Its [acceptance status](docs/events/acceptance.md)
+separates implementation, reduced/full cloud CI, independent-domain staging and
+production release. The root Compose profile is still single-broker development;
+the [isolated RF3 profile](infra/events/validation/README.md) runs three processes
+on one host and does not establish production HA.
 
 ## Business invariants
 
@@ -89,7 +100,7 @@ Metrics include HTTP/SQL/transaction latency, idempotency replay, cache outcomes
 
 Cache failures fall back to PostgreSQL. If Redis is configured but unavailable, login/import/report rate limiting fails closed with 503; core inventory writes remain independent of Redis. Existing DB login protection remains when Redis is disabled.
 
-Use `pg_dump`/`pg_restore` for PostgreSQL backups and validate restored data with reconciliation. `backup_database` remains SQLite-only. CLI tools `outbox_events` and `event_failures` inspect/requeue or resolve failures with a required reason. See [operations](docs/operations.md).
+Use `pg_dump`/`pg_restore` for PostgreSQL backups and validate restored data with reconciliation. `backup_database` remains SQLite-only. CLI tools `outbox_events`, `event_failures` and bounded `replay_events` preserve original IDs; recovery writes require actor, reason and authorization references. See the [operator commands](docs/events/operator-commands.md) and [restore watermark procedure](docs/events/restore.md).
 
 ## Scope and limits
 
@@ -115,7 +126,9 @@ docker compose exec web python manage.py seed_samples
 
 打开 [LabOps](http://127.0.0.1:8001)。演示账号包括 `admin@labops.local`、`reviewer@labops.local`、`buyer@labops.local`、`store@labops.local` 和 `tech@labops.local`，密码为 `LabOpsDemo!2026`，仅用于本地演示。初始化不会覆盖已有数据。`run.sh` 明确选择 SQLite 演示模式。
 
-在 `.env` 设置 `LABOPS_EVENT_TRANSPORT=kafka` 后，可使用 `docker compose --profile events up --build -d` 启动 Redpanda、发布器及两个独立消费者。Redis 和监控使用独立可选 profile；环境开关、端口及操作步骤见 [运行手册](docs/operations.md)。升级已有数据库应先备份，再执行库存分析投影重建。
+先按 [开发集群切换边界](infra/events/dev/README.md) 保留旧 broker 历史，确认使用新的空开发集群后，在 `.env` 设置 `LABOPS_EVENT_TRANSPORT=kafka` 和 `LABOPS_EVENTS_FRESH_CLUSTER_ACK=accept-new-empty-development-cluster`，再运行 `docker compose --profile events up --build -d`。该 profile 启动单节点 Redpanda、发布器、独立通知/分析消费者以及重试/DLQ worker；日常 imports/alerts worker 继续运行。Redis 和监控使用独立可选 profile；环境开关、端口及操作步骤见 [运行手册](docs/operations.md)。升级已有数据库应先完成备份与 [停写切换](docs/events/cutover.md)，再重建库存分析投影。
+
+[事件升级文档](docs/events/README.md) 说明契约、安全、恢复及 [验收状态](docs/events/acceptance.md)。三 broker 验证环境运行在同一主机，必须区分代码交付、小规模云端验证、完整验收、跨故障域 staging 和实际生产上线。
 
 ## 核心保证
 

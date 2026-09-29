@@ -20,6 +20,9 @@ if DB_MODE == 'sqlite-demo':
 elif DB_MODE == 'postgres':
     parsed = urlparse(os.environ.get('DATABASE_URL', 'postgresql://labops:labops-local@127.0.0.1:55432/labops'))
     if parsed.scheme not in {'postgres', 'postgresql'}: raise RuntimeError('DATABASE_URL must use PostgreSQL')
+    postgres_binding = os.environ.get('DB_SERVER_SIDE_BINDING', '1')
+    if postgres_binding not in {'0', '1'}:
+        raise RuntimeError('DB_SERVER_SIDE_BINDING must be 0 or 1')
     DATABASES = {'default': {'ENGINE':'django.db.backends.postgresql',
         'NAME':os.environ.get('POSTGRES_DB', unquote(parsed.path.lstrip('/'))),
         'USER':os.environ.get('POSTGRES_USER', unquote(parsed.username or 'labops')),
@@ -27,7 +30,10 @@ elif DB_MODE == 'postgres':
         'HOST':os.environ.get('POSTGRES_HOST', parsed.hostname or '127.0.0.1'),
         'PORT':os.environ.get('POSTGRES_PORT', str(parsed.port or 5432)),
         'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '0')),
-        'OPTIONS': {k:v[-1] for k,v in parse_qs(parsed.query).items() if k in {'sslmode', 'connect_timeout'}}}}
+        'OPTIONS': {'connect_timeout': int(os.environ.get('DB_CONNECT_TIMEOUT_SECONDS', '5')),
+                    'server_side_binding': postgres_binding == '1',
+                    'prepare_threshold': None,
+                    **{k:v[-1] for k,v in parse_qs(parsed.query).items() if k in {'sslmode', 'connect_timeout'}}}}}
 else: raise RuntimeError('LABOPS_DB_MODE must be postgres or sqlite-demo')
 AUTH_USER_MODEL = 'labops.User'
 AUTH_PASSWORD_VALIDATORS = [{'NAME':'django.contrib.auth.password_validation.MinimumLengthValidator','OPTIONS':{'min_length':10}},{'NAME':'django.contrib.auth.password_validation.CommonPasswordValidator'}]
@@ -56,4 +62,47 @@ EVENT_TRANSPORT = os.environ.get('LABOPS_EVENT_TRANSPORT', 'local')
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:19092')
 KAFKA_TOPIC = os.environ.get('KAFKA_TOPIC', 'labops.inventory.v1')
 KAFKA_DLQ_TOPIC = os.environ.get('KAFKA_DLQ_TOPIC', 'labops.inventory.dlq.v1')
-EVENT_RETRY_SECONDS = [60, 300, 900, 3600]
+KAFKA_SECURITY_PROTOCOL = os.environ.get('KAFKA_SECURITY_PROTOCOL', 'PLAINTEXT')
+KAFKA_REQUIRE_SECURITY = os.environ.get('KAFKA_REQUIRE_SECURITY', '0' if DEBUG else '1') == '1'
+KAFKA_SSL_CA_LOCATION = os.environ.get('KAFKA_SSL_CA_LOCATION', '')
+KAFKA_SASL_MECHANISM = os.environ.get('KAFKA_SASL_MECHANISM', 'SCRAM-SHA-256')
+KAFKA_SASL_USERNAME = os.environ.get('KAFKA_SASL_USERNAME', '')
+KAFKA_SASL_PASSWORD = os.environ.get('KAFKA_SASL_PASSWORD', '')
+KAFKA_SASL_PASSWORD_FILE = os.environ.get('KAFKA_SASL_PASSWORD_FILE', '')
+for _role in ('PUBLISHER', 'NOTIFICATION', 'ANALYTICS', 'DLQ', 'ADMIN', 'EXPORTER', 'REPLAY'):
+    for _field in ('SASL_USERNAME', 'SASL_PASSWORD', 'SASL_PASSWORD_FILE'):
+        globals()[f'KAFKA_{_role}_{_field}'] = os.environ.get(f'KAFKA_{_role}_{_field}', '')
+KAFKA_GROUP_PREFIX = os.environ.get('KAFKA_GROUP_PREFIX', 'labops')
+KAFKA_SOURCE_CLUSTER_ID = os.environ.get('KAFKA_SOURCE_CLUSTER_ID', 'dev-local')
+KAFKA_SOURCE_STREAM_GENERATION = os.environ.get('KAFKA_SOURCE_STREAM_GENERATION', '1')
+KAFKA_DELIVERY_TIMEOUT_MS = int(os.environ.get('KAFKA_DELIVERY_TIMEOUT_MS', '10000'))
+KAFKA_REQUEST_TIMEOUT_MS = int(os.environ.get('KAFKA_REQUEST_TIMEOUT_MS', '5000'))
+KAFKA_PRODUCER_RETRIES = int(os.environ.get('KAFKA_PRODUCER_RETRIES', '1000000'))
+KAFKA_RETRY_BACKOFF_MS = int(os.environ.get('KAFKA_RETRY_BACKOFF_MS', '100'))
+KAFKA_QUEUE_MAX_MESSAGES = int(os.environ.get('KAFKA_QUEUE_MAX_MESSAGES', '10000'))
+KAFKA_QUEUE_MAX_KBYTES = int(os.environ.get('KAFKA_QUEUE_MAX_KBYTES', '16384'))
+KAFKA_PRODUCER_QUEUE_WAIT_SECONDS = float(os.environ.get('KAFKA_PRODUCER_QUEUE_WAIT_SECONDS', '2'))
+KAFKA_PUBLISH_FLUSH_SECONDS = float(os.environ.get('KAFKA_PUBLISH_FLUSH_SECONDS', str(KAFKA_DELIVERY_TIMEOUT_MS / 1000 + 2)))
+EVENT_PUBLISH_DB_BUDGET_SECONDS = float(os.environ.get('EVENT_PUBLISH_DB_BUDGET_SECONDS', '5'))
+EVENT_LEASE_SECONDS = int(os.environ.get('EVENT_LEASE_SECONDS', '60'))
+EVENT_PUBLISHER_SHARD_COUNT = int(os.environ.get('EVENT_PUBLISHER_SHARD_COUNT', '1'))
+EVENT_PUBLISHER_SHARD_INDEX = int(os.environ.get('EVENT_PUBLISHER_SHARD_INDEX', '0'))
+EVENT_RETRY_SECONDS = [int(x) for x in os.environ.get('EVENT_RETRY_SECONDS', '60,300,900,3600').split(',')]
+EVENT_RETRY_JITTER = float(os.environ.get('EVENT_RETRY_JITTER', '0.2'))
+EVENT_MAX_PAYLOAD_BYTES = int(os.environ.get('EVENT_MAX_PAYLOAD_BYTES', '262144'))
+KAFKA_MESSAGE_MAX_BYTES = int(os.environ.get('KAFKA_MESSAGE_MAX_BYTES', '1048576'))
+KAFKA_DLQ_MESSAGE_MAX_BYTES = int(os.environ.get('KAFKA_DLQ_MESSAGE_MAX_BYTES', '2097152'))
+KAFKA_MAX_POLL_INTERVAL_MS = int(os.environ.get('KAFKA_MAX_POLL_INTERVAL_MS', '300000'))
+KAFKA_SESSION_TIMEOUT_MS = int(os.environ.get('KAFKA_SESSION_TIMEOUT_MS', '10000'))
+KAFKA_HEARTBEAT_INTERVAL_MS = int(os.environ.get('KAFKA_HEARTBEAT_INTERVAL_MS', '3000'))
+KAFKA_SOCKET_TIMEOUT_MS = int(os.environ.get('KAFKA_SOCKET_TIMEOUT_MS', '5000'))
+KAFKA_CONSUMER_PROCESS_TIMEOUT_SECONDS = float(os.environ.get('KAFKA_CONSUMER_PROCESS_TIMEOUT_SECONDS', '30'))
+EVENT_DB_LOCK_TIMEOUT_MS = int(os.environ.get('EVENT_DB_LOCK_TIMEOUT_MS', '5000'))
+EVENT_RETRY_LOCK_TIMEOUT_MS = int(os.environ.get('EVENT_RETRY_LOCK_TIMEOUT_MS', '5000'))
+EVENT_RETRY_STATEMENT_TIMEOUT_MS = int(os.environ.get('EVENT_RETRY_STATEMENT_TIMEOUT_MS', '30000'))
+WORKER_SHUTDOWN_TIMEOUT_SECONDS = float(os.environ.get('WORKER_SHUTDOWN_TIMEOUT_SECONDS', '45'))
+WORKER_METRICS_ENABLED = os.environ.get('WORKER_METRICS_ENABLED', '0') == '1'
+WORKER_METRICS_HOST = os.environ.get('WORKER_METRICS_HOST', '127.0.0.1')
+WORKER_METRICS_PORT = int(os.environ.get('WORKER_METRICS_PORT', '9100'))
+WORKER_METRICS_TOKEN = os.environ.get('WORKER_METRICS_TOKEN', os.environ.get('METRICS_TOKEN', ''))
+WORKER_METRICS_TOKEN_FILE = os.environ.get('WORKER_METRICS_TOKEN_FILE', '')

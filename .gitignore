@@ -7,3 +7,11 @@ __pycache__/
 staticfiles/
 .coverage
 backups/
+
+# Ephemeral Kafka validation credentials, private PKI and run evidence
+infra/events/validation/generated/
+infra/events/validation/evidence/
+benchmarks/events/evidence/
+*.key
+*.p12
+*.pfx

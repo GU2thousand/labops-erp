@@ -4,6 +4,7 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from unittest.mock import patch
+from unittest import skipUnless
 from django.test import TestCase,TransactionTestCase,Client
 from django.db import connections,close_old_connections,transaction
 from django.contrib.auth.models import Group
@@ -210,6 +211,7 @@ class AcceptanceTests(Fixture,TestCase):
         self.assertEqual(a.status_code,201);self.assertEqual(a.json()['data']['id'],b.json()['data']['id'])
         self.assertEqual(StockBalance.objects.get(batch=batch).on_hand_qty,10)
 
+@skipUnless(connections['default'].vendor == 'postgresql', 'PostgreSQL concurrency acceptance; SQLite is a single-process demo')
 class ConcurrencyTests(Fixture,TransactionTestCase):
     reset_sequences=True
     def concurrent(self,functions):

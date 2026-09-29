@@ -13,8 +13,20 @@ x-app-environment: &app-environment
   KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-redpanda:9092}
   KAFKA_TOPIC: ${KAFKA_TOPIC:-labops.inventory.v1}
   KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-labops.inventory.dlq.v1}
+  KAFKA_SECURITY_PROTOCOL: ${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}
+  KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-SCRAM-SHA-256}
+  KAFKA_SASL_USERNAME: ${KAFKA_SASL_USERNAME:-}
+  KAFKA_SASL_PASSWORD: ${KAFKA_SASL_PASSWORD:-}
+  KAFKA_SSL_CA_LOCATION: ${KAFKA_SSL_CA_LOCATION:-}
+  KAFKA_GROUP_PREFIX: ${KAFKA_GROUP_PREFIX:-labops}
+  KAFKA_SOURCE_CLUSTER_ID: ${KAFKA_SOURCE_CLUSTER_ID:-development}
+  KAFKA_SOURCE_STREAM_GENERATION: ${KAFKA_SOURCE_STREAM_GENERATION:-1}
   REDIS_URL: ${REDIS_URL:-}
   METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-change-me}
+  WORKER_METRICS_ENABLED: ${WORKER_METRICS_ENABLED:-1}
+  WORKER_METRICS_HOST: 0.0.0.0
+  WORKER_METRICS_PORT: 9100
+  WORKER_METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-change-me}
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
   OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-labops}
 x-app: &app
@@ -62,25 +74,24 @@ services:
     <<: *app
     command: ['python', 'manage.py', 'process_events', '--loop']
   redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96
     profiles: [events]
+    # The retained v25.1 volume is deliberately not attached to this broker.
+    # Starting a new empty development cluster requires the documented boundary.
+    entrypoint: ['/bin/sh', '-ec']
+    environment:
+      LABOPS_EVENTS_FRESH_CLUSTER_ACK: ${LABOPS_EVENTS_FRESH_CLUSTER_ACK:-}
     command:
-      - redpanda
-      - start
-      - --smp=1
-      - --memory=1G
-      - --reserve-memory=0M
-      - --overprovisioned
-      - --node-id=0
-      - --check=false
-      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:${KAFKA_EXTERNAL_PORT:-19093}
-      - --rpc-addr=0.0.0.0:33145
-      - --advertise-rpc-addr=redpanda:33145
+      - |
+        test "$${LABOPS_EVENTS_FRESH_CLUSTER_ACK}" = accept-new-empty-development-cluster || {
+          echo 'Set LABOPS_EVENTS_FRESH_CLUSTER_ACK only after following infra/events/dev/README.md cutover and preserving the old broker volume.' >&2
+          exit 78
+        }
+        exec rpk redpanda start --smp=1 --memory=1G --reserve-memory=0M --overprovisioned --node-id=0 --check=false --unsafe-bypass-fsync=false --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092 --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:${KAFKA_EXTERNAL_PORT:-19093} --rpc-addr=0.0.0.0:33145 --advertise-rpc-addr=redpanda:33145
     ports:
       - '127.0.0.1:${KAFKA_EXTERNAL_PORT:-19093}:19092'
       - '127.0.0.1:${REDPANDA_ADMIN_PORT:-19645}:9644'
-    volumes: [redpanda-data:/var/lib/redpanda/data]
+    volumes: [redpanda-26-2-data:/var/lib/redpanda/data]
     healthcheck:
       test: ['CMD', 'rpk', 'cluster', 'health', '--exit-when-healthy']
       interval: 10s
@@ -88,26 +99,17 @@ services:
       retries: 20
     restart: unless-stopped
   topics:
-    image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
+    <<: *app
     profiles: [events]
-    entrypoint: ['/bin/sh', '-ec']
-    command:
-      - |
-        for topic in "$${KAFKA_TOPIC}" "$${KAFKA_DLQ_TOPIC}"; do
-          if ! rpk topic describe "$$topic" --brokers redpanda:9092 >/dev/null 2>&1; then
-            rpk topic create "$$topic" --partitions 3 --replicas 1 --brokers redpanda:9092
-          fi
-        done
-    environment:
-      KAFKA_TOPIC: ${KAFKA_TOPIC:-labops.inventory.v1}
-      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-labops.inventory.dlq.v1}
+    restart: 'no'
+    command: ['python', 'infra/events/admin.py', 'topics', '--development-rf1']
     depends_on:
       redpanda:
         condition: service_healthy
   publisher:
     <<: *app
     profiles: [events]
-    command: ['python', 'manage.py', 'publish_events', '--loop']
+    command: ['python', 'manage.py', 'publish_events', '--loop', '--metrics-port', '9100']
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -115,8 +117,12 @@ services:
         condition: service_completed_successfully
   notification-consumer:
     <<: *app
+    environment:
+      <<: *app-environment
+      KAFKA_SASL_USERNAME: ${KAFKA_NOTIFICATION_USERNAME:-${KAFKA_SASL_USERNAME:-}}
+      KAFKA_SASL_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD:-${KAFKA_SASL_PASSWORD:-}}
     profiles: [events]
-    command: ['python', 'manage.py', 'consume_kafka', 'notification']
+    command: ['python', 'manage.py', 'consume_kafka', 'notification', '--metrics-port', '9100']
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -124,8 +130,29 @@ services:
         condition: service_completed_successfully
   analytics-consumer:
     <<: *app
+    environment:
+      <<: *app-environment
+      KAFKA_SASL_USERNAME: ${KAFKA_ANALYTICS_USERNAME:-${KAFKA_SASL_USERNAME:-}}
+      KAFKA_SASL_PASSWORD: ${KAFKA_ANALYTICS_PASSWORD:-${KAFKA_SASL_PASSWORD:-}}
     profiles: [events]
-    command: ['python', 'manage.py', 'consume_kafka', 'analytics']
+    command: ['python', 'manage.py', 'consume_kafka', 'analytics', '--metrics-port', '9100']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+  retry-worker:
+    <<: *app
+    profiles: [events]
+    command: ['python', 'manage.py', 'retry_events', '--loop', '--metrics-port', '9100']
+  dlq-publisher:
+    <<: *app
+    profiles: [events]
+    environment:
+      <<: *app-environment
+      KAFKA_SASL_USERNAME: ${KAFKA_DLQ_USERNAME:-${KAFKA_SASL_USERNAME:-}}
+      KAFKA_SASL_PASSWORD: ${KAFKA_DLQ_PASSWORD:-${KAFKA_SASL_PASSWORD:-}}
+    command: ['python', 'manage.py', 'publish_dlq', '--loop', '--metrics-port', '9100']
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -201,7 +228,7 @@ services:
     restart: unless-stopped
 volumes:
   postgres-data:
-  redpanda-data:
+  redpanda-26-2-data:
   redis-data:
   prometheus-data:
   grafana-data:

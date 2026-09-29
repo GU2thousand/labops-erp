@@ -1,0 +1,48 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 30s
+tests:
+  - name: worker scrape failure fires then resolves
+    interval: 30s
+    input_series:
+      - series: 'up{job="labops-events-workers",instance="publisher:9100",worker="publisher"}'
+        values: '0 0 0 0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m30s
+        alertname: EventWorkerUnavailable
+        exp_alerts:
+          - exp_labels: {job: labops-events-workers, instance: 'publisher:9100', worker: publisher, severity: critical}
+            exp_annotations: {summary: 'A required events worker metrics endpoint is unavailable'}
+      - eval_time: 4m
+        alertname: EventWorkerUnavailable
+        exp_alerts: []
+  - name: lag zero does not hide durable dead delivery
+    interval: 30s
+    input_series:
+      - series: 'kafka_consumergroup_lag{job="kafka-exporter",consumergroup="labops.analytics.v1",topic="labops.inventory.v1"}'
+        values: '0 0 0 0 0'
+      - series: 'labops_worker_failed_deliveries{consumer="analytics",status="DEAD",instance="analytics:9100"}'
+        values: '1 1 1 1 0'
+    alert_rule_test:
+      - eval_time: 1m30s
+        alertname: EventDeadDeliveries
+        exp_alerts:
+          - exp_labels: {consumer: analytics, status: DEAD, severity: warning}
+            exp_annotations: {summary: 'Dead deliveries need audited operator resolution even when Kafka lag is zero'}
+      - eval_time: 2m
+        alertname: EventDeadDeliveries
+        exp_alerts: []
+  - name: quorum loss fires and recovers
+    interval: 30s
+    input_series:
+      - series: 'redpanda_cluster_health_leaderless_partitions{job="redpanda",instance="redpanda:9644"}'
+        values: '1 1 0 0'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: RedpandaQuorumUnavailable
+        exp_alerts:
+          - exp_labels: {job: redpanda, instance: 'redpanda:9644', severity: critical}
+            exp_annotations: {summary: 'Redpanda has partitions without a Raft quorum or an elected controller'}
+      - eval_time: 1m
+        alertname: RedpandaQuorumUnavailable
+        exp_alerts: []
