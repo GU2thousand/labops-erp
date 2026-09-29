@@ -6,13 +6,23 @@ MRO closure for every record. This change affects only how
 native reader, capability guards, construction consistency checks, and every
 original descriptor, function, and field registration in place.
 
-For ordinary classes, the expected namespace and current namespace must be exact
-tuples of exact tuple pairs. Their lengths agree, and both key names are exact
-native strings before comparison. Names agree in the same order; values agree
-by object identity. Values are never compared for equality or hashed. Malformed
-snapshot entry, MRO, namespace, pair, or key shapes refuse before an unknown
-iterator, getter, comparison, or mapping operation can run. A caller-supplied
-mapping proxy is not proof of a native class dictionary.
+An entry proof uses captured native type/length/tuple/string/dictionary
+capabilities and the native dictionary get method before any potentially changed
+global builtin is called. Module and builtin dictionaries must have exact native
+string keys. Their captured binding facts must agree. The reader must retain its
+exact function identity, code, positional defaults, absent keyword defaults, and
+empty native attribute dictionary. Its global dictionary, native type dictionary
+and MRO descriptors, supported descriptor kinds, getter owner/slot/name, and
+captured bound native getters must agree before its body is dispatched.
+
+The unchanged owned reader establishes the current native tuple/pair shapes,
+exact string keys, MRO shape, and bounds. The comparison therefore does not repeat
+those current pair checks. Expected entries, MRO/item containers, and every
+expected pair and key still receive exact native shape checks on every call;
+neither a caller-supplied mapping proxy nor an unproved token is trusted. Names
+agree in the same order, and values agree by object identity. Values are never
+compared for equality or hashed. Every class is still reread on every record.
+There is no cached admission decision or native-ID projection.
 
 The current namespace still comes from the existing owned native type dictionary
 descriptor. The reader verifies its actual mapping proxy, exact string keys,
@@ -48,7 +58,8 @@ The checks retain their existing non-atomic limit for concurrent malicious
 monkeypatching.
 
 Ordinary comparisons avoid constructing two dictionaries and dispatching an
-empty bookkeeping rule loop. Native pair/key validation also adds work. The
+empty bookkeeping rule loop. The entry proof and expected pair/key validation
+also add work. The
 independent cost of dictionary allocation and the net cost of this change are
 not established by source inspection. This algorithm makes no local speedup,
 hosted capacity, or production performance prediction.
@@ -60,3 +71,10 @@ policy's actual PostgreSQL public budget fallback and timeout restoration. They
 do not send broker records or establish native acknowledgement performance.
 Local correctness and metadata timings remain separate from the required hosted
 correctness and fixed formal capacity gates.
+
+The direct synthetic recheck now refuses an unknown reader replacement before
+its body, even if a controlled Mock would return a well-shaped result or raise a
+control signal. The original test method retains this explicit zero-call refusal
+and exercises ordinary errors and exact control-object propagation inside the
+actual owned reader with a bounded test-only trace injection. The former direct
+capture seam is unchanged. Production helper/readiness guards remain active.

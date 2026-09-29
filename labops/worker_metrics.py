@@ -205,52 +205,119 @@ def _publisher_class_capture(roots):
         return None
 
 
-def _publisher_class_unchanged(snapshot):
-    """Reread all live facts; expected namespaces are private copied tuples."""
+def _publisher_class_unchanged(snapshot, _reader=_publisher_class_read,
+        _reader_code=_publisher_class_read.__code__, _reader_defaults=_publisher_class_read.__defaults__,
+        _module_state=globals(), _builtins_state=vars(builtins), _builtins=_PUBLISHER_BUILTIN_REFS,
+        _native_type=type, _native_len=len, _native_tuple=tuple, _native_str=str, _native_dict=dict,
+        _native_get=dict.get, _native_zip=zip, _native_any=any, _function_type=FunctionType,
+        _mappingproxy=MappingProxyType, _getset_kind=GetSetDescriptorType,
+        _member_kind=MemberDescriptorType, _wrapper_kind=MethodWrapperType,
+        _descriptors=(('_PUBLISHER_TYPE_DICT', _PUBLISHER_TYPE_DICT),
+            ('_PUBLISHER_TYPE_MRO', _PUBLISHER_TYPE_MRO),
+            ('_PUBLISHER_TYPE_MRO_KIND', _PUBLISHER_TYPE_MRO_KIND),
+            ('_PUBLISHER_TYPE_DICT_GET', _PUBLISHER_TYPE_DICT_GET),
+            ('_PUBLISHER_TYPE_MRO_GET', _PUBLISHER_TYPE_MRO_GET),
+            ('_PUBLISHER_TYPE_DICT_SLOT', _PUBLISHER_TYPE_DICT_SLOT),
+            ('_PUBLISHER_TYPE_MRO_SLOT', _PUBLISHER_TYPE_MRO_SLOT))):
+    """Prove the native reader once; reread every class and validate expected facts."""
     try:
-        if (type(snapshot) is not tuple or len(snapshot) != 2
-                or type(snapshot[1]) is not tuple):
+        # Bootstrap only with captured native capabilities. No possibly changed
+        # global builtin or unknown dictionary key participates in this proof.
+        if (_native_type(_module_state) is not _native_dict
+                or _native_type(_builtins_state) is not _native_dict
+                or _native_get is not _native_dict.get
+                or _native_type(_builtins) is not _native_tuple):
+            return False
+        for state in (_module_state, _builtins_state):
+            for name in state:
+                if _native_type(name) is not _native_str:
+                    return False
+        for binding in _builtins:
+            if (_native_type(binding) is not _native_tuple or _native_len(binding) != 4
+                    or _native_type(binding[0]) is not _native_str
+                    or (binding[1] is not True and binding[1] is not False)):
+                return False
+            name, present, value, native = binding
+            if ((name in _module_state) != present or _native_get(_module_state, name) is not value
+                    or _native_get(_builtins_state, name) is not native):
+                return False
+        for name, value in (('FunctionType', _function_type), ('MappingProxyType', _mappingproxy),
+                ('GetSetDescriptorType', _getset_kind), ('MemberDescriptorType', _member_kind),
+                ('MethodWrapperType', _wrapper_kind)):
+            if _native_get(_module_state, name) is not value:
+                return False
+        if (_native_type(_reader) is not _function_type
+                or _native_get(_module_state, '_publisher_class_read') is not _reader
+                or _reader.__globals__ is not _module_state
+                or _reader.__code__ is not _reader_code or _reader.__defaults__ is not _reader_defaults
+                or _reader.__kwdefaults__ is not None
+                or _native_type(_reader.__dict__) is not _native_dict or _native_len(_reader.__dict__) != 0
+                or _native_type(_reader_defaults) is not _native_tuple or _native_len(_reader_defaults) != 2
+                or _native_type(_descriptors) is not _native_tuple or _native_len(_descriptors) != 7):
+            return False
+        for binding in _descriptors:
+            if (_native_type(binding) is not _native_tuple or _native_len(binding) != 2
+                    or _native_type(binding[0]) is not _native_str
+                    or _native_get(_module_state, binding[0]) is not binding[1]):
+                return False
+        dictionary, mro_descriptor, mro_kind, dict_get, mro_get, dict_slot, mro_slot = (
+            binding[1] for binding in _descriptors)
+        if (_native_type.__dict__['__dict__'] is not dictionary
+                or _native_type.__dict__['__mro__'] is not mro_descriptor
+                or _native_type(dictionary) is not _getset_kind
+                or _native_type(mro_descriptor) is not mro_kind
+                or (mro_kind is not _getset_kind and mro_kind is not _member_kind)
+                or _getset_kind.__dict__['__get__'] is not dict_slot
+                or mro_kind.__dict__['__get__'] is not mro_slot
+                or _native_type(_native_type.__dict__) is not _mappingproxy
+                or _native_type(dictionary.__get__) is not _wrapper_kind
+                or _native_type(dict_get) is not _wrapper_kind or _native_type(mro_get) is not _wrapper_kind
+                or dict_get.__self__ is not dictionary or mro_get.__self__ is not mro_descriptor
+                or dict_get.__name__ != '__get__' or mro_get.__name__ != '__get__'
+                or _reader_defaults[0] is not dict_get or _reader_defaults[1] is not mro_get):
+            return False
+        if (_native_type(snapshot) is not _native_tuple or _native_len(snapshot) != 2
+                or _native_type(snapshot[1]) is not _native_tuple):
             return False
         for entry in snapshot[1]:
-            if type(entry) is not tuple or len(entry) != 4:
+            if _native_type(entry) is not _native_tuple or _native_len(entry) != 4:
                 return False
             kind, meta, mro, items = entry
-            if type(mro) is not tuple or type(items) is not tuple:
+            if _native_type(mro) is not _native_tuple or _native_type(items) is not _native_tuple:
                 return False
-            current = _publisher_class_read(kind)
-            if (type(current) is not tuple or len(current) != 4 or current[0] is not kind
-                    or type(current[2]) is not tuple or type(current[3]) is not tuple
-                    or current[1] is not meta or len(current[2]) != len(mro)):
+            current = _reader(kind)
+            # The proved reader itself establishes the native result shape,
+            # exact-string current keys, bounds, and current first MRO member.
+            if current is None or current[1] is not meta or _native_len(current[2]) != _native_len(mro):
                 return False
-            if any(value is not expected for value, expected in zip(current[2], mro)):
+            if _native_any(value is not expected for value, expected in _native_zip(current[2], mro)):
                 return False
             if kind is _PUBLISHER_BASE_MANAGER or kind is _PUBLISHER_MANAGER or kind is _PUBLISHER_FIELD:
                 # Preserve the four exact-owner bookkeeping rules. Prove native
                 # pair/key shapes before the original dictionary operations.
                 for table in (current[3], items):
                     for item in table:
-                        if type(item) is not tuple or len(item) != 2 or type(item[0]) is not str:
+                        if _native_type(item) is not _native_tuple or _native_len(item) != 2 or _native_type(item[0]) is not _native_str:
                             return False
-                namespace = dict(current[3])
-                expected = dict(items)
+                namespace = _native_dict(current[3])
+                expected = _native_dict(items)
                 bookkeeping = _publisher_bookkeeping_names(kind, namespace, expected)
                 if bookkeeping is None:
                     return False
                 for name in bookkeeping:
                     namespace.pop(name, None)
                     expected.pop(name, None)
-                if (len(namespace) != len(expected)
-                        or any(name not in namespace or namespace[name] is not value for name, value in expected.items())):
+                if (_native_len(namespace) != _native_len(expected)
+                        or _native_any(name not in namespace or namespace[name] is not value for name, value in expected.items())):
                     return False
             else:
-                # Native key spelling and order must agree; values never
-                # dispatch equality. A changed order selects public fallback.
-                if len(current[3]) != len(items):
+                # Only current's repeated shape checks are removed. Unknown
+                # expected pairs/keys still refuse before lookup or equality.
+                if _native_len(current[3]) != _native_len(items):
                     return False
-                for actual, expected in zip(current[3], items):
-                    if (type(actual) is not tuple or len(actual) != 2
-                            or type(expected) is not tuple or len(expected) != 2
-                            or type(actual[0]) is not str or type(expected[0]) is not str):
+                for actual, expected in _native_zip(current[3], items):
+                    if (_native_type(expected) is not _native_tuple or _native_len(expected) != 2
+                            or _native_type(expected[0]) is not _native_str):
                         return False
                     if actual[0] != expected[0] or actual[1] is not expected[1]:
                         return False

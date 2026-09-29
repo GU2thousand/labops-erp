@@ -285,23 +285,51 @@ class PublisherClassNamespaceTests(SimpleTestCase):
         class Root:
             pass
         snapshot = self.capture(Root)
-        for operation, expected in (
-                (lambda: worker_metrics._publisher_class_capture((Root,)), None),
-                (lambda: worker_metrics._publisher_class_unchanged(snapshot), False)):
-            for kind in (RuntimeError, AttributeError):
-                with self.subTest(operation=expected, ordinary=kind.__name__):
-                    reader = Mock(side_effect=kind('PRIVATE read failure'))
-                    with patch.object(worker_metrics, '_publisher_class_read', reader):
-                        self.assertIs(operation(), expected)
-                    reader.assert_called_once()
-            for kind in (NamespaceControl, OperationDeadlineExceeded):
-                with self.subTest(operation=expected, control=kind.__name__):
-                    first = kind('PRIVATE control')
-                    reader = Mock(side_effect=first)
-                    with patch.object(worker_metrics, '_publisher_class_read', reader), self.assertRaises(kind) as raised:
-                        operation()
+        # Direct capture retains its existing controlled reader seam. The
+        # stricter recheck instead refuses an unknown replacement before calls.
+        for kind in (RuntimeError, AttributeError):
+            reader = Mock(side_effect=kind('PRIVATE read failure'))
+            with patch.object(worker_metrics, '_publisher_class_read', reader):
+                self.assertIs(worker_metrics._publisher_class_capture((Root,)), None)
+            reader.assert_called_once()
+        for kind in (NamespaceControl, OperationDeadlineExceeded):
+            first = kind('PRIVATE control')
+            reader = Mock(side_effect=first)
+            with patch.object(worker_metrics, '_publisher_class_read', reader), self.assertRaises(kind) as raised:
+                worker_metrics._publisher_class_capture((Root,))
+            self.assertIs(raised.exception, first)
+            reader.assert_called_once()
+        for kind in (RuntimeError, AttributeError, NamespaceControl, OperationDeadlineExceeded):
+            reader = Mock(side_effect=kind('Unknown reader must never be dispatched'))
+            with patch.object(worker_metrics, '_publisher_class_read', reader):
+                self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+            reader.assert_not_called()
+        # Exercise failures inside the actual owned reader without changing its
+        # identity, code, defaults, attributes, or any production capability.
+        owned_code = worker_metrics._publisher_class_read.__code__
+        for kind in (RuntimeError, AttributeError, NamespaceControl, OperationDeadlineExceeded):
+            first, injected, previous = kind('Owned reader control'), [], sys.gettrace()
+            def inject(frame, event, argument):
+                if event == 'call' and frame.f_code is owned_code and frame.f_locals.get('kind') is Root and not injected:
+                    injected.append(first)
+                    raise first
+                if previous is not None:
+                    return previous(frame, event, argument)
+                return inject
+            try:
+                sys.settrace(inject)
+                if isinstance(first, Exception):
+                    self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+                else:
+                    with self.assertRaises(kind) as raised:
+                        worker_metrics._publisher_class_unchanged(snapshot)
                     self.assertIs(raised.exception, first)
-                    reader.assert_called_once()
+            finally:
+                sys.settrace(previous)
+            self.assertIs(sys.gettrace(), previous)
+            self.assertEqual(len(injected), 1)
+            self.assertIs(injected[0], first)
+            self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
 
     def test_direct_capture_resolve_and_recheck_dispatch_no_static_inspector(self):
         marker = object()
@@ -474,7 +502,9 @@ class PublisherClassNamespaceTests(SimpleTestCase):
             reader = Mock(return_value=result)
             with patch.object(worker_metrics, '_publisher_class_read', reader):
                 self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
-            reader.assert_called_once_with(kind)
+            # An unproved replacement cannot be invoked to obtain even a
+            # controlled malformed value. Reader refusal precedes its body.
+            reader.assert_not_called()
         calls.assert_not_called()
 
     def test_same_dictionary_facts_in_different_ordinary_order_select_strict_fallback(self):
@@ -525,6 +555,72 @@ class PublisherClassNamespaceTests(SimpleTestCase):
         self.assertIs(worker_metrics._publisher_class_resolve(changed, Root, 'first'), marker)
         self.assertIs(worker_metrics._publisher_class_unchanged(changed), False)
         self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+
+    def test_direct_recheck_proves_owned_reader_code_defaults_and_metadata_before_calls(self):
+        class Root:
+            pass
+        snapshot = self.capture(Root)
+        reader = worker_metrics._publisher_class_read
+        code, defaults, keywords, attributes = reader.__code__, reader.__defaults__, reader.__kwdefaults__, dict(reader.__dict__)
+        calls = Mock(side_effect=NamespaceControl('Unknown native reader default must never run'))
+        try:
+            reader.__code__ = forbidden_dispatch.__code__
+            self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+            reader.__code__ = code
+            reader.__defaults__ = (calls, calls)
+            self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+            reader.__defaults__ = defaults
+            reader.__kwdefaults__ = {}
+            self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+            reader.__kwdefaults__ = keywords
+            reader.__dict__['_unexpected_reader_attribute'] = calls
+            self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+        finally:
+            reader.__code__, reader.__defaults__, reader.__kwdefaults__ = code, defaults, keywords
+            reader.__dict__.clear()
+            reader.__dict__.update(attributes)
+        calls.assert_not_called()
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+    def test_direct_recheck_refuses_shadowed_builtin_and_native_alias_before_unknown_dispatch(self):
+        class Root:
+            pass
+        snapshot = self.capture(Root)
+        for name in ('type', 'len', 'tuple', 'str', 'dict', 'any', 'zip', 'FunctionType', 'MappingProxyType',
+                'GetSetDescriptorType', 'MemberDescriptorType', 'MethodWrapperType',
+                '_PUBLISHER_TYPE_DICT', '_PUBLISHER_TYPE_MRO', '_PUBLISHER_TYPE_MRO_KIND',
+                '_PUBLISHER_TYPE_DICT_GET', '_PUBLISHER_TYPE_MRO_GET', '_PUBLISHER_TYPE_DICT_SLOT', '_PUBLISHER_TYPE_MRO_SLOT'):
+            with self.subTest(binding=name):
+                unknown = Mock(side_effect=NamespaceControl('Changed builtin/native alias must not run'))
+                with patch.object(worker_metrics, name, unknown, create=True):
+                    self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+                unknown.assert_not_called()
+                self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+    def test_direct_recheck_rejects_foreign_module_key_before_dictionary_collision_hooks(self):
+        class Root:
+            pass
+        snapshot = self.capture(Root)
+        recheck, state, calls = worker_metrics._publisher_class_unchanged, vars(worker_metrics), []
+        class ForeignKey:
+            def __hash__(self):
+                calls.append('hash')
+                return hash('type')
+            def __eq__(self, other):
+                calls.append('equal')
+                raise NamespaceControl('Foreign module key equality must not run')
+        key = ForeignKey()
+        state[key] = None
+        calls.clear()
+        try:
+            refused = recheck(snapshot)
+            observed = tuple(calls)
+        finally:
+            state.pop(key)
+        self.assertIs(refused, False)
+        self.assertEqual(observed, ())
+        self.assertIs(recheck(snapshot), True)
 
 
 class PublisherClassNamespaceProductionTests(SimpleTestCase):
