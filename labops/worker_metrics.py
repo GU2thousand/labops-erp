@@ -769,13 +769,18 @@ class PublisherBudgetAdmission:
             if any(vars(item).get('receivers') for item in self.signals):
                 return False
             database = connections['default']
+            from django.db.backends.postgresql.base import DatabaseWrapper
+            if type(database) is not DatabaseWrapper:
+                return False
             from django.db.backends.postgresql.operations import DatabaseOperations
-            if type(database.ops) is not DatabaseOperations or any(name in vars(database.ops)
+            if inspect.getattr_static(DatabaseWrapper, 'ops', None) is not None:
+                return False
+            database_ops = vars(database).get('ops')
+            if type(database_ops) is not DatabaseOperations or any(name in vars(database_ops)
                     for name in ('compiler', 'get_db_converters', 'quote_name', 'adapt_datetimefield_value', 'adapt_json_value')):
                 return False
             dedicated = vars(owner).get('_connection')
             if dedicated is not None:
-                from django.db.backends.postgresql.base import DatabaseWrapper
                 state = vars(dedicated)
                 if (type(dedicated) is not DatabaseWrapper or state.get('execute_wrappers')
                         or any(name in state for name in ('cursor', '_cursor', 'create_cursor', 'ensure_connection'))):

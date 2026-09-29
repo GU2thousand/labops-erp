@@ -145,6 +145,34 @@ class PublisherBudgetStaticAdmissionTests(SimpleTestCase):
         finally:
             vars(self.database).pop('cursor', None)
 
+    def test_unknown_default_wrapper_is_rejected_before_ops_or_attribute_getters(self):
+        self.assertTrue(self.plain())
+        getter = Mock(side_effect=AssertionError('Unknown wrapper metadata must not run'))
+        class UnknownOpsWrapper(DatabaseWrapper):
+            @property
+            def ops(self):
+                return getter('ops')
+        class UnknownAttributeWrapper(DatabaseWrapper):
+            def __getattribute__(self, name):
+                return getter(name)
+        for kind in (UnknownOpsWrapper, UnknownAttributeWrapper):
+            with self.subTest(extension=kind.__name__):
+                # Bypass initialization so this unsupported replacement can
+                # expose getters without creating an application session.
+                unknown = object.__new__(kind)
+                with patch('django.db.connections', {'default': unknown}):
+                    self.refused()
+                getter.assert_not_called()
+                self.assertIsNone(self.database.connection)
+                self.assertTrue(self.plain())
+        original_ops = vars(self.database)['ops']
+        with patch.object(DatabaseWrapper, 'ops', property(lambda self: getter('ops')), create=True):
+            self.assertIs(vars(self.database)['ops'], original_ops)
+            self.refused()
+        getter.assert_not_called()
+        self.assertIs(vars(self.database)['ops'], original_ops)
+        self.assertTrue(self.plain())
+
     def test_changed_send_publish_and_command_alias_are_rejected_without_calling_extensions(self):
         for target, name in ((events, 'send'), (events, 'publish_one'), (command, 'publish_one')):
             with self.subTest(binding=name, module=target.__name__):
