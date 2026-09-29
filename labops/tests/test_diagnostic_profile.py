@@ -1,11 +1,13 @@
 """Resource-free profiler privacy, owner/exception and acceptance controls."""
 from contextlib import nullcontext
+import inspect
 import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from unittest import skipUnless
 from unittest.mock import Mock, patch
@@ -694,7 +696,7 @@ from unittest.mock import patch
 from django.test import SimpleTestCase
 
 from benchmarks.events.diagnostic_profile import CPUProfile
-from benchmarks.events.profile_publisher import ROOT, install_publisher_hooks, run_publisher
+from benchmarks.events.profile_publisher import ROOT, PublisherObservation, install_publisher_hooks, run_publisher
 from labops import events as publisher_events, worker_metrics as publisher_metrics
 from labops.management.commands import publish_events as publisher_command
 from labops.publisher_shards import PublisherShardOwner
@@ -1637,3 +1639,375 @@ class PythonProfileControls(SimpleTestCase):
         value = self.document(worker.cpu_profile)
         self.assertEqual(value['calls'][0]['ordinal'], 4)
         self.assertTrue(value['coverage']['complete'])
+
+
+class DeliveryClientFixture:
+    """Native-client substitute; real events.producer still owns its Client."""
+    def __init__(self, config):
+        self.config, self.calls, self.callbacks = config, [], []
+
+    def produce(self, *args, **kwargs):
+        self.calls.append(('produce', args, kwargs))
+        self.callbacks.append(kwargs['on_delivery'])
+
+    def poll(self, *args, **kwargs):
+        self.calls.append(('poll', args, kwargs))
+
+    def flush(self, *args, **kwargs):
+        self.calls.append(('flush', args, kwargs))
+        for callback in self.callbacks:
+            callback(None, self)
+        self.callbacks.clear()
+        return 0
+
+
+class PublisherObservationControlTests(SimpleTestCase):
+    def recorder(self):
+        profile = CPUProfile('publisher', observation_only=True)
+        observer = PublisherObservation(profile)
+        profile.publisher_observation = observer
+        self.addCleanup(profile.restore)
+        return profile, observer
+
+    def test_observation_only_constructs_no_function_engine_and_never_claims_a_graph(self):
+        with TemporaryDirectory() as name, patch('cProfile.Profile') as classic, patch('profile.Profile') as python:
+            output = Path(name) / 'publisher-profile-observation.json'
+            self.assertEqual(run_publisher(output, {}, observation_only=True,
+                call_command=lambda *args, **kwargs: 17), 17)
+            value = json.loads(output.read_text())
+        classic.assert_not_called()
+        python.assert_not_called()
+        self.assertEqual(value['function_graph_status'], 'NOT_REQUESTED')
+        self.assertFalse(value['function_profile_requested'])
+        self.assertFalse(value['coverage']['complete'])
+        self.assertFalse(value['publisher_observation']['complete'])
+        self.assertEqual(value['phases'], [])
+        self.assertFalse(value['qualification_admissible'])
+        self.assertIsNone(sys.getprofile())
+
+    def test_attempt_and_record_limits_are_fixed_and_overflow_is_not_hidden(self):
+        profile, observer = self.recorder()
+        observer.MAX_ATTEMPTS, observer.MAX_RECORDS = 2, 1
+        calls = []
+        def body(value, *, token):
+            calls.append((value, token))
+            return observer.invoke('claim_commit_composite', lambda: None, (), {})
+        with profile.call('publisher_lifecycle'):
+            for ordinal in range(5):
+                profile.ordinal = ordinal
+                self.assertIsNone(observer.invoke('publish_one_composite', body, (ordinal,), {'token': calls}))
+        result = observer.document()
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(token is calls for _, token in calls))
+        self.assertEqual(result['attempts_seen'], 5)
+        self.assertEqual(result['sampled_attempts'], 2)
+        self.assertEqual(result['overflow_attempts'], 3)
+        self.assertGreater(result['overflow_records'], 0)
+        self.assertEqual(len(result['records']), 1)
+        self.assertFalse(result['complete'])
+
+    def test_sql_wrapper_preserves_exact_delegate_arguments_result_and_first_error(self):
+        profile, observer = self.recorder()
+        observer.database = SimpleNamespace(autocommit=True, in_atomic_block=False, vendor='postgresql')
+        observer.attempt = {'ordinal': 7, 'event_id': None, 'rows': []}
+        sql, params, context, result = 'UPDATE "labops_outboxevent" SET "status"=%s', ['PUBLISHED', 'PRIVATE'], object(), object()
+        execute = Mock(return_value=result)
+        with observer._scope('publish_one_composite'), patch.object(observer, '_publication_callsite', return_value=True):
+            self.assertIs(observer.execute(execute, sql, params, False, context), result)
+        execute.assert_called_once_with(sql, params, False, context)
+        self.assertIs(execute.call_args.args[1], params)
+        error = PublisherPrimaryFailure('PRIVATE first error')
+        execute = Mock(side_effect=error)
+        with observer._scope('claim_commit_composite'), patch.object(observer, '_clock', return_value=None):
+            with self.assertRaises(PublisherPrimaryFailure) as raised:
+                observer.execute(execute, 'SELECT "labops_outboxevent"', params, False, context)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(execute.call_count, 1)
+        self.assertNotIn('PRIVATE', json.dumps(observer.document()))
+
+    def test_delivery_callback_identity_result_error_and_late_ack_do_not_change_business(self):
+        profile, observer = self.recorder()
+        observer.attempt = {'ordinal': 9, 'event_id': None, 'rows': []}
+        with patch('confluent_kafka.Producer', DeliveryClientFixture):
+            producer = publisher_events.producer()
+        original, callback_result, message, key, encoded = object(), object(), object(), object(), object()
+        callback = Mock(return_value=callback_result)
+        with observer._measure('send_composite'), observer._delivery_scope(producer):
+            producer.produce('fixture', key=key, value=encoded, on_delivery=callback)
+            delivery = producer.client.callbacks.pop()
+            self.assertIs(delivery(None, message), callback_result)
+            callback.assert_called_once_with(None, message)
+            self.assertIs(producer.client.calls[0][2]['key'], key)
+            self.assertIs(producer.client.calls[0][2]['value'], encoded)
+        self.assertNotIn('produce', vars(producer))
+        self.assertEqual(observer.records[-1]['stage'], 'delivery_ack')
+        self.assertEqual(observer.records[-1]['outcome'], 'success')
+        observer.attempt = {'ordinal': 10, 'event_id': None, 'rows': []}
+        self.assertIs(delivery(None, message), callback_result)
+        self.assertEqual(observer.ack_late, 1)
+        self.assertEqual(len(observer.records), 2)
+        error = PublisherPrimaryFailure('PRIVATE callback')
+        callback = Mock(side_effect=error)
+        with observer._delivery_scope(producer):
+            producer.produce('fixture', key=key, value=encoded, on_delivery=callback)
+            with self.assertRaises(PublisherPrimaryFailure) as raised:
+                producer.client.callbacks.pop()(original, message)
+        self.assertIs(raised.exception, error)
+        callback.assert_called_once_with(original, message)
+        self.assertNotIn('produce', vars(producer))
+
+    def test_failed_observation_clock_and_sink_preserve_delegate_exception(self):
+        profile, observer = self.recorder()
+        observer.attempt = {'ordinal': 2, 'event_id': None, 'rows': []}
+        first = PublisherPrimaryFailure('PRIVATE business')
+        function = Mock(side_effect=first)
+        with patch('benchmarks.events.profile_publisher.time.time_ns', side_effect=SystemExit('PRIVATE clock')), \
+             patch.object(profile, 'record_error', side_effect=SystemExit('PRIVATE sink')):
+            with profile.call('publisher_lifecycle'), self.assertRaises(PublisherPrimaryFailure) as raised:
+                observer.invoke('send_composite', function, (object(),), {'fixture': True})
+        self.assertIs(raised.exception, first)
+        function.assert_called_once()
+        self.assertTrue(profile.recording_failed)
+        self.assertGreater(observer.clock_failures, 0)
+        self.assertFalse(observer.document()['complete'])
+
+    def test_sample_scope_and_parent_sink_failures_preserve_result_and_first_error(self):
+        class BrokenAppend(list):
+            def append(self, value):
+                raise OSError('PRIVATE append sink')
+        class BrokenPop(list):
+            def pop(self):
+                raise OSError('PRIVATE pop sink')
+        for attribute, sink in [('samples', BrokenAppend), ('scopes', BrokenAppend),
+                ('scopes', BrokenPop), ('parents', BrokenAppend), ('parents', BrokenPop)]:
+            for first in (None, PublisherPrimaryFailure('PRIVATE primary')):
+                with self.subTest(attribute=attribute, sink=sink.__name__, failure=first is not None):
+                    profile, observer = self.recorder()
+                    setattr(observer, attribute, sink())
+                    result = object()
+                    function = Mock(return_value=result, side_effect=first)
+                    with profile.call('publisher_lifecycle'):
+                        if first is None:
+                            self.assertIs(observer.invoke('publish_one_composite', function, (), {}), result)
+                        else:
+                            with self.assertRaises(PublisherPrimaryFailure) as raised:
+                                observer.invoke('publish_one_composite', function, (), {})
+                            self.assertIs(raised.exception, first)
+                    function.assert_called_once_with()
+                    self.assertIsNone(observer.attempt)
+                    self.assertTrue(profile.recording_failed)
+                    self.assertFalse(observer.document()['complete'])
+
+    def test_foreign_produce_keeps_original_callback_and_cannot_create_owner_ack(self):
+        profile, observer = self.recorder()
+        observer.attempt = {'ordinal': 11, 'event_id': None, 'rows': []}
+        callback, token, failures = Mock(return_value=17), object(), []
+        with patch('confluent_kafka.Producer', DeliveryClientFixture):
+            producer = publisher_events.producer()
+        def foreign():
+            try:
+                producer.produce('foreign', key=token, value=token, on_delivery=callback)
+            except BaseException as error:
+                failures.append(error)
+        with observer._delivery_scope(producer):
+            thread = threading.Thread(target=foreign)
+            thread.start(); thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertIs(producer.client.calls[0][2]['on_delivery'], callback)
+            message = object()
+            self.assertEqual(producer.client.callbacks.pop()(None, message), 17)
+            callback.assert_called_once_with(None, message)
+        self.assertEqual(observer.records, [])
+        self.assertEqual(observer.ack_nonowner, 0)
+        self.assertNotIn('produce', vars(producer))
+
+    def test_unknown_producer_admission_failure_cannot_prevent_original_send(self):
+        class UnknownClient:
+            __slots__ = ()
+        UnknownClient.__module__ = 'labops.events'
+        UnknownClient.__qualname__ = 'producer.<locals>.Client'
+        profile, observer = self.recorder()
+        observer.attempt = {'ordinal': 2, 'event_id': None, 'rows': []}
+        function, token = Mock(return_value=17), UnknownClient()
+        with profile.call('publisher_lifecycle'):
+            self.assertEqual(observer.invoke('send_composite', function, (token,), {'fixture': True}), 17)
+        function.assert_called_once_with(token, fixture=True)
+        self.assertEqual(observer.ack_unavailable, 1)
+        self.assertTrue(profile.recording_failed)
+
+    def test_unknown_event_dict_descriptor_is_never_read_for_identity(self):
+        getter = Mock(return_value={'id': uuid.uuid4()})
+        class UnknownEvent:
+            __dict__ = property(lambda self: getter())
+        profile, observer = self.recorder()
+        observer.attempt = {'ordinal': 2, 'event_id': None, 'empty_claim': False, 'rows': []}
+        observer._bind_event(UnknownEvent())
+        getter.assert_not_called()
+        self.assertIsNone(observer.attempt['event_id'])
+
+    def test_model_hook_registration_failure_leaves_original_descriptors_intact(self):
+        class BrokenHooks(list):
+            def append(self, value):
+                raise OSError('PRIVATE hook sink')
+        from django.db.models import Model
+        profile, observer = self.recorder()
+        profile.hooks = BrokenHooks()
+        with self.assertRaises(OSError):
+            observer.install_model_hooks()
+        self.assertIs(inspect.getattr_static(OutboxEvent, 'from_db'), inspect.getattr_static(Model, 'from_db'))
+        self.assertIs(inspect.getattr_static(OutboxEvent, 'save'), inspect.getattr_static(Model, 'save'))
+
+    def test_each_publisher_hook_registration_failure_restores_all_original_bindings(self):
+        class BrokenNthHook(list):
+            def __init__(self, fail_at):
+                super().__init__()
+                self.fail_at, self.count = fail_at, 0
+            def append(self, value):
+                self.count += 1
+                if self.count == self.fail_at:
+                    raise OSError('PRIVATE hook sink')
+                return super().append(value)
+        bindings = PublisherProfileControlTests.bindings(self) + [(OutboxEvent, 'from_db'), (OutboxEvent, 'save')]
+        originals = [(target, name, inspect.getattr_static(target, name)) for target, name in bindings]
+        for fail_at in range(1, 11):
+            with self.subTest(fail_at=fail_at):
+                profile, observer = self.recorder()
+                profile.hooks = BrokenNthHook(fail_at)
+                install_publisher_hooks(profile)
+                profile.restore()
+                for target, name, original in originals:
+                    self.assertIs(inspect.getattr_static(target, name), original, name)
+                self.assertTrue(profile.hooks_restored)
+                self.assertTrue(profile.errors)
+                self.assertFalse(profile.summary()['complete'])
+
+    def test_callback_metadata_is_never_read_before_original_produce_or_callback(self):
+        getter, called = Mock(side_effect=OSError('PRIVATE metadata')), Mock(return_value=19)
+        class Callback:
+            __name__ = property(lambda self: getter())
+            def __call__(self, *args, **kwargs):
+                return called(*args, **kwargs)
+        profile, observer = self.recorder()
+        observer.attempt = {'ordinal': 2, 'event_id': None, 'rows': []}
+        with patch('confluent_kafka.Producer', DeliveryClientFixture):
+            producer = publisher_events.producer()
+        callback, message = Callback(), object()
+        with observer._delivery_scope(producer):
+            producer.produce('fixture', key='key', value=b'encoded', on_delivery=callback)
+            self.assertEqual(producer.client.callbacks.pop()(None, message), 19)
+        getter.assert_not_called()
+        called.assert_called_once_with(None, message)
+        self.assertEqual(len(producer.client.calls), 1)
+        self.assertNotIn('produce', vars(producer))
+
+
+from django.db import connection, transaction
+from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
+from labops.models import OutboxEvent
+from labops.tests.test_publisher_claim_reads import ClaimFixture
+
+
+class PublisherObservationDatabaseTests(ClaimFixture, TransactionTestCase):
+    """Real ORM/backend operations; PostgreSQL and SQLite remain distinct."""
+    def observed(self, producer, *, after_send=None):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        output = Path(directory.name) / 'publisher-profile-observation.json'
+        def command(*args, **kwargs):
+            return publisher_command.publish_one(producer, after_send=after_send)
+        with redirect_stderr(io.StringIO()), CaptureQueriesContext(connection) as queries:
+            result = run_publisher(output, {}, observation_only=True, call_command=command)
+        return result, json.loads(output.read_text()), list(queries)
+
+    def test_real_claim_commit_ack_and_final_autocommit_are_separate_with_same_sql_and_transport_counts(self):
+        baseline = self.row()
+        with patch('confluent_kafka.Producer', DeliveryClientFixture):
+            baseline_producer = publisher_events.producer()
+            with CaptureQueriesContext(connection) as baseline_queries:
+                self.assertTrue(publisher_events.publish_one(baseline_producer))
+            event = self.row()
+            observed_producer = publisher_events.producer()
+            returned, document, observed_queries = self.observed(observed_producer)
+        self.assertTrue(returned)
+        self.assertEqual(Counter(row['sql'].split()[0] for row in baseline_queries),
+                         Counter(row['sql'].split()[0] for row in observed_queries))
+        self.assertEqual(Counter(row[0] for row in baseline_producer.client.calls),
+                         Counter(row[0] for row in observed_producer.client.calls))
+        observation = document['publisher_observation']
+        self.assertTrue(observation['complete'], observation['attempts'])
+        self.assertFalse(document['coverage']['complete'])
+        self.assertEqual(observation['event_ids_observed'], 1)
+        self.assertEqual(observation['boundaries']['claim_physical_commit'], 1)
+        self.assertEqual(observation['boundaries']['publication_mark_execute'], 1)
+        rows = observation['records']
+        self.assertTrue(all(row['event_id'] == str(event.id) for row in rows))
+        self.assertTrue(all(row['complete'] and row['start_epoch_ns'] <= row['end_epoch_ns']
+            and row['start_perf_ns'] <= row['end_perf_ns'] and row['thread_cpu_ns'] >= 0 for row in rows))
+        ack = next(row for row in rows if row['stage'] == 'delivery_ack')
+        send = next(row for row in rows if row['stage'] == 'send_composite')
+        write = next(row for row in rows if row['stage'] == 'publication_mark_execute')
+        commit = next(row for row in rows if row['stage'] == 'claim_physical_commit')
+        self.assertEqual(ack['parent_id'], send['id'])
+        self.assertLessEqual(commit['end_perf_ns'], send['start_perf_ns'])
+        self.assertLessEqual(ack['start_perf_ns'], send['end_perf_ns'])
+        self.assertLessEqual(send['end_perf_ns'], write['start_perf_ns'])
+        self.assertTrue(write['autocommit'])
+        self.assertFalse(write['in_atomic_block'])
+        self.assertEqual(write['database_vendor'], connection.vendor)
+        event.refresh_from_db()
+        self.assertEqual(event.status, 'PUBLISHED')
+        self.assertNotIn('produce', vars(observed_producer))
+        self.assertNotIn('commit', vars(connection._connections[connection._alias]))
+
+    def test_legacy_hash_and_after_send_writes_are_not_publication_mark(self):
+        event, other = self.row(legacy=True), self.row(transport='local')
+        def after_send():
+            OutboxEvent.objects.filter(pk=other.pk).update(status='PUBLISHED')
+        with patch('confluent_kafka.Producer', DeliveryClientFixture):
+            result, document, queries = self.observed(publisher_events.producer(), after_send=after_send)
+        self.assertTrue(result)
+        self.assertEqual(sum(row['sql'].startswith('UPDATE') for row in queries), 4)
+        self.assertEqual(document['publisher_observation']['boundaries']['publication_mark_execute'], 1)
+        self.assertTrue(document['publisher_observation']['complete'])
+        event.refresh_from_db()
+        self.assertTrue(event.payload_hash)
+
+    def test_outer_atomic_uses_savepoint_and_never_claims_physical_commit_or_final_autocommit(self):
+        self.row()
+        with patch('confluent_kafka.Producer', DeliveryClientFixture), transaction.atomic():
+            result, document, queries = self.observed(publisher_events.producer())
+        self.assertTrue(result)
+        observation = document['publisher_observation']
+        self.assertFalse(observation['complete'])
+        self.assertNotIn('claim_physical_commit', observation['boundaries'])
+        self.assertIn('claim_physical_commit', observation['attempts'][0]['missing_boundaries'])
+        self.assertFalse(observation['attempts'][0]['publication_autocommit_observed'])
+        self.assertTrue(any(row['sql'].startswith('SAVEPOINT') for row in queries))
+
+    def test_shared_database_foreign_commit_is_not_attributed_to_owner_attempt(self):
+        connection.ensure_connection()  # Test fixture setup, outside observation.
+        database = connection._connections[connection._alias]
+        profile = CPUProfile('publisher', observation_only=True)
+        observer = PublisherObservation(profile)
+        observer.database = database
+        observer.attempt = {'ordinal': 13, 'event_id': None, 'rows': []}
+        failures, returned = [], []
+        database.inc_thread_sharing()
+        def foreign():
+            try:
+                returned.append(database.commit())
+            except BaseException as error:
+                failures.append(error)
+        try:
+            with observer._commit_scope():
+                thread = threading.Thread(target=foreign)
+                thread.start(); thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+        finally:
+            database.dec_thread_sharing()
+        self.assertEqual(failures, [])
+        self.assertEqual(returned, [None])
+        self.assertEqual(observer.records, [])
+        self.assertNotIn('commit', vars(database))

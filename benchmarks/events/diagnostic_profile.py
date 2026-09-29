@@ -260,10 +260,14 @@ class OwnedPythonProfile:
 
 class CPUProfile:
     """Own-thread diagnosis; ordinary diagnostic failure never changes work."""
-    def __init__(self, role, *, lane=None, profiler_factory=None, engine='cprofile'):
+    def __init__(self, role, *, lane=None, profiler_factory=None, engine='cprofile', observation_only=False):
         if role not in {'generator', 'publisher'} or (role == 'generator' and lane not in range(4)):
             raise ValueError('Invalid fixed profile role')
         request_profile(True, engine)
+        if type(observation_only) is not bool or (observation_only and (role != 'publisher' or engine != 'cprofile')):
+            raise ValueError('Invalid publisher observation request')
+        self.observation_only = observation_only
+        self.publisher_observation = None
         self.engine = engine
         self.role, self.lane = role, lane
         self.owner = threading.get_ident()
@@ -280,6 +284,11 @@ class CPUProfile:
         self.recording_failed = False
         self.graph_unavailable = False
         self.primary_error = None
+        if observation_only:
+            # Fixed owner-thread clocks require no function profiler. They
+            # cannot qualify a run or imply an available function graph.
+            self.graph_unavailable = True
+            return
         try:
             if sys.getprofile() is not None:
                 raise RuntimeError('ExistingProfileHook')
@@ -335,7 +344,7 @@ class CPUProfile:
     def phase(self, name):
         if name not in PHASES:
             raise ValueError('Unknown fixed profile phase')
-        if not self.owning_thread() or not self.recording_active:
+        if self.observation_only or not self.owning_thread() or not self.recording_active:
             yield
             return
         start = None
@@ -480,7 +489,7 @@ class CPUProfile:
             except BaseException as error:
                 self.record_error('disable_cleanup', error)
 
-    def hook(self, target, name, phase, *, expected=None, ordinal=False):
+    def hook(self, target, name, phase, *, expected=None, ordinal=False, observer=None):
         try:
             original = getattr(target, name)
             same = (original is expected or (getattr(original, '__func__', None) is not None
@@ -507,19 +516,23 @@ class CPUProfile:
                     self.ordinal = count
                 try:
                     with self.phase(phase):
+                        if observer is not None:
+                            return observer.invoke(phase, original, args, kwargs)
                         return original(*args, **kwargs)
                 finally:
                     if ordinal and self.owning_thread():
                         self.ordinal = prior
-            setattr(target, name, wrapper)
+            # Register before mutation so a broken diagnostic sink cannot
+            # leave an untracked wrapper installed on a business callable.
             self.hooks.append((target, name, previous, wrapper, locally_defined))
+            setattr(target, name, wrapper)
         except BaseException as error:
             self.record_error('hook_install', error)
 
     def restore(self):
         for target, name, previous, wrapper, locally_defined in reversed(self.hooks):
             try:
-                if getattr(target, name) is not wrapper:
+                if vars(target).get(name) is not wrapper:
                     raise RuntimeError('ProfileHookChanged')
                 if locally_defined:
                     setattr(target, name, previous)
@@ -578,6 +591,12 @@ class CPUProfile:
                 'phase_scope': 'own thread; fixed phases recorded independently of function graph admission',
                 'coverage': self.summary(), 'calls': self.calls, 'phases': self.phases, **graph}
             value['function_graph_status'] = 'UNAVAILABLE' if self.graph_unavailable else 'COMPLETE'
+            if self.observation_only:
+                value.update(observation_only=True, function_profile_requested=False,
+                    function_graph_status='NOT_REQUESTED',
+                    scope='own main thread; fixed publisher observation clocks only')
+            if self.publisher_observation is not None:
+                value['publisher_observation'] = self.publisher_observation.document()
             if self.engine == 'python-profile-owned':
                 value.update(scope='own main thread; owned Python callback active only during callable scopes',
                     callback_admission='sys.getprofile() is owned adapter', bias_seconds=0,

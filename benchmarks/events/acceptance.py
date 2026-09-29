@@ -2931,7 +2931,8 @@ class Harness:
                     for row in getattr(self, 'runtime_diagnostics', [])))
         diagnostics_qualified = not diagnostics_enabled or diagnostics_complete
         profile_evidence = self.diagnostic_profile_evidence()
-        qualification_admissible = not profile_evidence['enabled']
+        qualification_admissible = (not profile_evidence['enabled']
+            and not getattr(self, 'publisher_observation_enabled', False))
         final_complete = (final_state['database_observed'] and final_state['offsets_observed']
             and not final_state['errors'] and not final_state['unpublished_count']
             and reconciliation_complete and generation_complete and topologies_complete and diagnostics_qualified
@@ -2950,6 +2951,7 @@ class Harness:
         report = {'passed': qualification_admissible and error is None and all(case.get('passed') for case in self.cases) and final_complete,
             'qualification_admissible': qualification_admissible,
             'diagnostic_profile': profile_evidence,
+            'publisher_observation_enabled': getattr(self, 'publisher_observation_enabled', False),
             'consumer_topology': getattr(self, 'topology', topology_profile(
                 getattr(self, 'consumer_topology', DEFAULT_PRESET), writer_topology=self.writer_topology)),
             'writer_topology': writer_profile(self.writer_topology),

@@ -39,6 +39,10 @@ on:
         description: 'Own-thread CPU profiling only: an enabled run is never acceptance-admissible'
         type: boolean
         default: false
+      publisher_observation:
+        description: 'One finite steady publisher-phase diagnostic; never capacity acceptance or a fault matrix'
+        type: boolean
+        default: false
       diagnostic_profile_engine:
         description: 'Explicit diagnostic engine; python-profile-owned requires diagnostic_profile=true'
         type: choice
@@ -71,6 +75,7 @@ jobs:
       EVENTS_TIER: ${{ github.event.inputs.tier || 'smoke' }}
       RUNTIME_DIAGNOSTICS: ${{ github.event.inputs.runtime_diagnostics || 'false' }}
       DIAGNOSTIC_PROFILE: ${{ github.event.inputs.diagnostic_profile || 'false' }}
+      PUBLISHER_OBSERVATION: ${{ github.event.inputs.publisher_observation || 'false' }}
       DIAGNOSTIC_PROFILE_ENGINE: ${{ github.event.inputs.diagnostic_profile_engine || 'cprofile' }}
       CONSUMER_TOPOLOGY: ${{ github.event.inputs.consumer_topology || 'single' }}
       WRITER_TOPOLOGY: ${{ github.event.inputs.writer_topology || 'writers-4' }}
@@ -81,6 +86,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Admit joint writer and consumer request before Python setup
         run: |
+          case "$PUBLISHER_OBSERVATION" in
+            true) [ "$DIAGNOSTIC_PROFILE" = false ] && [ "$EVENTS_TIER" = smoke ] || { echo 'Publisher observation requires smoke and function profiling OFF'; exit 2; } ;;
+            false) ;;
+            *) echo 'Invalid publisher observation boolean'; exit 2 ;;
+          esac
+          if [ "$PUBLISHER_OBSERVATION" = true ]; then
+            python3 benchmarks/events/publisher_probe.py --admit-only --run-id "ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --evidence-dir "infra/events/validation/evidence/ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY"
+          fi
           case "$DIAGNOSTIC_PROFILE_ENGINE" in
             cprofile) ;;
             python-profile-owned) [ "$DIAGNOSTIC_PROFILE" = true ] || { echo 'Explicit Python engine requires profiling enabled'; exit 2; } ;;
@@ -153,7 +166,11 @@ jobs:
             false) ;;
             *) echo 'Invalid diagnostic profile boolean'; exit 2 ;;
           esac
-          python benchmarks/events/acceptance.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+          if [ "$PUBLISHER_OBSERVATION" = true ]; then
+            python benchmarks/events/publisher_probe.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+          else
+            python benchmarks/events/acceptance.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+          fi
       - name: Verify actual offsets topic replication and topic configuration
         if: ${{ always() && steps.runner_profile.outcome == 'success' }}
         run: |
