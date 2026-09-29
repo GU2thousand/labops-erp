@@ -156,11 +156,17 @@ p95/p99 were 6.49619/6.68469 seconds and notification p95/p99 were
 exceeded five seconds. Exact counts and complete native diagnostics do not
 replace those failed rate and latency gates.
 
-Paired PostgreSQL timeout queries retain their original scope and budgets:
-the publisher/DLQ helper reads both previous session values together, applies
-both values together, and restores both together (three statements instead of
-six). A restore database error still closes the application connection and
-preserves an active body exception. Database-effect workers set both transaction-
+PostgreSQL timeout queries retain their original scope and budgets. The
+publisher/DLQ helper now materializes both previous session values before
+applying both settings in one statement, then restores both saved values in
+the original second statement. The earlier paired implementation used three
+statements per operation; this single setup change removes one round trip.
+Any setup execute/fetch/result failure discards the application session with
+unknown settings and preserves the original exception; the body is not entered.
+The independent ownership session is untouched. The existing restore database-
+error path still closes the application connection. See the
+[setup hypothesis and required proof](../publisher-budget-setup-hypothesis.md).
+Database-effect workers set both transaction-
 local values in one statement; the original atomic context remains, and SET
 LOCAL lasts until the outer transaction commits or rolls back. Publisher owner
 checks, lease checks, per-message broker ACK, conditional writeback and consumer

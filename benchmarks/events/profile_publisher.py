@@ -1,5 +1,5 @@
 """Owned validation bootstrap; the real production management command is intact."""
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, _GeneratorContextManager
 from functools import wraps
 import ast
 import inspect
@@ -10,7 +10,7 @@ import re
 import sys
 import time
 import textwrap
-from types import FunctionType
+from types import FunctionType, GetSetDescriptorType
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,7 +24,7 @@ class PublisherObservation:
     includes its driver's commit; it is not a separately measured commit.
     """
     MAX_ATTEMPTS = 4096
-    MAX_RECORDS = 65536
+    MAX_RECORDS = 131072
 
     def __init__(self, profile):
         self.profile = profile
@@ -41,7 +41,14 @@ class PublisherObservation:
         self.native_admission_preflight_calls = 0
         self.native_hook_installed = False
         self.claim_strategy_at_install = 'orm_model_hooks'
+        self.deadline_scope_depth = 0
+        self.deadline_hook_installed = False
+        self.owner_execute_unavailable = 0
+        self.context_unavailable = 0
+        self.cleanup_primary = None
         from labops import events
+        from labops.worker_metrics import OperationDeadlineExceeded
+        self.deadline_error_type = OperationDeadlineExceeded
         self.publication_code = events.publish_one.__code__
         self.publication_lines = set()
         if self.publication_code.co_name == 'publish_one':
@@ -53,13 +60,33 @@ class PublisherObservation:
                             and keyword.value.value == 'PUBLISHED' for keyword in node.value.keywords)):
                     self.publication_lines.update(range(first_line + node.lineno - 1, first_line + node.end_lineno))
 
-    def _error(self, stage, error):
-        # Diagnostic errors must not alter the original call's result/error.
+    def _error(self, stage, error, *, primary=None):
+        # The real one-shot deadline is a business control, including when its
+        # signal lands in a clock/sink frame. Ordinary diagnostic faults stay
+        # contained; a secondary control must preserve a known primary error.
+        if primary is None:
+            primary = self.cleanup_primary
         self.profile.recording_failed = True
+        if type(error) is self.deadline_error_type and primary is None:
+            raise error
         try:
-            self.profile.record_error(stage, error)
-        except BaseException:
+            self._record_error(stage, error)
+        except BaseException as recording_error:
             self.profile.recording_failed = True
+            if type(recording_error) is self.deadline_error_type and primary is None:
+                raise
+
+    def _record_error(self, stage, error):
+        if not self.profile.observation_only:
+            return self.profile.record_error(stage, error)
+        # The legacy cProfile sink contains BaseException internally. During a
+        # live one-shot deadline that could consume its production control, so
+        # this finite observer uses the same sanitized row with its own guard.
+        from benchmarks.events.diagnostic_profile import _safe_name
+        errors = self.profile.errors
+        if type(errors) is not list:
+            raise RuntimeError('UnsupportedPublisherObservationErrorSink')
+        errors.append({'stage': stage, 'error_type': _safe_name(type(error).__name__)})
 
     def _clock(self):
         self.clock_read_calls += 1
@@ -80,6 +107,7 @@ class PublisherObservation:
         clock = self._clock()
         row = {'id': len(self.records) + 1, 'parent_id': self.parents[-1] if self.parents else None,
             'stage': stage, 'ordinal': self.attempt['ordinal'], 'event_id': self.attempt['event_id'],
+            'attempt_id': self.attempt.get('attempt_id', self.attempt['ordinal']),
             'claim_path': self.attempt.get('claim_path', 'unobserved'),
             'start_epoch_ns': clock[0] if clock else None,
             'start_perf_ns': clock[1] if clock else None,
@@ -119,7 +147,7 @@ class PublisherObservation:
                         row.update(wall_ns=clock[1] - row['start_perf_ns'],
                             thread_cpu_ns=clock[2] - row['start_thread_cpu_ns'], complete=True)
             except BaseException as error:
-                self._error('publisher_observation_end', error)
+                self._error('publisher_observation_end', error, primary=original)
             finally:
                 if parent_installed:
                     try:
@@ -127,7 +155,7 @@ class PublisherObservation:
                             raise RuntimeError('PublisherObservationParentChanged')
                         self.parents.pop()
                     except BaseException as error:
-                        self._error('publisher_observation_parent_restore', error)
+                        self._error('publisher_observation_parent_restore', error, primary=original)
 
     @staticmethod
     def _exception_type(error):
@@ -147,7 +175,7 @@ class PublisherObservation:
 
     @contextmanager
     def _scope(self, phase):
-        installed = False
+        installed, original = False, None
         try:
             self.scopes.append(phase)
             installed = True
@@ -155,16 +183,19 @@ class PublisherObservation:
             self._error('publisher_observation_scope_start', error)
         try:
             yield
+        except BaseException as error:
+            original = error
+            raise
         finally:
             if installed:
                 try:
                     self.scopes.pop()
                 except BaseException as error:
-                    self._error('publisher_observation_scope_restore', error)
+                    self._error('publisher_observation_scope_restore', error, primary=original)
 
     @contextmanager
     def _instance_hook(self, target, name, wrapper):
-        previous, installed, local = None, False, False
+        previous, installed, local, original = None, False, False, None
         try:
             local = name in vars(target)
             previous = vars(target).get(name)
@@ -174,6 +205,9 @@ class PublisherObservation:
             self._error('publisher_observation_hook', error)
         try:
             yield installed
+        except BaseException as error:
+            original = error
+            raise
         finally:
             if installed:
                 try:
@@ -184,11 +218,11 @@ class PublisherObservation:
                     else:
                         delattr(target, name)
                 except BaseException as error:
-                    self._error('publisher_observation_restore', error)
+                    self._error('publisher_observation_restore', error, primary=original)
 
     @contextmanager
     def _database_scope(self):
-        stack, previous = ExitStack(), self.database
+        stack, previous, original = ExitStack(), self.database, None
         try:
             from django.db import connections, DEFAULT_DB_ALIAS
             self.database = connections[DEFAULT_DB_ALIAS]
@@ -197,12 +231,16 @@ class PublisherObservation:
             self._error('publisher_observation_database', error)
         try:
             yield
+        except BaseException as error:
+            original = error
+            raise
         finally:
             try:
                 stack.close()
             except BaseException as error:
-                self._error('publisher_observation_database_restore', error)
-            self.database = previous
+                self._error('publisher_observation_database_restore', error, primary=original)
+            finally:
+                self.database = previous
 
     @contextmanager
     def _commit_scope(self):
@@ -243,7 +281,9 @@ class PublisherObservation:
         stage = None
         try:
             phase = self.scopes[-1] if self.scopes else None
-            if isinstance(sql, str) and '"labops_outboxevent"' in sql:
+            if phase in {'budget_setup_composite', 'budget_restore_composite'}:
+                stage = phase.replace('_composite', '_execute')
+            elif isinstance(sql, str) and '"labops_outboxevent"' in sql:
                 status = None
                 if sql.lstrip().startswith('UPDATE') and isinstance(params, (tuple, list)):
                     # Model.save orders fields by declaration; lease_token
@@ -267,24 +307,240 @@ class PublisherObservation:
                         and status == 'PUBLISHED'
                         and self._publication_callsite()):
                     stage = 'publication_mark_execute'
+                elif phase == 'lease_check' and self.attempt is not None and self.attempt.get('scope') == 'operation_deadline_context':
+                    stage = 'lease_check_execute'
         except BaseException as error:
             self._error('publisher_observation_sql_classification', error)
-        if stage is None or not self.profile.owning_thread() or self.attempt is None:
+        if not self.profile.owning_thread() or self.attempt is None:
+            return execute(sql, params, many, context)
+        if stage is None and self.attempt.get('scope') == 'operation_deadline_context':
+            stage = 'application_other_execute'
+        if stage is None:
             return execute(sql, params, many, context)
         if stage == 'claim_query_execute':
             self._mark_claim_path('orm')
+        return self._execute_record(stage, self.database, execute, sql, params, many, context)
+
+    def _execute_record(self, stage, database, execute, sql, params, many, context):
+        try:
+            counts = self.attempt.setdefault('execute_counts', {})
+            counts[stage] = counts.get(stage, 0) + 1
+        except BaseException as error:
+            self._error('publisher_observation_execute_count', error)
         with self._measure(stage) as row:
             if row is not None:
                 try:
-                    autocommit, in_atomic = self.database.autocommit, self.database.in_atomic_block
+                    descriptor = inspect.getattr_static(type(database), '__dict__', None)
+                    if type(descriptor) is GetSetDescriptorType:
+                        state = descriptor.__get__(database, type(database))
+                    else:
+                        raise RuntimeError('UnsupportedPublisherDatabaseStateObservation')
+                    autocommit, in_atomic = state.get('autocommit'), state.get('in_atomic_block')
+                    if type(autocommit) is not bool or type(in_atomic) is not bool:
+                        raise RuntimeError('UnsupportedPublisherDatabaseTransactionStateObservation')
+                    vendor = inspect.getattr_static(database, 'vendor', None)
+                    if type(vendor) is not str:
+                        raise RuntimeError('UnsupportedPublisherDatabaseVendorObservation')
                     row.update(autocommit=autocommit,
                         in_atomic_block=in_atomic,
-                        database_vendor=self.database.vendor,
+                        database_vendor=vendor,
                         boundary=('driver_execute_including_autocommit' if stage == 'publication_mark_execute'
                             and autocommit and not in_atomic else 'driver_execute_excluding_fetch'))
                 except BaseException as error:
                     self._error('publisher_observation_database_state', error)
             return execute(sql, params, many, context)
+
+    @contextmanager
+    def _owner_database_scope(self, owner, stage):
+        stack, original = ExitStack(), None
+        try:
+            from labops.publisher_shards import PublisherShardOwner
+            from django.db.backends.postgresql.base import DatabaseWrapper
+            from django.db.backends.base.base import BaseDatabaseWrapper
+            descriptor = inspect.getattr_static(PublisherShardOwner, '__dict__', None)
+            if (type(owner) is not PublisherShardOwner or type(descriptor) is not GetSetDescriptorType
+                    or descriptor.__objclass__ is not PublisherShardOwner):
+                raise RuntimeError('UnsupportedPublisherOwnerObservation')
+            state = object.__getattribute__(owner, '__dict__')
+            database = state.get('_connection')
+            if state.get('_sqlite_owned') is not True and state.get('_lost') is not True:
+                if type(database) is not DatabaseWrapper or database is self.database:
+                    raise RuntimeError('UnsupportedPublisherOwnerDatabaseObservation')
+                descriptor = inspect.getattr_static(type(database), '__dict__', None)
+                if type(descriptor) is not GetSetDescriptorType:
+                    raise RuntimeError('UnsupportedPublisherOwnerDatabaseStateObservation')
+                database_state = descriptor.__get__(database, type(database))
+                alias = database_state.get('alias')
+                if type(alias) is not str or alias != 'publisher_shard_owner':
+                    raise RuntimeError('UnsupportedPublisherOwnerDatabaseObservation')
+                execute_wrapper = inspect.getattr_static(database, 'execute_wrapper', None)
+                if (type(execute_wrapper) is not FunctionType
+                        or execute_wrapper is not inspect.getattr_static(BaseDatabaseWrapper, 'execute_wrapper')):
+                    raise RuntimeError('UnsupportedPublisherOwnerExecuteWrapperObservation')
+                wrappers = database_state.get('execute_wrappers')
+                if (type(wrappers) is not list or inspect.getattr_static(database, 'execute_wrappers', None) is not wrappers):
+                    raise RuntimeError('UnsupportedPublisherOwnerExecuteWrapperStateObservation')
+                attempt = self.attempt
+                def owner_execute(execute, sql, params, many, context):
+                    if not self.profile.owning_thread() or self.attempt is not attempt:
+                        return execute(sql, params, many, context)
+                    return self._execute_record(stage, database, execute, sql, params, many, context)
+                stack.enter_context(execute_wrapper.__get__(database, type(database))(owner_execute))
+        except BaseException as error:
+            self.owner_execute_unavailable += 1
+            self._error('publisher_observation_owner_database', error)
+        try:
+            yield
+        except BaseException as error:
+            original = error
+            raise
+        finally:
+            try:
+                stack.close()
+            except BaseException as error:
+                self._error('publisher_observation_owner_database_restore', error, primary=original)
+
+    @contextmanager
+    def _attempt_scope(self, scope):
+        self.attempts_seen += 1
+        if self.attempts_seen > self.MAX_ATTEMPTS:
+            self.overflow_attempts += 1
+            yield None
+            return
+        self.sampled_attempts += 1
+        prior = self.attempt
+        sample = {'attempt_id': self.attempts_seen,
+            'ordinal': self.attempts_seen if scope == 'operation_deadline_context' else self.profile.ordinal,
+            'event_id': None, 'empty_claim': False, 'claim_returned': False, 'publish_invoked': False,
+            'publish_result': None, 'publish_result_status': 'not_invoked',
+            'claim_path': 'unobserved', 'scope': scope, 'rows': [], 'execute_counts': {}}
+        self.attempt = sample
+        original = None
+        try:
+            yield sample
+        except BaseException as error:
+            original = error
+            raise
+        finally:
+            try:
+                if sample['claim_returned'] and sample['event_id'] is None and not sample['empty_claim']:
+                    self.missing_event_ids += 1
+                sample['outcome'] = 'error' if original is not None else 'returned'
+                sample['exception_type'] = self._exception_type(original)
+                self.samples.append(sample)
+            except BaseException as error:
+                self._error('publisher_observation_sample_finalize', error, primary=original)
+            finally:
+                self.attempt = prior
+
+    @contextmanager
+    def context_phase(self, phase):
+        try:
+            eligible = self.profile.owning_thread() and self.profile.recording_active and self.attempt is not None
+        except BaseException as error:
+            self._error('publisher_observation_context_phase', error)
+            eligible = False
+        if not eligible:
+            yield
+            return
+        with self._scope(phase), self._measure(phase):
+            yield
+
+    @contextmanager
+    def context_delegate(self, prefix, original, args, kwargs):
+        entered = False
+        try:
+            with self.context_phase(prefix + '_setup_composite'):
+                manager = original(*args, **kwargs)
+                admitted = type(manager) is _GeneratorContextManager
+                if admitted:
+                    # Match Python's cached type-level context protocol. The
+                    # cleanup guarantee starts before setup measurement exits.
+                    enter, exit = type(manager).__enter__, type(manager).__exit__
+                    value = enter(manager)
+                    entered = True
+                else:
+                    self.context_unavailable += 1
+                    if self.attempt is not None:
+                        self.attempt['context_unavailable'] = True
+            if not admitted:
+                with manager as value:
+                    yield value
+                return
+            yield value
+        except BaseException:
+            info = sys.exc_info()
+            if not entered:
+                raise
+            suppressed = self._context_exit(prefix, manager, exit, info)
+            if not suppressed:
+                raise
+            try:
+                if self.attempt is not None:
+                    self.attempt['suppressed_context_error'] = True
+            except BaseException as error:
+                self._error('publisher_observation_context_suppression', error)
+        else:
+            if entered:
+                self._context_exit(prefix, manager, exit, (None, None, None))
+
+    def _context_exit(self, prefix, manager, exit, info):
+        called, prior = False, self.cleanup_primary
+        self.cleanup_primary = info[1] if info[1] is not None else prior
+        try:
+            try:
+                with self.context_phase(prefix + '_restore_composite'):
+                    called = True
+                    return exit(manager, *info)
+            except BaseException as error:
+                if called:
+                    # Original exit exceptions retain Python's replacement
+                    # semantics; measurement finalizers preserve that error.
+                    raise
+                if type(error) is self.deadline_error_type and info[1] is None:
+                    control_info = sys.exc_info()
+                    if not exit(manager, *control_info):
+                        raise
+                    if self.attempt is not None:
+                        self.attempt['suppressed_context_error'] = True
+                    return True
+                self._error('publisher_observation_context_exit', error, primary=info[1])
+                return exit(manager, *info)
+        finally:
+            self.cleanup_primary = prior
+
+    def _publish(self, original, args, kwargs):
+        sample = self.attempt
+        sample['publish_invoked'] = True
+        sample['publish_result_status'] = 'no_return'
+        result = original(*args, **kwargs)
+        sample['publish_result_status'] = 'observed_bool' if type(result) is bool else 'unsupported_nonbool'
+        sample['publish_result'] = result if type(result) is bool else None
+        return result
+
+    @contextmanager
+    def deadline_context(self, original, args, kwargs):
+        try:
+            eligible = self.profile.owning_thread() and self.profile.recording_active and not self.deadline_scope_depth
+        except BaseException as error:
+            self._error('publisher_observation_deadline_eligibility', error)
+            eligible = False
+        if not eligible:
+            with original(*args, **kwargs) as value:
+                yield value
+            return
+        self.deadline_scope_depth += 1
+        try:
+            with self._attempt_scope('operation_deadline_context') as sample:
+                if sample is None:
+                    with original(*args, **kwargs) as value:
+                        yield value
+                else:
+                    with self._scope('deadline_scope_composite'), self._measure('deadline_scope_composite'), self._database_scope():
+                        with self.context_delegate('deadline', original, args, kwargs) as value:
+                            yield value
+        finally:
+            self.deadline_scope_depth -= 1
 
     def _mark_claim_path(self, path):
         try:
@@ -296,6 +552,7 @@ class PublisherObservation:
 
     def _bind_event(self, event):
         try:
+            self.attempt['claim_returned'] = True
             self.attempt['empty_claim'] = event is None
             # Never access a descriptor/deferred field: that could issue SQL.
             from django.db.models import Model
@@ -376,36 +633,39 @@ class PublisherObservation:
     def invoke(self, phase, original, args, kwargs):
         if not self.profile.owning_thread() or not self.profile.recording_active:
             return original(*args, **kwargs)
-        if phase == 'publish_one_composite':
-            self.attempts_seen += 1
-            if self.attempts_seen > self.MAX_ATTEMPTS:
-                self.overflow_attempts += 1
-                return original(*args, **kwargs)
-            self.sampled_attempts += 1
+        if phase == 'publish_one_composite' and self.attempt is not None and self.attempt.get('publish_invoked'):
+            # The command's deadline scope publishes at most one record. An
+            # after_send callback or an unsupported extra call must not rebind
+            # all first-event rows to another event and claim complete coverage.
             prior = self.attempt
-            self.attempt = {'ordinal': self.profile.ordinal, 'event_id': None, 'empty_claim': False,
-                'claim_path': 'unobserved', 'rows': []}
-            outcome = 'error'
+            self._error('publisher_observation_multiple_publish', RuntimeError('UnsupportedMultiplePublishObservation'))
+            self.attempt = None
             try:
-                with self._scope(phase), self._measure(phase), self._database_scope():
-                    result = original(*args, **kwargs)
-                    outcome = 'returned'
-                    return result
+                return original(*args, **kwargs)
             finally:
-                try:
-                    if self.attempt['event_id'] is None and not self.attempt['empty_claim']:
-                        self.missing_event_ids += 1
-                    self.attempt['outcome'] = outcome
-                    self.samples.append(self.attempt)
-                except BaseException as error:
-                    self._error('publisher_observation_sample_finalize', error)
-                finally:
-                    self.attempt = prior
+                self.attempt = prior
+        if phase == 'publish_one_composite' and self.attempt is None:
+            # A bounded-out deadline must not start another publish-only sample.
+            if self.deadline_scope_depth:
+                return original(*args, **kwargs)
+            with self._attempt_scope('publish_one_call') as sample:
+                if sample is None:
+                    return original(*args, **kwargs)
+                with self._scope(phase), self._measure(phase), self._database_scope():
+                    return self._publish(original, args, kwargs)
         if self.attempt is None:
             return original(*args, **kwargs)
+        if phase == 'shard_ownership' and self.attempt.get('scope') == 'operation_deadline_context':
+            inner = 'publish_one_composite' in self.scopes
+            stage = ('inner' if inner else 'outer') + '_shard_ownership_composite'
+            with self._scope(stage), self._measure(stage), self._owner_database_scope(
+                    args[0] if args else kwargs.get('self'), stage.replace('_composite', '_execute')):
+                return original(*args, **kwargs)
         if phase == 'claim_atomic_materialization_composite':
             self._mark_claim_path('native_postgresql')
         with self._scope(phase), self._measure(phase):
+            if phase == 'publish_one_composite':
+                return self._publish(original, args, kwargs)
             if phase == 'claim_commit_composite':
                 with self._commit_scope():
                     result = original(*args, **kwargs)
@@ -496,27 +756,77 @@ class PublisherObservation:
             if sample['empty_claim']:
                 required = {'claim_physical_commit'} | ({'claim_atomic_claim_execute', 'claim_atomic_materialization_composite'}
                     if path == 'native_postgresql' else {'claim_query_execute'})
+            scope = sample.get('scope', 'publish_one_call')
+            if scope == 'operation_deadline_context':
+                required |= {'deadline_scope_composite', 'deadline_setup_composite', 'deadline_restore_composite',
+                             'outer_shard_ownership_composite', 'budget_setup_composite', 'budget_restore_composite'}
             observed = {row['stage'] for row in rows if row['complete'] and row['outcome'] in {'returned', 'success'}}
             missing = sorted(required - observed)
             publication = [row for row in rows if row['stage'] == 'publication_mark_execute']
             autocommit = bool(publication) and all(row.get('autocommit') is True
                 and row.get('in_atomic_block') is False for row in publication)
-            attempts.append({'ordinal': sample['ordinal'], 'event_id': sample['event_id'],
-                'claim_path': path,
+            errors = [row['stage'] for row in rows if row['outcome'] == 'error']
+            error_type = sample.get('exception_type')
+            if error_type == 'ShardOwnershipLost':
+                classification = 'owner_lost'
+            elif error_type == 'OperationDeadlineExceeded':
+                classification = 'deadline_exceeded'
+            elif any(stage.startswith('budget_setup_') for stage in errors):
+                classification = 'budget_setup_failed'
+            elif any(stage.startswith('budget_restore_') for stage in errors):
+                classification = 'budget_restore_failed'
+            elif 'deadline_setup_composite' in errors:
+                classification = 'deadline_setup_failed'
+            elif 'deadline_restore_composite' in errors:
+                classification = 'deadline_restore_failed'
+            elif sample.get('suppressed_context_error'):
+                classification = 'suppressed_context_error'
+            elif sample.get('context_unavailable'):
+                classification = 'unsupported_context'
+            elif sample['outcome'] == 'error':
+                classification = 'publish_failed' if sample.get('publish_invoked') else 'deadline_body_failed'
+            elif sample['empty_claim']:
+                classification = 'empty_claim'
+            elif not sample.get('publish_invoked', True):
+                classification = 'scope_without_publish'
+            elif path == 'orm' and self.claim_strategy_at_install == 'postgresql_helper_only':
+                classification = 'orm_fallback'
+            elif sample.get('publish_result') is False:
+                classification = 'publish_returned_false'
+            elif sample.get('publish_result') is not True:
+                classification = 'publish_result_unavailable'
+            elif missing or errors or not autocommit:
+                classification = 'publication_incomplete'
+            else:
+                classification = 'published_' + path
+            attempts.append({'attempt_id': sample.get('attempt_id', sample['ordinal']),
+                'ordinal': sample['ordinal'], 'event_id': sample['event_id'],
+                'claim_path': path, 'scope': scope, 'classification': classification,
+                'exception_type': error_type,
+                'context_unavailable': sample.get('context_unavailable', False),
+                'publish_result': sample.get('publish_result'),
+                'publish_result_status': sample.get('publish_result_status', 'unavailable'),
+                'statement_execute_counts': sample.get('execute_counts', {}),
                 'empty_claim': sample['empty_claim'], 'outcome': sample['outcome'],
                 'missing_boundaries': missing,
                 'publication_autocommit_observed': autocommit,
-                'complete': sample['outcome'] == 'returned' and path in {'native_postgresql', 'orm'}
-                    and not missing and (sample['empty_claim'] or
-                        (sample['event_id'] is not None and autocommit))})
+                'complete': sample['outcome'] == 'returned' and not errors and not sample.get('suppressed_context_error')
+                    and path in {'native_postgresql', 'orm'}
+                    and not missing and (sample['empty_claim'] and sample.get('publish_result') is False or
+                        (sample.get('publish_result') is True and sample['event_id'] is not None and autocommit))})
         complete = (bool(attempts) and any(row['event_id'] is not None for row in attempts)
             and all(row['complete'] for row in attempts) and not self.overflow_attempts
             and not self.overflow_records and not self.missing_event_ids and not self.clock_failures
             and not self.ack_unavailable and not self.ack_nonowner and not self.ack_late
             and not self.commit_unavailable and not self.profile.recording_failed
+            and not self.owner_execute_unavailable
+            and not self.context_unavailable
             and self.profile.hooks_restored
             and not any(row['stage'].startswith('publisher_observation') for row in self.profile.errors))
-        return {'schema_version': 1, 'max_sampled_attempts': self.MAX_ATTEMPTS,
+        counts = Counter()
+        for sample in self.samples:
+            counts.update(sample.get('execute_counts', {}))
+        return {'schema_version': 2, 'max_sampled_attempts': self.MAX_ATTEMPTS,
             'max_records': self.MAX_RECORDS, 'attempts_seen': self.attempts_seen,
             'sampled_attempts': self.sampled_attempts, 'overflow_attempts': self.overflow_attempts,
             'overflow_records': self.overflow_records, 'missing_event_ids': self.missing_event_ids,
@@ -528,6 +838,15 @@ class PublisherObservation:
             'native_admission_preflight_calls': self.native_admission_preflight_calls,
             'claim_strategy_at_install': self.claim_strategy_at_install,
             'native_hook_installed': self.native_hook_installed,
+            'deadline_hook_installed': self.deadline_hook_installed,
+            'attempt_scopes': dict(Counter(row['scope'] for row in attempts)),
+            'statement_execute_counts': dict(counts),
+            'owner_execute_unavailable': self.owner_execute_unavailable,
+            'context_unavailable': self.context_unavailable,
+            'topology_provenance': {'actual_topology': 'NOT_OBSERVED_IN_PROFILE',
+                'function_guard_template': {'writer_roles': 4},
+                'top_level_topology_fields': 'function profiling guard template',
+                'authoritative_actual_topology': ['runner-profile.json', 'writer-topology.json', 'consumer-topology.json']},
             'claim_paths': dict(Counter(row['claim_path'] for row in attempts)),
             'complete': complete, 'status': 'COMPLETE' if complete else 'INCOMPLETE',
             'attempts': attempts,
@@ -538,6 +857,9 @@ class PublisherObservation:
             'nested_times_additive': False, 'qualification_admissible': False,
             'clock_overhead_scope': 'clock reads only; total instrumentation overhead unmeasured',
             'limitations': ['claim query execute excludes fetching and ORM conversion outside from_db',
+                'deadline context scope includes original context factory, entry, body and exit; excludes heartbeat, loop bookkeeping, idle wait and shutdown',
+                'deadline attempt ordinals count entered observed contexts; publish-only ordinals retain the function hook counter',
+                'budget and owner execute counts are attempted driver calls, including failures; fetching and server cost are not isolated',
                 'native claim helper combines SQL construction, atomic scope, execute, fetch, typed materialization and commit',
                 'native claim execute combines candidate selection and lease update; their separate costs are unmeasured',
                 'PostgreSQL ORM fallback has no model hooks and may have incomplete materialization boundaries',
@@ -574,11 +896,45 @@ def install_publisher_hooks(profile):
         observer.install_claim_hooks()
         for target, name, phase, original in expected:
             profile.hook(target, name, phase, expected=original, ordinal=name == 'publish_one', observer=observer)
+        if profile.observation_only:
+            original_deadline = command.operation_deadline
+            if type(original_deadline) is not FunctionType or original_deadline is not worker_metrics.operation_deadline:
+                raise RuntimeError('UnexpectedPublisherDeadlineAlias')
+            inner = vars(original_deadline).get('__wrapped__')
+            closure = original_deadline.__closure__
+            if (type(inner) is not FunctionType or inner.__module__ != worker_metrics.__name__
+                    or inner.__qualname__ != 'operation_deadline'
+                    or Path(inner.__code__.co_filename).resolve() != ROOT / 'labops/worker_metrics.py'
+                    or Path(original_deadline.__code__.co_filename).resolve()
+                       != Path(contextmanager.__code__.co_filename).resolve()
+                    or not closure or len(closure) != 1 or closure[0].cell_contents is not inner):
+                raise RuntimeError('UnexpectedPublisherDeadlineSource')
+            @wraps(original_deadline)
+            @contextmanager
+            def deadline(*args, **kwargs):
+                with observer.deadline_context(original_deadline, args, kwargs) as value:
+                    yield value
+            profile.hooks.append((command, 'operation_deadline', original_deadline, deadline, True))
+            command.operation_deadline = deadline
+            observer.deadline_hook_installed = True
         original = command.database_statement_budget
 
         @wraps(original)
         @contextmanager
         def budget(*args, **kwargs):
+            if profile.observation_only:
+                try:
+                    eligible = profile.owning_thread() and observer.attempt is not None
+                except BaseException as error:
+                    observer._error('publisher_observation_budget_eligibility', error)
+                    eligible = False
+                if eligible:
+                    with observer.context_delegate('budget', original, args, kwargs) as value:
+                        yield value
+                else:
+                    with original(*args, **kwargs) as value:
+                        yield value
+                return
             manager = original(*args, **kwargs)
             with profile.phase('budget_setup_composite'):
                 value = manager.__enter__()

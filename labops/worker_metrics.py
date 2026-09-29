@@ -151,11 +151,28 @@ def database_statement_budget(seconds):
     if connection.vendor != 'postgresql':
         yield
         return
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT current_setting('statement_timeout'), current_setting('lock_timeout')")
-        previous_statement, previous_lock = cursor.fetchone()
-        cursor.execute("SELECT set_config('statement_timeout', %s, false), set_config('lock_timeout', %s, false)",
-                       [str(int(seconds * 1000)), str(settings.EVENT_DB_LOCK_TIMEOUT_MS)])
+    try:
+        with connection.cursor() as cursor:
+            # Materialize both old values before either session setter runs.
+            # Target-list evaluation order alone is not a read-before-set fence.
+            cursor.execute("""WITH previous AS MATERIALIZED (
+                SELECT current_setting('statement_timeout') AS statement_value,
+                       current_setting('lock_timeout') AS lock_value
+            )
+            SELECT previous.statement_value, previous.lock_value,
+                   set_config('statement_timeout', %s, false),
+                   set_config('lock_timeout', %s, false)
+            FROM previous""", [str(int(seconds * 1000)), str(settings.EVENT_DB_LOCK_TIMEOUT_MS)])
+            previous_statement, previous_lock, _, _ = cursor.fetchone()
+    except BaseException:
+        # A failed execute/fetch can follow successful server-side setters,
+        # while their prior values are still unknown to Python. Discard this
+        # application session rather than reuse an ambiguous timeout budget.
+        try:
+            connection.close()
+        except BaseException:
+            pass  # Cleanup must not replace the original setup/control error.
+        raise
     try:
         yield
     finally:
