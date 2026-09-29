@@ -5,17 +5,21 @@ actual admission policy, the real confluent producer, and the default tracing
 implementations. No broker records are sent by these tests.
 """
 from contextlib import ExitStack, contextmanager
+from datetime import timedelta
 import json
-from types import MethodType
+from types import CodeType, FunctionType, MethodType
 from unittest import skipUnless
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from confluent_kafka.cimpl import Producer
 from django.db import connection, connections
 from django.db.backends.postgresql.base import Cursor, DatabaseWrapper, ServerBindingCursor
 from django.db.models import signals as model_signals
+from django.db.models.fields import Field
 from django.test import SimpleTestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from opentelemetry import context, propagate, trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.context.contextvars_context import ContextVarsRuntimeContext
@@ -39,8 +43,9 @@ def ordinary_connection_capability(database=None):
 
     SimpleTestCase wraps the inherited capability even when the default
     database is allowed. The production policy must continue to refuse that
-    wrapper, so the fixture exposes the policy's captured ordinary descriptor
-    on the PostgreSQL class. Its teardown can also leave the original bound
+    wrapper, so the fixture restores the captured descriptor on its original
+    namespace owner, preserving its absence on the PostgreSQL subclass.
+    Its teardown can also leave the original bound
     cursor on the persistent default instance; remove only that exact method
     for the fixture and restore the same object afterwards. Unknown instance
     callbacks remain in place, with no production admission relaxation.
@@ -48,6 +53,20 @@ def ordinary_connection_capability(database=None):
     policy = command._BUDGET_ADMISSION
     ensure = next(descriptor for kind, name, descriptor in policy.descriptors
         if kind is DatabaseWrapper and name == 'ensure_connection')
+    snapshots = {id(kind): (kind, mro, dict(items)) for kind, _, mro, items in policy.class_namespaces[1]}
+    original_mro = snapshots[id(DatabaseWrapper)][1]
+    namespace_owner = next(kind for kind in original_mro if 'ensure_connection' in snapshots[id(kind)][2])
+    if snapshots[id(namespace_owner)][2]['ensure_connection'] is not ensure:
+        raise AssertionError('Fixture must expose the originally captured namespace binding')
+    current = vars(namespace_owner)['ensure_connection']
+    test_code = next(value for value in SimpleTestCase.ensure_connection_patch_method.__func__.__code__.co_consts
+        if type(value) is CodeType and value.co_name == 'patched_ensure_connection')
+    candidate, seen = current, set()
+    while type(candidate) is FunctionType and candidate.__code__ is test_code and id(candidate) not in seen:
+        seen.add(id(candidate))
+        closure = dict(zip(candidate.__code__.co_freevars, candidate.__closure__ or ()))
+        candidate = closure['real_ensure_connection'].cell_contents if 'real_ensure_connection' in closure else None
+    identified = candidate is ensure
     cursor = next(descriptor for kind, name, descriptor in policy.descriptors
         if kind is DatabaseWrapper and name == 'cursor')
     database = connections['default'] if database is None else database
@@ -58,8 +77,11 @@ def ordinary_connection_capability(database=None):
     if removed:
         del vars(database)['cursor']
     try:
-        with patch.object(DatabaseWrapper, 'ensure_connection', ensure):
-            yield
+        if identified:
+            with patch.object(namespace_owner, 'ensure_connection', ensure):
+                yield
+        else:
+            yield  # Unknown framework overrides stay visible to strict refusal.
     finally:
         if removed:
             vars(database)['cursor'] = original
@@ -144,6 +166,32 @@ class PublisherBudgetStaticAdmissionTests(SimpleTestCase):
             extension.assert_not_called()
         finally:
             vars(self.database).pop('cursor', None)
+
+    def test_fixture_restores_inherited_namespace_and_exact_test_wrapper_after_error(self):
+        snapshots = {id(kind): (mro, dict(items)) for kind, _, mro, items in self.policy.class_namespaces[1]}
+        owner = next(kind for kind in snapshots[id(DatabaseWrapper)][0]
+            if 'ensure_connection' in snapshots[id(kind)][1])
+        original = snapshots[id(owner)][1]['ensure_connection']
+        self.assertNotIn('ensure_connection', vars(DatabaseWrapper))
+        wrapper = SimpleTestCase.ensure_connection_patch_method()
+        marker = RuntimeError('Fixture teardown must retain original namespace state')
+        with patch.object(owner, 'ensure_connection', wrapper):
+            with self.assertRaises(RuntimeError) as raised:
+                with ordinary_connection_capability(self.database):
+                    self.assertIs(vars(owner)['ensure_connection'], original)
+                    self.assertNotIn('ensure_connection', vars(DatabaseWrapper))
+                    self.assertTrue(self.plain())
+                    raise marker
+            self.assertIs(raised.exception, marker)
+            self.assertIs(vars(owner)['ensure_connection'], wrapper)
+        extension = Mock(side_effect=AssertionError('Unknown framework callback must stay refused'))
+        with patch.object(owner, 'ensure_connection', extension):
+            with ordinary_connection_capability(self.database):
+                self.assertIs(vars(owner)['ensure_connection'], extension)
+                self.refused()
+        extension.assert_not_called()
+        self.assertNotIn('ensure_connection', vars(DatabaseWrapper))
+        self.assertTrue(self.plain())
 
     def test_unknown_default_wrapper_is_rejected_before_ops_or_attribute_getters(self):
         self.assertTrue(self.plain())
@@ -365,3 +413,37 @@ class PublisherBudgetNativeAdmissionPostgreSQLTests(TransactionTestCase):
                     self.assertIs(vars(database)['cursor'], extension)
                     self.assertIsNone(worker_metrics.PublisherBatchBudget._session(database))
                 extension.assert_not_called()
+
+    def test_two_real_ownership_queries_advance_field_counter_without_invalidating_global_policy(self):
+        # Exercise the ordinary Value(1) -> IntegerField construction in
+        # Query.exists(), without substituting publication or acknowledgement.
+        event = OutboxEvent.objects.create(event_type='experiment.completed', transport='kafka',
+            aggregate_type='experiment', aggregate_id=uuid4(), dedupe_key=str(uuid4()),
+            status='PROCESSING', lease_token=uuid4(), locked_until=timezone.now() + timedelta(hours=1))
+        policy = command._BUDGET_ADMISSION
+        self.assertIsNotNone(policy)
+        self.assertTrue(policy.valid)
+        for enabled in (False, True):
+            with self.subTest(server_side_binding=enabled), ordinary_connection_capability(), self.database(enabled) as database, plain_tracing():
+                broker = events.producer()
+                self.assertIs(type(broker.client), Producer)
+                before, raw = self.values(database), database.connection
+                with StopController() as stop, publisher_shard_owner(0, 1) as owner, operation_deadline(30):
+                    def admitted():
+                        self.assertIs(command._BUDGET_ADMISSION, policy, 'Never rebuild the global policy to hide drift')
+                        self.assertTrue(policy.plain(broker, owner, command._budget_aliases(), stop))
+                        self.assertIsNotNone(worker_metrics.PublisherBatchBudget._session(database))
+                        self.assertIs(database.connection, raw)
+                    admitted()
+                    for ordinal in range(2):
+                        with self.subTest(ownership_query=ordinal + 1):
+                            owner.assert_owned()
+                            counter = vars(Field)['creation_counter']
+                            with CaptureQueriesContext(database) as queries:
+                                self.assertIs(events.owned_event(event), True)
+                            self.assertEqual(len(queries), 1)
+                            self.assertIn('labops_outboxevent', queries[0]['sql'])
+                            self.assertIs(type(vars(Field)['creation_counter']), int)
+                            self.assertGreater(vars(Field)['creation_counter'], counter)
+                            admitted()
+                    self.assertEqual(self.values(database), before)

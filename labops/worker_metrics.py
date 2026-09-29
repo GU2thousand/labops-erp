@@ -1,17 +1,21 @@
 """Independent worker metrics; no payloads or event IDs in labels."""
 import hmac
+import builtins
 import inspect
 import logging
 import signal
 import threading
 import time
 from contextlib import contextmanager
-from types import FunctionType
+from types import FunctionType, MappingProxyType, MethodWrapperType, GetSetDescriptorType, MemberDescriptorType, ModuleType
+from functools import _lru_cache_wrapper
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
+from django.db.models import fields as _publisher_field_module
+from django.db.models import manager as _publisher_manager_module
 from django.db.backends.postgresql import psycopg_any as _budget_psycopg_any
 from psycopg import Connection as _BudgetConnection
 from psycopg import adapters as _budget_driver_adapters
@@ -32,6 +36,276 @@ _BUDGET_TZ_LOAD = _BUDGET_TZ_LOADER.load
 _BUDGET_ADAPTER_META = type(_BUDGET_TZ_LOADER)
 _BUDGET_TZ_HOOK = vars(_BUDGET_TZ_LOADER).get('__subclasshook__')
 _BUDGET_ABC_STATE_TYPE = type(vars(_BUDGET_TZ_LOADER).get('_abc_impl'))
+
+# These are owned native capabilities, not dynamically resolved class getters.
+_PUBLISHER_TYPE_DICT = type.__dict__['__dict__']
+_PUBLISHER_TYPE_MRO = type.__dict__['__mro__']
+_PUBLISHER_TYPE_MRO_KIND = type(_PUBLISHER_TYPE_MRO)
+_PUBLISHER_TYPE_DICT_GET = _PUBLISHER_TYPE_DICT.__get__
+_PUBLISHER_TYPE_MRO_GET = (_PUBLISHER_TYPE_MRO.__get__
+    if _PUBLISHER_TYPE_MRO_KIND is GetSetDescriptorType or _PUBLISHER_TYPE_MRO_KIND is MemberDescriptorType else None)
+_PUBLISHER_TYPE_DICT_SLOT = GetSetDescriptorType.__dict__['__get__']
+_PUBLISHER_TYPE_MRO_SLOT = (_PUBLISHER_TYPE_MRO_KIND.__dict__['__get__']
+    if _PUBLISHER_TYPE_MRO_KIND is GetSetDescriptorType or _PUBLISHER_TYPE_MRO_KIND is MemberDescriptorType else None)
+_PUBLISHER_NATIVE_LOOKUP = type.__getattribute__
+_PUBLISHER_NATIVE_HASH = type.__hash__
+_PUBLISHER_NATIVE_EQ = type.__eq__
+_PUBLISHER_CLASS_MISSING = object()
+_PUBLISHER_BASE_MANAGER = _publisher_manager_module.BaseManager
+_PUBLISHER_MANAGER = _publisher_manager_module.Manager
+_PUBLISHER_FIELD = _publisher_field_module.Field
+# These four concrete-class entries are ordinary Django bookkeeping, rather
+# than descriptor lookup capabilities. No inherited or similarly named class
+# receives an exception. Every live value is still checked on every record.
+_PUBLISHER_BOOKKEEPING_REFS = (
+    (_PUBLISHER_BASE_MANAGER, 'creation_counter', 1),
+    (_PUBLISHER_FIELD, 'creation_counter', 1),
+    (_PUBLISHER_FIELD, 'auto_creation_counter', -1),
+    (_PUBLISHER_MANAGER, '__slotnames__', 0),
+)
+_PUBLISHER_BUILTIN_REFS = tuple((name, name in globals(), globals().get(name), vars(builtins)[name])
+    for name in ('type', 'id', 'tuple', 'str', 'int', 'dict', 'list', 'set', 'len', 'any', 'zip', 'globals', 'vars',
+        'object', 'TypeError', 'KeyError', 'AttributeError', 'Exception'))
+
+# Snapshot only the static inspector's lookup algorithm and inputs. Python
+# 3.11/3.12 use a Python _static_getmro; 3.14 uses native bound descriptors and
+# the weakref cache. Unknown layouts are unavailable rather than invoked.
+_PUBLISHER_INSPECT_NAMES = ('getattr_static', '_is_type', '_static_getmro', '_check_class',
+    '_shadowed_dict', '_check_instance', '_get_dunder_dict_of_class',
+    '_shadowed_dict_from_weakref_mro_tuple', 'make_weakref', '_sentinel', 'types',
+    'type', 'object', 'dict', 'TypeError', 'KeyError', 'AttributeError')
+_PUBLISHER_INSPECT_REFS = tuple((name, name in vars(inspect), vars(inspect).get(name))
+    for name in _PUBLISHER_INSPECT_NAMES)
+_PUBLISHER_INSPECT_FUNCTIONS = []
+_PUBLISHER_INSPECT_WRAPPERS = []
+_PUBLISHER_INSPECT_VALID = True
+for _inspect_name, _inspect_present, _inspect_value in _PUBLISHER_INSPECT_REFS:
+    if _inspect_name in ('_sentinel', 'types', 'make_weakref') or not _inspect_present:
+        continue
+    if type(_inspect_value) is _lru_cache_wrapper:
+        _PUBLISHER_INSPECT_WRAPPERS.append((_inspect_value, dict(vars(_inspect_value))))
+        _inspect_value = vars(_inspect_value).get('__wrapped__')
+    if type(_inspect_value) is FunctionType:
+        if _inspect_value.__code__.co_filename != inspect.__file__:
+            _PUBLISHER_INSPECT_VALID = False
+        _PUBLISHER_INSPECT_FUNCTIONS.append((_inspect_value, _inspect_value.__code__,
+            _inspect_value.__defaults__, dict(_inspect_value.__kwdefaults__) if _inspect_value.__kwdefaults__ is not None else None,
+            dict(_inspect_value.__dict__)))
+    elif not (_inspect_name in ('_static_getmro', '_get_dunder_dict_of_class')
+            and type(_inspect_value) is MethodWrapperType
+            and _inspect_value.__self__ is (_PUBLISHER_TYPE_MRO if _inspect_name == '_static_getmro' else _PUBLISHER_TYPE_DICT)):
+        _PUBLISHER_INSPECT_VALID = False
+_PUBLISHER_INSPECT_FUNCTIONS = tuple(_PUBLISHER_INSPECT_FUNCTIONS)
+_PUBLISHER_INSPECT_WRAPPERS = tuple(_PUBLISHER_INSPECT_WRAPPERS)
+_PUBLISHER_INSPECT_TYPE_REFS = (vars(inspect.types).get('GetSetDescriptorType'), vars(inspect.types).get('MemberDescriptorType'))
+del _inspect_name, _inspect_present, _inspect_value
+
+
+def _publisher_class_read(kind, _dict_get=_PUBLISHER_TYPE_DICT_GET, _mro_get=_PUBLISHER_TYPE_MRO_GET):
+    """Read only the actual native namespace and MRO of one class."""
+    mro = _mro_get(kind)
+    namespace = _dict_get(kind)
+    if type(mro) is not tuple or not mro or mro[0] is not kind or len(mro) > 64:
+        return None
+    if type(namespace) is not MappingProxyType or len(namespace) > 4096:
+        return None
+    items = tuple(namespace.items())
+    if any(type(name) is not str for name, _ in items):
+        return None
+    return kind, type(kind), mro, items
+
+
+def _publisher_class_resolve(snapshot, kind, name, _missing=_PUBLISHER_CLASS_MISSING):
+    """Derive the standard class getattr_static result from copied state."""
+    entries = {id(entry[0]): entry for entry in snapshot[1]}
+    entry = entries.get(id(kind))
+    if entry is None or entry[0] is not kind:
+        return _missing
+    for ancestor in (*entry[2], *entries[id(entry[1])][2]):
+        namespace = dict(entries[id(ancestor)][3])
+        if name in namespace:
+            return namespace[name]
+    return _missing
+
+
+def _publisher_bookkeeping_names(kind, namespace, expected=None,
+        _rules=_PUBLISHER_BOOKKEEPING_REFS, _missing=_PUBLISHER_CLASS_MISSING):
+    """Validate only the four declared concrete-class bookkeeping facts."""
+    names = []
+    for owner, name, direction in _rules:
+        if kind is not owner:
+            continue
+        names.append(name)
+        current = namespace.get(name, _missing)
+        baseline = current if expected is None else expected.get(name, _missing)
+        if direction:
+            if type(current) is not int or type(baseline) is not int:
+                return None
+            if (direction == 1 and current < baseline) or (direction == -1 and current > baseline):
+                return None
+        elif ((current is not _missing and (type(current) is not list or len(current) != 0))
+                or (baseline is not _missing and (type(baseline) is not list or len(baseline) != 0))):
+            return None
+    return tuple(names)
+
+
+def _publisher_binding_is_bookkeeping(snapshot, kind, name, _rules=_PUBLISHER_BOOKKEEPING_REFS):
+    """An original descriptor binding must not intersect a bookkeeping rule."""
+    entry = None
+    for item in snapshot[1]:
+        if item[0] is kind:
+            entry = item
+            break
+    return entry is not None and any(name == key and any(ancestor is owner for ancestor in entry[2])
+        for owner, key, _ in _rules)
+
+
+def _publisher_class_capture(roots):
+    """Build a bounded identity closure before any regular class lookup."""
+    try:
+        if type(roots) is not tuple:
+            return None
+        entries, pending, seen, total = [], list(roots), set(), 0
+        while pending:
+            kind = pending.pop()
+            if id(kind) in seen:
+                continue
+            if len(seen) >= 1024:
+                return None
+            entry = _publisher_class_read(kind)
+            if entry is None or _publisher_bookkeeping_names(kind, dict(entry[3])) is None:
+                return None
+            seen.add(id(kind))
+            entries.append(entry)
+            total += len(entry[3])
+            if total > 65536:
+                return None
+            pending.extend(entry[2])
+            pending.append(entry[1])
+        snapshot = roots, tuple(entries)
+        by_id = {id(entry[0]): entry for entry in entries}
+        # inspect's regular entry.__dict__ access and (on 3.14) weakref cache
+        # must not execute custom metaclass lookup, hashing or equality.
+        for _, meta, _, _ in entries:
+            if (_publisher_class_resolve(snapshot, meta, '__getattribute__') is not _PUBLISHER_NATIVE_LOOKUP
+                    or _publisher_class_resolve(snapshot, meta, '__hash__') is not _PUBLISHER_NATIVE_HASH
+                    or _publisher_class_resolve(snapshot, meta, '__eq__') is not _PUBLISHER_NATIVE_EQ
+                    or _publisher_class_resolve(snapshot, meta, '__dict__') is not _PUBLISHER_TYPE_DICT
+                    or _publisher_class_resolve(snapshot, meta, '__mro__') is not _PUBLISHER_TYPE_MRO
+                    or _publisher_class_resolve(snapshot, meta, '__getattr__') is not _PUBLISHER_CLASS_MISSING):
+                return None
+            for ancestor in by_id[id(meta)][2]:
+                namespace = dict(by_id[id(ancestor)][3])
+                if '__dict__' in namespace:
+                    descriptor = namespace['__dict__']
+                    if descriptor is not _PUBLISHER_TYPE_DICT:
+                        return None
+        return snapshot
+    except Exception:
+        return None
+
+
+def _publisher_class_unchanged(snapshot):
+    """Reread all live facts; expected namespaces are private copied tuples."""
+    try:
+        if type(snapshot) is not tuple or len(snapshot) != 2:
+            return False
+        for kind, meta, mro, items in snapshot[1]:
+            current = _publisher_class_read(kind)
+            if current is None or current[1] is not meta or len(current[2]) != len(mro):
+                return False
+            if any(value is not expected for value, expected in zip(current[2], mro)):
+                return False
+            namespace = dict(current[3])
+            expected = dict(items)
+            bookkeeping = _publisher_bookkeeping_names(kind, namespace, expected)
+            if bookkeeping is None:
+                return False
+            for name in bookkeeping:
+                namespace.pop(name, None)
+                expected.pop(name, None)
+            if (len(namespace) != len(expected)
+                    or any(name not in namespace or namespace[name] is not value for name, value in expected.items())):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+_PUBLISHER_NAMESPACE_FUNCTIONS = tuple((name, value, value.__code__, value.__defaults__,
+    dict(value.__kwdefaults__) if value.__kwdefaults__ is not None else None, dict(value.__dict__))
+    for name, value in (('_publisher_class_read', _publisher_class_read),
+        ('_publisher_class_resolve', _publisher_class_resolve),
+        ('_publisher_bookkeeping_names', _publisher_bookkeeping_names),
+        ('_publisher_binding_is_bookkeeping', _publisher_binding_is_bookkeeping),
+        ('_publisher_class_capture', _publisher_class_capture),
+        ('_publisher_class_unchanged', _publisher_class_unchanged)))
+_PUBLISHER_NATIVE_REFS = tuple((name, globals()[name]) for name in (
+    '_PUBLISHER_TYPE_DICT', '_PUBLISHER_TYPE_MRO', '_PUBLISHER_TYPE_MRO_KIND', '_PUBLISHER_TYPE_DICT_GET', '_PUBLISHER_TYPE_MRO_GET',
+    '_PUBLISHER_TYPE_DICT_SLOT', '_PUBLISHER_TYPE_MRO_SLOT', '_PUBLISHER_NATIVE_LOOKUP',
+    '_PUBLISHER_NATIVE_HASH', '_PUBLISHER_NATIVE_EQ', '_PUBLISHER_CLASS_MISSING',
+    '_PUBLISHER_BASE_MANAGER', '_PUBLISHER_MANAGER', '_PUBLISHER_FIELD', '_PUBLISHER_BOOKKEEPING_REFS',
+    '_publisher_field_module', '_publisher_manager_module',
+    'MappingProxyType', 'MethodWrapperType', 'GetSetDescriptorType', 'MemberDescriptorType', 'ModuleType'))
+_PUBLISHER_NATIVE_REFS += (('inspect', inspect), ('FunctionType', FunctionType))
+
+
+def _publisher_namespace_ready(_helpers=_PUBLISHER_NAMESPACE_FUNCTIONS, _native=_PUBLISHER_NATIVE_REFS,
+        _inspect_refs=_PUBLISHER_INSPECT_REFS, _inspect_functions=_PUBLISHER_INSPECT_FUNCTIONS,
+        _inspect_types=_PUBLISHER_INSPECT_TYPE_REFS, _inspect_valid=_PUBLISHER_INSPECT_VALID,
+        _inspect_wrappers=_PUBLISHER_INSPECT_WRAPPERS, _module_state=globals(),
+        _builtins_state=vars(builtins), _builtins=_PUBLISHER_BUILTIN_REFS):
+    """Verify owned capabilities before any helper or inspector dispatch."""
+    for name, present, value, native in _builtins:
+        if ((name in _module_state) != present or _module_state.get(name) is not value
+                or _builtins_state.get(name) is not native):
+            return False
+    if not _inspect_valid or any(_module_state.get(name) is not value for name, value in _native):
+        return False
+    if type(inspect) is not ModuleType:
+        return False
+    if (type(_publisher_field_module) is not ModuleType or type(_publisher_manager_module) is not ModuleType
+            or vars(_publisher_field_module).get('Field') is not _PUBLISHER_FIELD
+            or vars(_publisher_manager_module).get('BaseManager') is not _PUBLISHER_BASE_MANAGER
+            or vars(_publisher_manager_module).get('Manager') is not _PUBLISHER_MANAGER):
+        return False
+    if (type(_PUBLISHER_TYPE_DICT) is not GetSetDescriptorType
+            or (_PUBLISHER_TYPE_MRO_KIND is not GetSetDescriptorType and _PUBLISHER_TYPE_MRO_KIND is not MemberDescriptorType)
+            or type(_PUBLISHER_TYPE_MRO) is not _PUBLISHER_TYPE_MRO_KIND
+            or type.__dict__['__dict__'] is not _PUBLISHER_TYPE_DICT
+            or type.__dict__['__mro__'] is not _PUBLISHER_TYPE_MRO
+            or _PUBLISHER_TYPE_DICT.__objclass__ is not type or _PUBLISHER_TYPE_MRO.__objclass__ is not type
+            or GetSetDescriptorType.__dict__['__get__'] is not _PUBLISHER_TYPE_DICT_SLOT
+            or _PUBLISHER_TYPE_MRO_KIND.__dict__['__get__'] is not _PUBLISHER_TYPE_MRO_SLOT
+            or type(_PUBLISHER_TYPE_DICT_GET) is not MethodWrapperType
+            or type(_PUBLISHER_TYPE_MRO_GET) is not MethodWrapperType
+            or _PUBLISHER_TYPE_DICT_GET.__self__ is not _PUBLISHER_TYPE_DICT
+            or _PUBLISHER_TYPE_MRO_GET.__self__ is not _PUBLISHER_TYPE_MRO):
+        return False
+    if any((name in vars(inspect)) != present or vars(inspect).get(name) is not value for name, present, value in _inspect_refs):
+        return False
+    if type(inspect.types) is not ModuleType:
+        return False
+    if (vars(inspect.types).get('GetSetDescriptorType') is not _inspect_types[0]
+            or vars(inspect.types).get('MemberDescriptorType') is not _inspect_types[1]):
+        return False
+    for wrapper, attributes in _inspect_wrappers:
+        if vars(wrapper).keys() != attributes.keys() or any(vars(wrapper)[name] is not value for name, value in attributes.items()):
+            return False
+    for name, value, code, defaults, kwdefaults, attributes in _helpers:
+        if _module_state.get(name) is not value:
+            return False
+    for value, code, defaults, kwdefaults, attributes in (
+            *((value, code, defaults, kwdefaults, attributes) for _, value, code, defaults, kwdefaults, attributes in _helpers),
+            *_inspect_functions):
+        if (type(value) is not FunctionType or value.__code__ is not code or value.__defaults__ is not defaults
+                or (value.__kwdefaults__ is None) != (kwdefaults is None)
+                or (kwdefaults is not None and (value.__kwdefaults__.keys() != kwdefaults.keys()
+                    or any(value.__kwdefaults__[name] is not item for name, item in kwdefaults.items())))
+                or value.__dict__.keys() != attributes.keys()
+                or any(value.__dict__[name] is not item for name, item in attributes.items())):
+            return False
+    return True
 
 
 def _publisher_standard_tz_adapter(kind, timezone):
@@ -530,12 +804,15 @@ class PublisherBudgetAdmission:
     callbacks, which the independent native claim optimization need not replace.
     Unknown capabilities choose the public helper before touching its SQL.
     """
-    def __init__(self, aliases):
+    def __init__(self, aliases, _namespace_ready=_publisher_namespace_ready,
+            _ready_code=_publisher_namespace_ready.__code__, _ready_defaults=_publisher_namespace_ready.__defaults__,
+            _native_type=type, _native_tuple=tuple):
         from pathlib import Path
         from django.db import models
         from django.db.models.manager import Manager
         from django.db.models.query import QuerySet, RawQuerySet, RawModelIterable, ModelIterable
         from django.db.models.sql.compiler import SQLCompiler, SQLUpdateCompiler
+        from django.db.models.options import Options
         from django.db.backends.postgresql.base import DatabaseWrapper
         from django.db.backends.postgresql.operations import DatabaseOperations
         from django.db.backends.utils import CursorWrapper, CursorDebugWrapper
@@ -546,12 +823,38 @@ class PublisherBudgetAdmission:
         from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
         from opentelemetry.baggage.propagation import W3CBaggagePropagator
         from . import events, event_schema, publisher_shards
-        self.events, self.aliases = events, tuple(aliases)
-        self.model = events.OutboxEvent
-        self.model_meta = self.model._meta
-        self.fields = tuple(self.model_meta.concrete_fields)
         self.functions = []
         self.descriptors = []
+        self.class_namespaces = None
+        self.valid = False
+        # The command also reads aliases on an unavailable policy. Preserve its
+        # ordinary tuple without calling any extension before capability proof.
+        self.aliases = aliases if _native_type(aliases) is _native_tuple else ()
+        if (_native_type(_namespace_ready) is not FunctionType or _publisher_namespace_ready is not _namespace_ready
+                or _namespace_ready.__code__ is not _ready_code or _namespace_ready.__defaults__ is not _ready_defaults
+                or _namespace_ready.__kwdefaults__ is not None or _namespace_ready.__dict__
+                or _namespace_ready() is not True):
+            return
+        self.events, self.aliases = events, tuple(aliases)
+        self.model = vars(events).get('OutboxEvent')
+        roots = (self.model, models.Model, Manager, QuerySet, RawQuerySet, RawModelIterable, ModelIterable,
+            SQLCompiler, SQLUpdateCompiler, DatabaseWrapper, DatabaseOperations, CursorWrapper, CursorDebugWrapper,
+            Atomic, trace.ProxyTracer, trace.NoOpTracer, CompositePropagator, TraceContextTextMapPropagator,
+            W3CBaggagePropagator, ContextVarsRuntimeContext, publisher_shards.PublisherShardOwner,
+            _BudgetConnection, _BUDGET_TZ_LOADER, *_BUDGET_ADAPTER_TYPES)
+        initial = _publisher_class_capture(roots)
+        if initial is None or _publisher_class_resolve(initial, type(self.model), '_meta') is not _PUBLISHER_CLASS_MISSING:
+            return
+        # Native class state supplies this value without executing a metaclass
+        # data descriptor. The actual model participates in every later scan.
+        self.model_meta = _publisher_class_resolve(initial, self.model, '_meta')
+        if type(self.model_meta) is not Options:
+            return
+        self.fields = tuple(self.model_meta.concrete_fields)
+        roots += tuple(type(field) for field in self.fields)
+        expanded = _publisher_class_capture(roots)
+        if expanded is None or not _publisher_class_unchanged(initial):
+            return
         self.valid = True
 
         def function(value, allowed):
@@ -614,6 +917,11 @@ class PublisherBudgetAdmission:
             function(value, [own_source, *std_sources])
         from django.db.backends.postgresql import psycopg_any
         import psycopg
+        if (type(psycopg) is not ModuleType or type(psycopg_any) is not ModuleType
+                or vars(psycopg).get('Connection') is not _BudgetConnection
+                or vars(psycopg_any).get('BaseTzLoader') is not _BUDGET_TZ_LOADER):
+            self.valid = False
+            return
         driver_source = str(Path(psycopg.__file__).resolve().parent)
         self.global_refs.append((psycopg_any, 'get_adapters_template', psycopg_any.get_adapters_template))
         factory = psycopg_any.get_adapters_template
@@ -664,6 +972,9 @@ class PublisherBudgetAdmission:
             (ContextVarsRuntimeContext, ('get_current', 'attach', 'detach')),
         ):
             for name in names:
+                if type(name) is not str:
+                    self.valid = False
+                    return
                 descriptor = inspect.getattr_static(kind, name)
                 self.descriptors.append((kind, name, descriptor))
                 value = descriptor.__func__ if type(descriptor) in (classmethod, staticmethod) else (
@@ -684,8 +995,21 @@ class PublisherBudgetAdmission:
             ) if type(events.producer) is FunctionType else None
         self.client_codes = {item.co_name: item for item in client_code.co_consts
             if type(item) is type(client_code)} if client_code else {}
+        # Capture cannot bless a descriptor observed during transient class
+        # mutation: every original binding must agree with the final namespace.
+        final = _publisher_class_capture(roots)
+        if (final is None or not _publisher_class_unchanged(expanded)
+                or any(type(name) is not str or _publisher_binding_is_bookkeeping(final, kind, name)
+                    or _publisher_class_resolve(final, kind, name) is not descriptor
+                    for kind, name, descriptor in self.descriptors)
+                or not _publisher_class_unchanged(final)):
+            self.valid = False
+        else:
+            self.class_namespaces = final
 
-    def plain(self, broker, owner, aliases, stop=None):
+    def plain(self, broker, owner, aliases, stop=None, _namespace_ready=_publisher_namespace_ready,
+            _ready_code=_publisher_namespace_ready.__code__, _ready_defaults=_publisher_namespace_ready.__defaults__,
+            _native_type=type):
         from django.db import connections, router
         from django.db.models.manager import Manager
         from django.db.models.query import QuerySet
@@ -700,6 +1024,11 @@ class PublisherBudgetAdmission:
         from confluent_kafka.cimpl import Producer
         from .publisher_shards import PublisherShardOwner
         try:
+            if (_native_type(_namespace_ready) is not FunctionType or _publisher_namespace_ready is not _namespace_ready
+                    or _namespace_ready.__code__ is not _ready_code or _namespace_ready.__defaults__ is not _ready_defaults
+                    or _namespace_ready.__kwdefaults__ is not None or _namespace_ready.__dict__
+                    or _namespace_ready() is not True):
+                return False
             if (not self.valid or len(aliases) != len(self.aliases)
                     or any(value is not expected for value, expected in zip(aliases, self.aliases))
                     or type(owner) is not PublisherShardOwner
@@ -719,7 +1048,7 @@ class PublisherBudgetAdmission:
                     or any(value.__dict__[name] is not item for name, item in attributes.items())
                     for value, code, defaults, kwdefaults, attributes in self.functions):
                 return False
-            if any(inspect.getattr_static(kind, name) is not descriptor for kind, name, descriptor in self.descriptors):
+            if not _publisher_class_unchanged(self.class_namespaces):
                 return False
             kind = type(broker)
             if type(kind) is not type or vars(kind).get('__module__') != 'labops.events':
