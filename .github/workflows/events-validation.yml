@@ -43,6 +43,11 @@ on:
         description: 'One finite steady publisher-phase diagnostic; never capacity acceptance or a fault matrix'
         type: boolean
         default: false
+      publisher_observation_mode:
+        description: 'Closed diagnostic observer; native-scoped requires six writers, dual notification, profilers and runtime SQL sampler OFF'
+        type: choice
+        options: [legacy, native-scoped]
+        default: legacy
       diagnostic_profile_engine:
         description: 'Explicit diagnostic engine; python-profile-owned requires diagnostic_profile=true'
         type: choice
@@ -76,6 +81,7 @@ jobs:
       RUNTIME_DIAGNOSTICS: ${{ github.event.inputs.runtime_diagnostics || 'false' }}
       DIAGNOSTIC_PROFILE: ${{ github.event.inputs.diagnostic_profile || 'false' }}
       PUBLISHER_OBSERVATION: ${{ github.event.inputs.publisher_observation || 'false' }}
+      PUBLISHER_OBSERVATION_MODE: ${{ github.event.inputs.publisher_observation_mode || 'legacy' }}
       DIAGNOSTIC_PROFILE_ENGINE: ${{ github.event.inputs.diagnostic_profile_engine || 'cprofile' }}
       CONSUMER_TOPOLOGY: ${{ github.event.inputs.consumer_topology || 'single' }}
       WRITER_TOPOLOGY: ${{ github.event.inputs.writer_topology || 'writers-4' }}
@@ -94,8 +100,13 @@ jobs:
             false) ;;
             *) echo 'Invalid publisher observation boolean'; exit 2 ;;
           esac
+          case "$PUBLISHER_OBSERVATION_MODE" in
+            legacy) ;;
+            native-scoped) [ "$PUBLISHER_OBSERVATION" = true ] && [ "$DIAGNOSTIC_PROFILE" = false ] && [ "$RUNTIME_DIAGNOSTICS" = false ] && [ "$WRITER_TOPOLOGY" = writers-6 ] && [ "$CONSUMER_TOPOLOGY" = notification-dual ] || { echo 'Native-scoped requires explicit diagnostic-only six-writer request with all profilers and runtime SQL sampler OFF'; exit 2; } ;;
+            *) echo 'Invalid publisher observation mode'; exit 2 ;;
+          esac
           if [ "$PUBLISHER_OBSERVATION" = true ]; then
-            python3 benchmarks/events/publisher_probe.py --admit-only --run-id "ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --evidence-dir "infra/events/validation/evidence/ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY"
+            python3 benchmarks/events/publisher_probe.py --admit-only --run-id "ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --evidence-dir "infra/events/validation/evidence/ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --publisher-observation-mode "$PUBLISHER_OBSERVATION_MODE"
           fi
           case "$DIAGNOSTIC_PROFILE_ENGINE" in
             cprofile) ;;
@@ -170,7 +181,7 @@ jobs:
             *) echo 'Invalid diagnostic profile boolean'; exit 2 ;;
           esac
           if [ "$PUBLISHER_OBSERVATION" = true ]; then
-            python benchmarks/events/publisher_probe.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+            python benchmarks/events/publisher_probe.py --publisher-observation-mode "$PUBLISHER_OBSERVATION_MODE" --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
           else
             python benchmarks/events/acceptance.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
           fi

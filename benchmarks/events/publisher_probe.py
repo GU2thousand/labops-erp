@@ -159,7 +159,10 @@ class PublisherProbe(Harness):
 
     def start_publisher(self):
         self.probe_output = self.evidence / 'logs' / f'publisher-profile-{len(self.children):03d}.json'
-        argv = [str(HERE / 'profile_publisher.py'), '--output', str(self.probe_output), '--observation-only']
+        if getattr(self.args, 'publisher_observation_mode', 'legacy') == 'native-scoped':
+            argv = [str(HERE / 'native_publisher.py'), '--output', str(self.probe_output)]
+        else:
+            argv = [str(HERE / 'profile_publisher.py'), '--output', str(self.probe_output), '--observation-only']
         self.workers['publisher'] = self.spawn('publisher-' + str(len(self.children)), argv, 'publisher')
         self.sync_metrics_targets()
 
@@ -195,6 +198,7 @@ def parser():
     p.add_argument('--rate', type=float, default=50)
     p.add_argument('--duration', type=float, default=60)
     p.add_argument('--runtime-diagnostics', action='store_true')
+    p.add_argument('--publisher-observation-mode', choices=('legacy', 'native-scoped'), default='legacy')
     p.add_argument('--admit-only', action='store_true', help='Validate finite inputs without opening services or files')
     return p
 
@@ -212,6 +216,9 @@ def main():
         p.error('Finite observation duration must be between zero and 300 seconds')
     if args.events / args.rate > 300:
         p.error('Finite observation requires a scheduled generation window at most 300 seconds')
+    if args.publisher_observation_mode == 'native-scoped' and (args.runtime_diagnostics
+            or args.writer_topology != 'writers-6' or args.consumer_topology != 'notification-dual'):
+        p.error('Native-scoped observation requires six writers, dual notification and runtime SQL sampler OFF')
     if args.admit_only:
         return
     args.writer_topology_version = WRITER_TOPOLOGY_VERSION
@@ -231,12 +238,14 @@ def main():
         'source_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'started_epoch_ns': time.time_ns(), 'writer_topology': args.writer_topology,
         'consumer_topology': args.consumer_topology, 'events': args.events, 'rate': args.rate,
-        'duration': args.duration, 'function_profiling_enabled': False,
+        'duration': args.duration, 'function_profiling_enabled': False, 'publisher_observation_mode': args.publisher_observation_mode,
         'runtime_diagnostics_enabled': args.runtime_diagnostics,
         'scope': 'one finite steady diagnostic; all matrix fault cases intentionally unexecuted',
         'source_sha256': {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (Path(__file__), HERE / 'acceptance.py', HERE / 'profile_publisher.py',
-                         HERE / 'diagnostic_profile.py', ROOT / 'labops/events.py')}}
+                         HERE / 'diagnostic_profile.py', ROOT / 'labops/events.py',
+                         HERE / 'native_publisher.py', ROOT / 'labops/publisher_observation.py',
+                         ROOT / 'labops/management/commands/publish_events.py', ROOT / 'labops/worker_metrics.py')}}
     with (args.evidence_dir / 'publisher-probe-manifest.json').open('x') as stream:
         json.dump(manifest, stream, indent=2)
         stream.write('\n')

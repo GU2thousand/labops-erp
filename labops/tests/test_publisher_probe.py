@@ -442,16 +442,26 @@ class PublisherProbeTests(SimpleTestCase):
             relative = f'benchmarks/events/{name}.py'
             script = script.replace(relative, shlex.quote(str(probe.ROOT / relative)))
         cases = [
-            ('true', 'false', 'smoke', 'cprofile', 'writers-6', 'notification-dual', True),
-            ('false', 'true', 'smoke', 'cprofile', 'writers-4', 'single', True),
-            ('true', 'true', 'smoke', 'cprofile', 'writers-4', 'single', False),
-            ('true', 'false', 'full', 'cprofile', 'writers-6', 'notification-dual', False),
-            ('false', 'true', 'smoke', 'cprofile', 'writers-6', 'single', False),
-            ('false', 'true', 'smoke', 'cprofile', 'writers-4', 'notification-dual', False),
-            ('false', 'false', 'smoke', 'python-profile-owned', 'writers-4', 'single', False)]
-        for observation, profiling, tier, engine, writer, consumer, allowed in cases:
-            with self.subTest(observation=observation, profiling=profiling, writer=writer, consumer=consumer):
+            ('true', 'false', 'smoke', 'cprofile', 'writers-6', 'notification-dual', 'legacy', 'false', True),
+            ('false', 'true', 'smoke', 'cprofile', 'writers-4', 'single', 'legacy', 'false', True),
+            ('true', 'true', 'smoke', 'cprofile', 'writers-4', 'single', 'legacy', 'false', False),
+            ('true', 'false', 'full', 'cprofile', 'writers-6', 'notification-dual', 'legacy', 'false', False),
+            ('false', 'true', 'smoke', 'cprofile', 'writers-6', 'single', 'legacy', 'false', False),
+            ('false', 'true', 'smoke', 'cprofile', 'writers-4', 'notification-dual', 'legacy', 'false', False),
+            ('false', 'false', 'smoke', 'python-profile-owned', 'writers-4', 'single', 'legacy', 'false', False),
+            ('true', 'false', 'smoke', 'cprofile', 'writers-6', 'notification-dual', 'native-scoped', 'false', True),
+            ('true', 'false', 'smoke', 'cprofile', 'writers-6', 'notification-dual', 'unknown', 'false', False),
+            ('false', 'false', 'smoke', 'cprofile', 'writers-6', 'notification-dual', 'native-scoped', 'false', False),
+            ('true', 'true', 'smoke', 'cprofile', 'writers-6', 'notification-dual', 'native-scoped', 'false', False),
+            ('true', 'false', 'smoke', 'cprofile', 'writers-6', 'notification-dual', 'native-scoped', 'true', False),
+            ('true', 'false', 'smoke', 'cprofile', 'writers-4', 'notification-dual', 'native-scoped', 'false', False),
+            ('true', 'false', 'smoke', 'cprofile', 'writers-6', 'single', 'native-scoped', 'false', False),
+            ('true', 'false', 'full', 'cprofile', 'writers-6', 'notification-dual', 'native-scoped', 'false', False)]
+        for observation, profiling, tier, engine, writer, consumer, mode, runtime, allowed in cases:
+            with self.subTest(observation=observation, profiling=profiling, writer=writer,
+                    consumer=consumer, mode=mode, runtime_diagnostics=runtime):
                 env = {**os.environ, 'PUBLISHER_OBSERVATION': observation, 'DIAGNOSTIC_PROFILE': profiling,
+                    'PUBLISHER_OBSERVATION_MODE': mode, 'RUNTIME_DIAGNOSTICS': runtime,
                     'EVENTS_TIER': tier, 'DIAGNOSTIC_PROFILE_ENGINE': engine, 'WRITER_TOPOLOGY': writer,
                     'CONSUMER_TOPOLOGY': consumer, 'GITHUB_RUN_ID': '11', 'GITHUB_RUN_ATTEMPT': '1',
                     'EVENTS_COUNT': '3000', 'EVENTS_RATE': '50', 'EVENTS_DURATION': '60'}

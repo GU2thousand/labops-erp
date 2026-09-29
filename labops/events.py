@@ -38,6 +38,9 @@ from .models import OutboxEvent, ProcessedEvent, InventoryProjection, FailedDeli
 from .event_schema import validate_inventory_envelope, canonical_payload_hash, EventValidationError
 from .kafka_config import producer_config, source_identity
 from .worker_metrics import EVENTS, PUBLISH_ACK, EFFECT_LATENCY, LEASE_REJECTIONS, schema_rejected
+from types import FunctionType as _ObservationFunctionType
+from .publisher_observation import current as _observation_current
+from .worker_metrics import OperationDeadlineExceeded as _ObservationDeadline
 
 log = logging.getLogger('labops')
 
@@ -563,8 +566,28 @@ def _plain_outbox_claim(manager):
         return False
 
 
-def _claim_event_postgresql(manager, now, *, shard_index, shard_count):
+def _claim_event_postgresql(manager, now, *, shard_index, shard_count,
+        _get_observer=_observation_current, _observer_identity=_observation_current,
+        _observer_code=_observation_current.__code__, _observer_defaults=_observation_current.__defaults__,
+        _observer_globals=_observation_current.__globals__, _observer_type=type,
+        _observer_function=_ObservationFunctionType, _observer_dict=dict,
+        _observer_deadline=_ObservationDeadline):
     """Lock and lease one ordered event with one statement, then commit."""
+    observer = None
+    try:
+        if (_observer_type(_get_observer) is _observer_function
+                and _get_observer is _observer_identity
+                and _get_observer.__code__ is _observer_code
+                and _get_observer.__defaults__ is _observer_defaults
+                and _get_observer.__globals__ is _observer_globals
+                and _get_observer.__kwdefaults__ is None
+                and _observer_type(_get_observer.__dict__) is _observer_dict
+                and not _get_observer.__dict__):
+            observer = _get_observer(_get_observer)
+    except _observer_deadline:
+        raise
+    except Exception:
+        observer = None
     quote = connection.ops.quote_name
     table = quote(OutboxEvent._meta.db_table)
     columns = ', '.join(f'event.{quote(field.column)}' for field in OutboxEvent._meta.concrete_fields)
@@ -599,23 +622,68 @@ def _claim_event_postgresql(manager, now, *, shard_index, shard_count):
     SET status = 'PROCESSING', lease_token = %s, locked_until = %s
     FROM claimed WHERE event.id = claimed.id
     RETURNING {columns}, claimed.status AS _claim_previous_status{shard_return}'''
-    with transaction.atomic():
-        # RawQuerySet fetches at most the one candidate and applies the same
-        # backend/field converters and from_db/__init__ lifecycle as ORM reads.
-        event = next(iter(manager.raw(sql, params)), None)
-        if event is not None and event.__dict__.pop('_claim_previous_status') == 'PROCESSING':
-            # The old status is available only after a successful UPDATE. Like
-            # the ORM counter, a later rollback/commit failure does not undo it.
-            EVENTS.labels('publisher', 'lease_expired').inc()
+    # Native claim selection already happened; observer cannot choose it.
+    if observer is None:
+        with transaction.atomic():
+            # RawQuerySet fetches at most the one candidate and applies the same
+            # backend/field converters and from_db/__init__ lifecycle as ORM reads.
+            event = next(iter(manager.raw(sql, params)), None)
+            if event is not None and event.__dict__.pop('_claim_previous_status') == 'PROCESSING':
+                # The old status is available only after a successful UPDATE. Like
+                # the ORM counter, a later rollback/commit failure does not undo it.
+                EVENTS.labels('publisher', 'lease_expired').inc()
+    else:
+        with observer.claim_scope() as _observation_hooks:
+            _observation_hooks.install()
+            with transaction.atomic():
+                # RawQuerySet fetches at most the one candidate and applies the same
+                # backend/field converters and from_db/__init__ lifecycle as ORM reads.
+                event = next(iter(manager.raw(sql, params)), None)
+                if event is not None and event.__dict__.pop('_claim_previous_status') == 'PROCESSING':
+                    # The old status is available only after a successful UPDATE. Like
+                    # the ORM counter, a later rollback/commit failure does not undo it.
+                    EVENTS.labels('publisher', 'lease_expired').inc()
     return event
 
 
-def claim_event(*, shard_index=0, shard_count=1):
+def claim_event(*, shard_index=0, shard_count=1,
+        _get_observer=_observation_current, _observer_identity=_observation_current,
+        _observer_code=_observation_current.__code__, _observer_defaults=_observation_current.__defaults__,
+        _observer_globals=_observation_current.__globals__, _observer_type=type,
+        _observer_function=_ObservationFunctionType, _observer_dict=dict,
+        _observer_deadline=_ObservationDeadline):
     if shard_count < 1 or not 0 <= shard_index < shard_count:
         raise ValueError('Invalid publisher shard')
     now = timezone.now()
     manager = OutboxEvent.objects
-    if _plain_outbox_claim(manager):
+    observer = None
+    try:
+        if (_observer_type(_get_observer) is _observer_function
+                and _get_observer is _observer_identity
+                and _get_observer.__code__ is _observer_code
+                and _get_observer.__defaults__ is _observer_defaults
+                and _get_observer.__globals__ is _observer_globals
+                and _get_observer.__kwdefaults__ is None
+                and _observer_type(_get_observer.__dict__) is _observer_dict
+                and not _get_observer.__dict__):
+            observer = _get_observer(_get_observer)
+    except _observer_deadline:
+        raise
+    except Exception:
+        observer = None
+    if observer is None:
+        native_claim = _plain_outbox_claim(manager)
+    else:
+        with observer.measure('claim_native_admission'):
+            native_claim = _plain_outbox_claim(manager)
+    if observer is not None:
+        try:
+            observer.native_result(native_claim)
+        except _observer_deadline:
+            raise
+        except Exception:
+            observer.recording_failed = True
+    if native_claim:
         return _claim_event_postgresql(manager, now, shard_index=shard_index, shard_count=shard_count)
     earlier = OutboxEvent.objects.filter(transport='kafka', aggregate_type=OuterRef('aggregate_type'),
         aggregate_id=OuterRef('aggregate_id'), aggregate_version__lt=OuterRef('aggregate_version')).exclude(status='PUBLISHED')
@@ -659,7 +727,27 @@ def producer(role='publisher'):
     return wrapped
 
 
-def send(producer, topic, key, value):
+def send(producer, topic, key, value,
+        _get_observer=_observation_current, _observer_identity=_observation_current,
+        _observer_code=_observation_current.__code__, _observer_defaults=_observation_current.__defaults__,
+        _observer_globals=_observation_current.__globals__, _observer_type=type,
+        _observer_function=_ObservationFunctionType, _observer_dict=dict,
+        _observer_deadline=_ObservationDeadline):
+    observer = None
+    try:
+        if (_observer_type(_get_observer) is _observer_function
+                and _get_observer is _observer_identity
+                and _get_observer.__code__ is _observer_code
+                and _get_observer.__defaults__ is _observer_defaults
+                and _get_observer.__globals__ is _observer_globals
+                and _get_observer.__kwdefaults__ is None
+                and _observer_type(_get_observer.__dict__) is _observer_dict
+                and not _get_observer.__dict__):
+            observer = _get_observer(_get_observer)
+    except _observer_deadline:
+        raise
+    except Exception:
+        observer = None
     results = []; started = time.monotonic()
     if hasattr(producer, 'last_security_error'): producer.last_security_error = None
     worker = 'dlq' if topic == settings.KAFKA_DLQ_TOPIC else 'publisher'
@@ -671,7 +759,16 @@ def send(producer, topic, key, value):
         deadline = time.monotonic() + settings.KAFKA_PRODUCER_QUEUE_WAIT_SECONDS
         while True:
             try:
-                producer.produce(topic, key=key, value=encoded, on_delivery=lambda err, msg: results.append(err))
+                # The original source callback is tapped; native client binding is untouched.
+                callback = lambda err, msg: results.append(err)
+                if observer is not None:
+                    try:
+                        callback = observer.callback(callback)
+                    except _observer_deadline:
+                        raise
+                    except Exception:
+                        observer.recording_failed = True
+                producer.produce(topic, key=key, value=encoded, on_delivery=callback)
                 break
             except BufferError:
                 if time.monotonic() >= deadline: raise RuntimeError('Producer queue budget exceeded')
@@ -693,19 +790,72 @@ def owned_event(event):
                                      locked_until__gt=timezone.now()+timedelta(seconds=required)).exists()
 
 
-def publish_one(producer, after_send=None, *, shard_index=0, shard_count=1, ownership_check=None):
-    event = claim_event(shard_index=shard_index, shard_count=shard_count)
+def publish_one(producer, after_send=None, *, shard_index=0, shard_count=1, ownership_check=None,
+        _get_observer=_observation_current, _observer_identity=_observation_current,
+        _observer_code=_observation_current.__code__, _observer_defaults=_observation_current.__defaults__,
+        _observer_globals=_observation_current.__globals__, _observer_type=type,
+        _observer_function=_ObservationFunctionType, _observer_dict=dict,
+        _observer_deadline=_ObservationDeadline):
+    observer = None
+    try:
+        if (_observer_type(_get_observer) is _observer_function
+                and _get_observer is _observer_identity
+                and _get_observer.__code__ is _observer_code
+                and _get_observer.__defaults__ is _observer_defaults
+                and _get_observer.__globals__ is _observer_globals
+                and _get_observer.__kwdefaults__ is None
+                and _observer_type(_get_observer.__dict__) is _observer_dict
+                and not _get_observer.__dict__):
+            observer = _get_observer(_get_observer)
+    except _observer_deadline:
+        raise
+    except Exception:
+        observer = None
+    if observer is None:
+        event = claim_event(shard_index=shard_index, shard_count=shard_count)
+    else:
+        with observer.measure('claim_composite'):
+            event = claim_event(shard_index=shard_index, shard_count=shard_count)
+    if observer is not None:
+        try:
+            observer.bind_event(event)
+        except _observer_deadline:
+            raise
+        except Exception:
+            observer.recording_failed = True
     if event is None: return False
     try:
-        value = envelope(event)
+        if observer is None:
+            value = envelope(event)
+        else:
+            with observer.measure('envelope'):
+                value = envelope(event)
         if ownership_check: ownership_check()
-        if not owned_event(event): raise LeaseLost('Publish owner expired before send')
-        send(producer, settings.KAFKA_TOPIC, f'{event.aggregate_type}:{event.aggregate_id}', value)
+        if observer is None:
+            if not owned_event(event): raise LeaseLost('Publish owner expired before send')
+        else:
+            with observer.measure('lease_check'):
+                with observer.execute_scope('lease_check_execute') as _observation_hooks:
+                    _observation_hooks.install()
+                    if not owned_event(event): raise LeaseLost('Publish owner expired before send')
+        if observer is None:
+            send(producer, settings.KAFKA_TOPIC, f'{event.aggregate_type}:{event.aggregate_id}', value)
+        else:
+            with observer.measure('send'):
+                send(producer, settings.KAFKA_TOPIC, f'{event.aggregate_type}:{event.aggregate_id}', value)
         if after_send: after_send()
         if ownership_check: ownership_check()
-        changed = OutboxEvent.objects.filter(pk=event.pk, status='PROCESSING', lease_token=event.lease_token,
-                                            locked_until__gt=timezone.now()).update(
-            status='PUBLISHED', published_at=timezone.now(), locked_until=None, lease_token=None, last_error='')
+        if observer is None:
+            changed = OutboxEvent.objects.filter(pk=event.pk, status='PROCESSING', lease_token=event.lease_token,
+                                                locked_until__gt=timezone.now()).update(
+                status='PUBLISHED', published_at=timezone.now(), locked_until=None, lease_token=None, last_error='')
+        else:
+            with observer.measure('publication_writeback'):
+                with observer.execute_scope('publication_writeback_execute') as _observation_hooks:
+                    _observation_hooks.install()
+                    changed = OutboxEvent.objects.filter(pk=event.pk, status='PROCESSING', lease_token=event.lease_token,
+                                                        locked_until__gt=timezone.now()).update(
+                        status='PUBLISHED', published_at=timezone.now(), locked_until=None, lease_token=None, last_error='')
         if changed != 1:
             LEASE_REJECTIONS.labels('publisher').inc()
             log.warning('publisher_stale_write_rejected', extra={'event_id': str(event.id)})
