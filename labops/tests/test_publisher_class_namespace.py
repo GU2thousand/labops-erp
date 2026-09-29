@@ -1,13 +1,17 @@
-"""Static class capability proofs; no broker records or database SQL.
+"""Static class capabilities and real PostgreSQL public fallback wiring.
 
 Synthetic classes isolate namespace/MRO semantics. The production-policy
 cases retain a real native producer and a positive admission baseline, so a
 refusal cannot pass merely because an unrelated capability was unavailable.
+The separate PostgreSQL case uses the original global policy, owner, and public
+budget helper without sending broker records.
 """
+from collections.abc import Mapping
 from contextlib import ExitStack
 import inspect
 import sys
-from types import GetSetDescriptorType, MemberDescriptorType, ModuleType
+from types import GetSetDescriptorType, MappingProxyType, MemberDescriptorType, ModuleType
+from unittest import skipUnless
 from unittest.mock import Mock, patch
 
 from confluent_kafka.cimpl import Producer
@@ -16,15 +20,17 @@ from django.db.backends.postgresql.base import DatabaseWrapper
 from django.db.backends.postgresql import psycopg_any
 from django.db.models import Field, IntegerField
 from django.db.models.manager import BaseManager, Manager
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 import psycopg
 
 from labops import events, worker_metrics
 from labops.management.commands import publish_events as command
 from labops.models import OutboxEvent
 from labops.publisher_shards import PublisherShardOwner
+from labops.tests import test_publisher_budget_reuse_admission as admission_fixtures
 from labops.tests.test_publisher_budget_reuse_admission import ordinary_connection_capability, plain_tracing
-from labops.worker_metrics import OperationDeadlineExceeded, PublisherBudgetAdmission, StopController
+from labops.worker_metrics import OperationDeadlineExceeded, PublisherBudgetAdmission, StopController, operation_deadline
 
 
 class NamespaceControl(BaseException):
@@ -76,7 +82,10 @@ class PublisherClassNamespaceTests(SimpleTestCase):
             self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
         finally:
             Root.value = original
-        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+        # Restoring the value does not restore its former insertion order.
+        # Only this synthetic baseline is recaptured for the next subcase.
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+        snapshot = self.capture(Root)
         with patch.object(Root, 'new_none', None, create=True):
             self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
             fresh = self.capture(Root)
@@ -304,6 +313,218 @@ class PublisherClassNamespaceTests(SimpleTestCase):
             self.assertIs(worker_metrics._publisher_class_resolve(snapshot, Root, 'value'), marker)
             self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
         inspector.assert_not_called()
+
+
+    def namespace_items(self, snapshot, kind, items):
+        return snapshot[0], tuple((owner, meta, mro, items if owner is kind else original)
+            for owner, meta, mro, original in snapshot[1])
+
+    def namespace_entry(self, snapshot, kind):
+        return next(entry for entry in snapshot[1] if entry[0] is kind)
+
+    def test_ordinary_tuple_comparison_keeps_value_identity_without_bookkeeping_dispatch(self):
+        calls = Mock(side_effect=NamespaceControl('Namespace value hooks must not run'))
+        class Value:
+            def __eq__(self, other):
+                return calls('equal')
+            def __hash__(self):
+                return calls('hash')
+        value = Value()
+        class Root:
+            ordinary_value = value
+        snapshot = self.capture(Root)
+        bookkeeper = Mock(side_effect=NamespaceControl('Ordinary classes need no bookkeeping dispatch'))
+        with patch.object(worker_metrics, '_publisher_bookkeeping_names', bookkeeper):
+            self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+            items = tuple((name, Value() if name == 'ordinary_value' else item)
+                for name, item in self.namespace_entry(snapshot, Root)[3])
+            self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, items)), False)
+        bookkeeper.assert_not_called()
+        calls.assert_not_called()
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+    def test_equal_native_key_spelling_does_not_require_key_object_identity(self):
+        class Root:
+            a_long_ordinary_key_name = object()
+        snapshot = self.capture(Root)
+        copied = []
+        for name, value in self.namespace_entry(snapshot, Root)[3]:
+            spelling = name.encode('utf-8').decode('utf-8')
+            self.assertEqual(spelling, name)
+            self.assertIsNot(spelling, name)
+            copied.append((spelling, value))
+        self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, tuple(copied))), True)
+
+    def test_expected_tuple_key_name_and_presence_remain_complete_facts(self):
+        class Root:
+            ordinary_none = None
+        snapshot = self.capture(Root)
+        items = self.namespace_entry(snapshot, Root)[3]
+        renamed = tuple(('different_none' if name == 'ordinary_none' else name, value) for name, value in items)
+        absent = tuple((name, value) for name, value in items if name != 'ordinary_none')
+        added = items + (('new_none', None),)
+        for label, changed in (('renamed_same_value', renamed), ('absent', absent), ('new_presence', added)):
+            with self.subTest(change=label):
+                self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, changed)), False)
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+    def test_expected_entry_collection_and_entry_shapes_refuse_without_iteration(self):
+        calls = Mock(side_effect=NamespaceControl('Unknown snapshot iteration must not run'))
+        class Unknown:
+            def __iter__(self):
+                return calls('iterate')
+            def __len__(self):
+                return calls('length')
+            def __getitem__(self, index):
+                return calls('item')
+        class Root:
+            pass
+        snapshot = self.capture(Root)
+        for changed in (Unknown(), (snapshot[0], Unknown()), (snapshot[0], (Unknown(),)),
+                (snapshot[0], (list(self.namespace_entry(snapshot, Root)),))):
+            self.assertIs(worker_metrics._publisher_class_unchanged(changed), False)
+        calls.assert_not_called()
+
+    def test_expected_mro_container_refuses_before_reading_or_iterating_unknown_state(self):
+        calls = Mock(side_effect=NamespaceControl('Unknown MRO container must not run'))
+        class UnknownMro(tuple):
+            def __iter__(self):
+                return calls('iterate')
+            def __len__(self):
+                return calls('length')
+        class Root:
+            pass
+        snapshot = self.capture(Root)
+        kind, meta, mro, items = self.namespace_entry(snapshot, Root)
+        for poisoned in (list(mro), UnknownMro(mro)):
+            changed = snapshot[0], ((kind, meta, poisoned, items),)
+            reader = Mock(side_effect=NamespaceControl('Malformed expected MRO must refuse before native read'))
+            with patch.object(worker_metrics, '_publisher_class_read', reader):
+                self.assertIs(worker_metrics._publisher_class_unchanged(changed), False)
+            reader.assert_not_called()
+        calls.assert_not_called()
+
+    def test_expected_namespace_mapping_proxy_does_not_prove_native_backing_state(self):
+        calls = Mock(side_effect=NamespaceControl('Unknown backing mapping must not run'))
+        class UnknownMapping(Mapping):
+            def __getitem__(self, name):
+                return calls('item')
+            def __iter__(self):
+                return calls('iterate')
+            def __len__(self):
+                return calls('length')
+        class Root:
+            value = None
+        snapshot = self.capture(Root)
+        proxy = MappingProxyType(UnknownMapping())
+        calls.assert_not_called()
+        for items in (proxy, UnknownMapping(), list(self.namespace_entry(snapshot, Root)[3])):
+            self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, items)), False)
+        calls.assert_not_called()
+
+    def test_expected_namespace_pair_shapes_refuse_before_unpacking_unknown_pairs(self):
+        calls = Mock(side_effect=NamespaceControl('Unknown namespace pair must not run'))
+        class UnknownPair(tuple):
+            def __iter__(self):
+                return calls('iterate')
+            def __len__(self):
+                return calls('length')
+            def __getitem__(self, index):
+                return calls('item')
+        class Root:
+            value = None
+        snapshot = self.capture(Root)
+        items = self.namespace_entry(snapshot, Root)[3]
+        for pair in (UnknownPair(items[0]), list(items[0]), (), (items[0][0],), (*items[0], None)):
+            changed = (pair, *items[1:])
+            self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, changed)), False)
+        calls.assert_not_called()
+
+    def test_expected_string_subclass_key_refuses_before_equality_or_hash(self):
+        calls = Mock(side_effect=NamespaceControl('Unknown key comparison must not run'))
+        class UnknownKey(str):
+            def __eq__(self, other):
+                return calls('equal')
+            def __hash__(self):
+                return calls('hash')
+        class Root:
+            value = None
+        snapshot = self.capture(Root)
+        items = self.namespace_entry(snapshot, Root)[3]
+        poisoned = tuple((UnknownKey(name), value) for name, value in items)
+        self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, poisoned)), False)
+        calls.assert_not_called()
+
+    def test_malformed_controlled_read_result_refuses_without_unknown_container_hooks(self):
+        calls = Mock(side_effect=NamespaceControl('Malformed native read shape must not run hooks'))
+        class Unknown(tuple):
+            def __iter__(self):
+                return calls('iterate')
+            def __len__(self):
+                return calls('length')
+            def __getitem__(self, index):
+                return calls('item')
+        class Root:
+            value = None
+        snapshot = self.capture(Root)
+        kind, meta, mro, items = self.namespace_entry(snapshot, Root)
+        results = (Unknown((kind, meta, mro, items)), (kind, meta, Unknown(mro), items),
+            (kind, meta, mro, Unknown(items)), (kind, meta, mro, (Unknown(items[0]), *items[1:])))
+        for result in results:
+            reader = Mock(return_value=result)
+            with patch.object(worker_metrics, '_publisher_class_read', reader):
+                self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), False)
+            reader.assert_called_once_with(kind)
+        calls.assert_not_called()
+
+    def test_same_dictionary_facts_in_different_ordinary_order_select_strict_fallback(self):
+        calls = Mock(side_effect=NamespaceControl('Order comparison must not compare values'))
+        class Value:
+            def __eq__(self, other):
+                return calls('equal')
+        value = Value()
+        class Root:
+            first = value
+            second = value
+        snapshot = self.capture(Root)
+        items = self.namespace_entry(snapshot, Root)[3]
+        reordered = tuple(reversed(items))
+        expected, current = dict(reordered), dict(items)
+        self.assertEqual(expected.keys(), current.keys())
+        self.assertTrue(all(expected[name] is item for name, item in current.items()))
+        self.assertIs(worker_metrics._publisher_class_unchanged(self.namespace_items(snapshot, Root, reordered)), False)
+        calls.assert_not_called()
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+    def test_ancestor_order_is_checked_with_unchanged_inherited_binding_and_mro(self):
+        marker = object()
+        class Base:
+            first = marker
+            second = marker
+        class Root(Base):
+            pass
+        snapshot = self.capture(Root)
+        base_entry = self.namespace_entry(snapshot, Base)
+        changed = self.namespace_items(snapshot, Base, tuple(reversed(base_entry[3])))
+        self.assertIs(worker_metrics._publisher_class_resolve(changed, Root, 'first'), marker)
+        self.assertTrue(all(actual is expected for actual, expected in zip(Root.__mro__, self.namespace_entry(snapshot, Root)[2])))
+        self.assertIs(worker_metrics._publisher_class_unchanged(changed), False)
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
+
+    def test_metaclass_namespace_order_is_checked_with_unchanged_native_lookup(self):
+        marker = object()
+        class Meta(type):
+            first = marker
+            second = marker
+        class Root(metaclass=Meta):
+            pass
+        snapshot = self.capture(Root)
+        meta_entry = self.namespace_entry(snapshot, Meta)
+        changed = self.namespace_items(snapshot, Meta, tuple(reversed(meta_entry[3])))
+        self.assertIs(type(Root), Meta)
+        self.assertIs(worker_metrics._publisher_class_resolve(changed, Root, 'first'), marker)
+        self.assertIs(worker_metrics._publisher_class_unchanged(changed), False)
+        self.assertIs(worker_metrics._publisher_class_unchanged(snapshot), True)
 
 
 class PublisherClassNamespaceProductionTests(SimpleTestCase):
@@ -773,3 +994,90 @@ class PublisherClassNamespaceProductionTests(SimpleTestCase):
                     function.__code__ = code
                 self.assertIs(self.plain(), True)
         self.assertIsNone(self.database.connection)
+
+
+    def test_exact_three_bookkeeping_owner_item_orders_keep_original_compatibility(self):
+        original = self.policy.class_namespaces
+        for owner in (BaseManager, Manager, Field):
+            with self.subTest(owner=owner.__name__):
+                entry = next(entry for entry in original[1] if entry[0] is owner)
+                self.assertGreater(len(entry[3]), 1)
+                changed = original[0], tuple((kind, meta, mro,
+                    tuple(reversed(items)) if kind is owner else items) for kind, meta, mro, items in original[1])
+                self.assertIs(worker_metrics._publisher_class_unchanged(changed), True)
+                with patch.object(self.policy, 'class_namespaces', changed):
+                    self.assertIs(self.plain(), True)
+                self.assertIs(self.policy.class_namespaces, original)
+                self.assertIsNone(self.database.connection)
+
+    def test_exact_bookkeeping_owner_expected_keys_refuse_before_dictionary_hooks(self):
+        calls = Mock(side_effect=NamespaceControl('Bookkeeping input keys must not execute hooks'))
+        class UnknownKey(str):
+            def __eq__(self, other):
+                return calls('equal')
+            def __hash__(self):
+                return calls('hash')
+        original = self.policy.class_namespaces
+        for owner in (BaseManager, Manager, Field):
+            with self.subTest(owner=owner.__name__):
+                changed = original[0], tuple((kind, meta, mro,
+                    tuple((UnknownKey(name), value) for name, value in items) if kind is owner else items)
+                    for kind, meta, mro, items in original[1])
+                with patch.object(self.policy, 'class_namespaces', changed):
+                    self.refused()
+                self.assertIs(self.policy.class_namespaces, original)
+                self.assertIs(self.plain(), True)
+        calls.assert_not_called()
+
+
+@skipUnless(connection.vendor == 'postgresql', 'Real PostgreSQL public budget fallback')
+class PublisherClassNamespaceOrderFallbackPostgreSQLTests(TransactionTestCase):
+    # Reuse the existing actual connection/timeout fixtures, without inheriting
+    # and rediscovering their unrelated test methods or recreating the policy.
+    database = admission_fixtures.PublisherBudgetNativeAdmissionPostgreSQLTests.database
+    values = admission_fixtures.PublisherBudgetNativeAdmissionPostgreSQLTests.values
+
+    def test_same_global_policy_order_refusal_uses_actual_public_budget_and_restores(self):
+        policy = command._BUDGET_ADMISSION
+        self.assertIsNotNone(policy)
+        original = policy.class_namespaces
+        entry = next(entry for entry in original[1] if entry[0] is DatabaseWrapper)
+        self.assertGreater(len(entry[3]), 1)
+        changed = original[0], tuple((kind, meta, mro,
+            tuple(reversed(items)) if kind is DatabaseWrapper else items) for kind, meta, mro, items in original[1])
+        for binding in (False, True):
+            with self.subTest(server_side_binding=binding), ordinary_connection_capability(), self.database(binding) as database, plain_tracing():
+                broker = events.producer()
+                self.assertIs(type(broker.client), Producer)
+                before, raw = self.values(database), database.connection
+                with StopController() as stop, command.publisher_shard_owner(0, 1) as owner:
+                    self.assertIs(policy.plain(broker, owner, command._budget_aliases(), stop), True)
+                    with patch.object(policy, 'class_namespaces', changed):
+                        self.assertIs(command._BUDGET_ADMISSION, policy)
+                        self.assertIs(policy.plain(broker, owner, command._budget_aliases(), stop), False)
+                        batch = worker_metrics.PublisherBatchBudget(1.25, 3,
+                            admission=lambda: policy.plain(broker, owner, command._budget_aliases(), stop))
+                        batch.before_deadline()
+                        self.assertIs(batch.gap_plain, True)
+                        with operation_deadline(30):
+                            owner.assert_owned()
+                            with CaptureQueriesContext(database) as queries:
+                                with batch.record(command.database_statement_budget) as token:
+                                    token.complete(False)
+                                    token.retain(False)
+                        self.assertEqual(len(queries), 2)
+                        self.assertEqual(sum(row['sql'].lstrip().startswith('WITH previous AS MATERIALIZED') for row in queries), 1)
+                        self.assertEqual(sum(row['sql'].lstrip().startswith("SELECT set_config('statement_timeout'") for row in queries), 1)
+                        self.assertEqual(batch.counts['fallback_records'], 1)
+                        self.assertEqual(batch.counts['admitted_records'], 0)
+                        self.assertEqual(batch.counts['setup_attempts'], 0)
+                        self.assertEqual(batch.counts['discard_attempts'], 0)
+                        self.assertIsNone(batch.raw)
+                        self.assertIs(database.connection, raw)
+                        self.assertEqual(self.values(database), before)
+                        self.assertIs(command._BUDGET_ADMISSION, policy)
+                    self.assertIs(policy.class_namespaces, original)
+                    self.assertIs(policy.plain(broker, owner, command._budget_aliases(), stop), True)
+                    owner.assert_owned()
+        self.assertIs(command._BUDGET_ADMISSION, policy)
+        self.assertIs(policy.class_namespaces, original)

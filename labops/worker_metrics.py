@@ -208,25 +208,52 @@ def _publisher_class_capture(roots):
 def _publisher_class_unchanged(snapshot):
     """Reread all live facts; expected namespaces are private copied tuples."""
     try:
-        if type(snapshot) is not tuple or len(snapshot) != 2:
+        if (type(snapshot) is not tuple or len(snapshot) != 2
+                or type(snapshot[1]) is not tuple):
             return False
-        for kind, meta, mro, items in snapshot[1]:
+        for entry in snapshot[1]:
+            if type(entry) is not tuple or len(entry) != 4:
+                return False
+            kind, meta, mro, items = entry
+            if type(mro) is not tuple or type(items) is not tuple:
+                return False
             current = _publisher_class_read(kind)
-            if current is None or current[1] is not meta or len(current[2]) != len(mro):
+            if (type(current) is not tuple or len(current) != 4 or current[0] is not kind
+                    or type(current[2]) is not tuple or type(current[3]) is not tuple
+                    or current[1] is not meta or len(current[2]) != len(mro)):
                 return False
             if any(value is not expected for value, expected in zip(current[2], mro)):
                 return False
-            namespace = dict(current[3])
-            expected = dict(items)
-            bookkeeping = _publisher_bookkeeping_names(kind, namespace, expected)
-            if bookkeeping is None:
-                return False
-            for name in bookkeeping:
-                namespace.pop(name, None)
-                expected.pop(name, None)
-            if (len(namespace) != len(expected)
-                    or any(name not in namespace or namespace[name] is not value for name, value in expected.items())):
-                return False
+            if kind is _PUBLISHER_BASE_MANAGER or kind is _PUBLISHER_MANAGER or kind is _PUBLISHER_FIELD:
+                # Preserve the four exact-owner bookkeeping rules. Prove native
+                # pair/key shapes before the original dictionary operations.
+                for table in (current[3], items):
+                    for item in table:
+                        if type(item) is not tuple or len(item) != 2 or type(item[0]) is not str:
+                            return False
+                namespace = dict(current[3])
+                expected = dict(items)
+                bookkeeping = _publisher_bookkeeping_names(kind, namespace, expected)
+                if bookkeeping is None:
+                    return False
+                for name in bookkeeping:
+                    namespace.pop(name, None)
+                    expected.pop(name, None)
+                if (len(namespace) != len(expected)
+                        or any(name not in namespace or namespace[name] is not value for name, value in expected.items())):
+                    return False
+            else:
+                # Native key spelling and order must agree; values never
+                # dispatch equality. A changed order selects public fallback.
+                if len(current[3]) != len(items):
+                    return False
+                for actual, expected in zip(current[3], items):
+                    if (type(actual) is not tuple or len(actual) != 2
+                            or type(expected) is not tuple or len(expected) != 2
+                            or type(actual[0]) is not str or type(expected[0]) is not str):
+                        return False
+                    if actual[0] != expected[0] or actual[1] is not expected[1]:
+                        return False
         return True
     except Exception:
         return False
