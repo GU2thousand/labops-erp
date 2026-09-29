@@ -49,7 +49,7 @@ services:
       - ./generated/tls/redpanda-2.crt:/etc/labops-tls/redpanda-2.crt:ro
       - ./generated/tls/ca.crt:/etc/labops-tls/ca.crt:ro
   kafka-exporter:
-    image: danielqsj/kafka-exporter:v1.9.0
+    image: danielqsj/kafka-exporter:v1.9.0@sha256:4150e46b2e9697ac30e4be8de03ec1704b4bdc7037577b83b8d35a32be298c16
     profiles: [metrics]
     entrypoint: ['/bin/sh', '-ec']
     command:
@@ -65,7 +65,7 @@ services:
     mem_limit: 128m
     restart: 'no'
   prometheus:
-    image: prom/prometheus:v3.3.0
+    image: prom/prometheus:v3.3.0@sha256:339ce86a59413be18d0e445472891d022725b4803fab609069110205e79fb2f1
     profiles: [metrics]
     # Linux CI only: workers are independent host processes, so the collector
     # needs the same host loopback. Port 19091 stays private to the job host.
@@ -80,7 +80,7 @@ services:
     mem_limit: 192m
     restart: 'no'
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     command: [postgres, -c, track_commit_timestamp=on]
     environment:
       POSTGRES_USER: labops

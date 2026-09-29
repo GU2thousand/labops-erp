@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import copy
 import json
 from pathlib import Path
+import signal
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -24,6 +25,8 @@ class Process:
 
     def send_signal(self, value):
         self.signals.append(value)
+        if value == signal.SIGKILL:
+            self.returncode = -signal.SIGKILL
 
     def wait(self, timeout):
         if self.returncode is None:
@@ -243,7 +246,7 @@ class ConsumerPoolTests(SimpleTestCase):
             h.restore_consumer_pool('notification')
             first, old = h.workers['notification'], h.workers['notification-1']
             old.returncode = 1
-            result = h.ensure_consumer_pool('notification')
+            result = h.ensure_consumer_pool('notification', expected_fault_exit=True)
         self.assertIs(h.workers['notification'], first)
         self.assertNotEqual(h.workers['notification-1'].pid, old.pid)
         self.assertNotIn('acceptance-' + str(old.pid), result['client_ids'])

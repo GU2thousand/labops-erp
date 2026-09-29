@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 import subprocess
 import sys
+from contextlib import nullcontext
 from unittest import skipUnless
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -304,55 +305,83 @@ class PostgresBindingLiveTests(TransactionTestCase):
         expected = rows[3000].pk
         with connection.cursor() as cursor:
             cursor.execute('ANALYZE labops_outboxevent')
-        captured = []
-        def observe(execute, sql, params, many, context):
-            if sql.lstrip().startswith('SELECT') and 'FROM "labops_outboxevent"' in sql and 'FOR UPDATE SKIP LOCKED' in sql:
-                captured.append((sql, params))
-            return execute(sql, params, many, context)
-        with transaction.atomic(), connection.execute_wrapper(observe), patch.object(events.timezone, 'now', return_value=now):
-            self.assertEqual(events.claim_event().pk, expected)
-            transaction.set_rollback(True)
-        self.assertEqual(len(captured), 1)
-        sql, params = captured[0]
         def nodes(plan):
             result = [(plan['Node Type'], plan.get('Index Name'))]
             for child in plan.get('Plans', []):
                 result.extend(nodes(child))
             return result
-        observations = []
-        for enabled in (False, True):
-            database = connection.copy(alias='binding_planner_' + str(enabled))
-            database.settings_dict['OPTIONS'] = {**database.settings_dict['OPTIONS'],
-                'server_side_binding': enabled, 'prepare_threshold': None}
-            database.settings_dict['AUTOCOMMIT'] = True
-            try:
-                effective = self.assert_cursor(database)
-                with database.cursor() as cursor:
-                    for _ in range(8):
-                        cursor.execute(sql, params)
-                        self.assertEqual(cursor.fetchone()[0], expected)
-                    cursor.execute('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' + sql, params)
-                    plan = cursor.fetchone()[0]
-                    if isinstance(plan, str):
-                        plan = json.loads(plan)
-                    shape = nodes(plan[0]['Plan'])
-                    self.assertIn('outbox_active_created_id_idx', [name for _, name in shape])
-                    cursor.execute('SELECT name FROM pg_prepared_statements')
-                    self.assertEqual(cursor.fetchall(), [])
-                    cursor.execute('SHOW plan_cache_mode')
-                    cache_mode = cursor.fetchone()[0]
-                observations.append({'effective': effective, 'execution_count': 8,
-                    'selected_id': str(expected), 'named_prepared_statements': [],
-                    'plan_cache_mode': cache_mode, 'plan': plan, 'node_shape': shape})
-            finally:
-                database.close()
-        self.assertEqual(observations[0]['node_shape'], observations[1]['node_shape'])
-        found = OutboxEvent.objects.get(pk=expected)
-        self.assertEqual(found.status, 'PENDING')
-        self.assertIsNone(found.lease_token)
-        self.assertIsNone(found.locked_until)
-        proof('binding-partial-index', {'fixture_rows': 4080, 'published_history_rows': 3000,
-            'pending_backlog_rows': 1024, 'control_rows': 56, 'normal_planner': True,
-            'actual_claim_sql_sha256': hashlib.sha256(sql.encode()).hexdigest(),
-            'observations': observations, 'equivalent_node_shape': True,
-            'equivalent_selected_id': True, 'claim_mutations_rolled_back': True})
+        for path in ('orm', 'native_postgresql'):
+            with self.subTest(claim_path=path):
+                captured = []
+                expected_start = 'SELECT' if path == 'orm' else 'WITH claimed AS ('
+                def observe(execute, sql, params, many, context):
+                    if (sql.lstrip().startswith(expected_start) and 'FROM "labops_outboxevent"' in sql
+                            and 'FOR UPDATE SKIP LOCKED' in sql):
+                        captured.append((sql, params))
+                    return execute(sql, params, many, context)
+                # Preserve the original SELECT planner proof independently.
+                # The native capture also exercises parameterized shard modulo.
+                admission = patch.object(events, '_plain_outbox_claim', return_value=False) if path == 'orm' else nullcontext()
+                kwargs = {} if path == 'orm' else {'shard_index': 0, 'shard_count': 2}
+                if path == 'native_postgresql':
+                    self.assertTrue(events._plain_outbox_claim(OutboxEvent.objects))
+                with admission, transaction.atomic(), connection.execute_wrapper(observe), \
+                        patch.object(events.timezone, 'now', return_value=now):
+                    self.assertEqual(events.claim_event(**kwargs).pk, expected)
+                    transaction.set_rollback(True)
+                self.assertEqual(len(captured), 1)
+                sql, params = captured[0]
+                self.assertTrue(params, 'Exercise driver binding with actual claim parameters')
+                if path == 'native_postgresql':
+                    self.assertIn('UPDATE "labops_outboxevent" AS event', sql)
+                    self.assertIn('RETURNING event."id"', sql)
+                    self.assertIn('%% %s', sql)
+                    self.assertTrue(any(type(value) is UUID for value in params))
+                observations = []
+                for enabled in (False, True):
+                    with self.subTest(server_side_binding=enabled):
+                        database = connection.copy(alias='binding_planner_' + path + '_' + str(enabled))
+                        database.settings_dict['OPTIONS'] = {**database.settings_dict['OPTIONS'],
+                            'server_side_binding': enabled, 'prepare_threshold': None}
+                        database.settings_dict['AUTOCOMMIT'] = True
+                        try:
+                            effective = self.assert_cursor(database)
+                            # This copy is not registered with Django atomic.
+                            # Roll back each native UPDATE, including EXPLAIN
+                            # ANALYZE, so every repetition claims the same row.
+                            database.set_autocommit(False)
+                            with database.cursor() as cursor:
+                                for _ in range(8):
+                                    cursor.execute(sql, params)
+                                    self.assertEqual(cursor.fetchone()[0], expected)
+                                    self.assertIsNone(cursor.fetchone())
+                                    database.rollback()
+                                cursor.execute('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' + sql, params)
+                                plan = cursor.fetchone()[0]
+                                if isinstance(plan, str):
+                                    plan = json.loads(plan)
+                                shape = nodes(plan[0]['Plan'])
+                                self.assertIn('outbox_active_created_id_idx', [name for _, name in shape])
+                                database.rollback()
+                                cursor.execute('SELECT name FROM pg_prepared_statements')
+                                self.assertEqual(cursor.fetchall(), [])
+                                cursor.execute('SHOW plan_cache_mode')
+                                cache_mode = cursor.fetchone()[0]
+                                database.rollback()
+                            observations.append({'effective': effective, 'execution_count': 8,
+                                'selected_id': str(expected), 'named_prepared_statements': [],
+                                'plan_cache_mode': cache_mode, 'plan': plan, 'node_shape': shape,
+                                'each_execution_and_explain_rolled_back': True})
+                        finally:
+                            database.close()
+                self.assertEqual(observations[0]['node_shape'], observations[1]['node_shape'])
+                found = OutboxEvent.objects.get(pk=expected)
+                self.assertEqual(found.status, 'PENDING')
+                self.assertIsNone(found.lease_token)
+                self.assertIsNone(found.locked_until)
+                proof('binding-partial-index' if path == 'orm' else 'binding-native-claim-partial-index', {
+                    'claim_path': path, 'fixture_rows': 4080, 'published_history_rows': 3000,
+                    'pending_backlog_rows': 1024, 'control_rows': 56, 'normal_planner': True,
+                    'actual_claim_sql_sha256': hashlib.sha256(sql.encode()).hexdigest(),
+                    'observations': observations, 'equivalent_node_shape': True,
+                    'equivalent_selected_id': True, 'claim_mutations_rolled_back': True})

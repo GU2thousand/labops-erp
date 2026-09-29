@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import textwrap
+from types import FunctionType
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +37,10 @@ class PublisherObservation:
         self.ack_unavailable = self.ack_nonowner = self.ack_late = 0
         self.commit_unavailable = 0
         self.database = None
+        self.native_admitted_at_install = None
+        self.native_admission_preflight_calls = 0
+        self.native_hook_installed = False
+        self.claim_strategy_at_install = 'orm_model_hooks'
         from labops import events
         self.publication_code = events.publish_one.__code__
         self.publication_lines = set()
@@ -75,6 +80,7 @@ class PublisherObservation:
         clock = self._clock()
         row = {'id': len(self.records) + 1, 'parent_id': self.parents[-1] if self.parents else None,
             'stage': stage, 'ordinal': self.attempt['ordinal'], 'event_id': self.attempt['event_id'],
+            'claim_path': self.attempt.get('claim_path', 'unobserved'),
             'start_epoch_ns': clock[0] if clock else None,
             'start_perf_ns': clock[1] if clock else None,
             'start_thread_cpu_ns': clock[2] if clock else None,
@@ -247,7 +253,12 @@ class PublisherObservation:
                     position = assignment[:match.start()].count('%s') if match else None
                     if position is not None and position < len(params):
                         status = params[position]
-                if phase == 'claim_commit_composite' and sql.lstrip().startswith('SELECT'):
+                if (phase == 'claim_atomic_materialization_composite'
+                        and sql.lstrip().startswith('WITH claimed AS (')
+                        and 'UPDATE "labops_outboxevent" AS event' in sql
+                        and 'RETURNING ' in sql and '_claim_previous_status' in sql):
+                    stage = 'claim_atomic_claim_execute'
+                elif phase == 'claim_commit_composite' and sql.lstrip().startswith('SELECT'):
                     stage = 'claim_query_execute'
                 elif (phase == 'claim_commit_composite' and sql.lstrip().startswith('UPDATE')
                         and status == 'PROCESSING'):
@@ -260,6 +271,8 @@ class PublisherObservation:
             self._error('publisher_observation_sql_classification', error)
         if stage is None or not self.profile.owning_thread() or self.attempt is None:
             return execute(sql, params, many, context)
+        if stage == 'claim_query_execute':
+            self._mark_claim_path('orm')
         with self._measure(stage) as row:
             if row is not None:
                 try:
@@ -272,6 +285,14 @@ class PublisherObservation:
                 except BaseException as error:
                     self._error('publisher_observation_database_state', error)
             return execute(sql, params, many, context)
+
+    def _mark_claim_path(self, path):
+        try:
+            self.attempt['claim_path'] = path
+            for row in self.attempt['rows']:
+                row['claim_path'] = path
+        except BaseException as error:
+            self._error('publisher_observation_claim_path', error)
 
     def _bind_event(self, event):
         try:
@@ -362,7 +383,8 @@ class PublisherObservation:
                 return original(*args, **kwargs)
             self.sampled_attempts += 1
             prior = self.attempt
-            self.attempt = {'ordinal': self.profile.ordinal, 'event_id': None, 'empty_claim': False, 'rows': []}
+            self.attempt = {'ordinal': self.profile.ordinal, 'event_id': None, 'empty_claim': False,
+                'claim_path': 'unobserved', 'rows': []}
             outcome = 'error'
             try:
                 with self._scope(phase), self._measure(phase), self._database_scope():
@@ -381,6 +403,8 @@ class PublisherObservation:
                     self.attempt = prior
         if self.attempt is None:
             return original(*args, **kwargs)
+        if phase == 'claim_atomic_materialization_composite':
+            self._mark_claim_path('native_postgresql')
         with self._scope(phase), self._measure(phase):
             if phase == 'claim_commit_composite':
                 with self._commit_scope():
@@ -391,6 +415,45 @@ class PublisherObservation:
                 with self._delivery_scope(args[0] if args else kwargs.get('producer')):
                     return original(*args, **kwargs)
             return original(*args, **kwargs)
+
+    def install_claim_hooks(self):
+        from labops import events
+        from django.db import connections, DEFAULT_DB_ALIAS
+        helper = vars(events).get('_claim_event_postgresql')
+        admission = vars(events).get('_plain_outbox_claim')
+        if helper is not None or admission is not None:
+            # Exact source functions only. Metadata from __wrapped__ is not a
+            # capability to bypass business admission or observe another call.
+            for function, name in [(helper, '_claim_event_postgresql'), (admission, '_plain_outbox_claim')]:
+                if type(function) is not FunctionType:
+                    raise RuntimeError('UnexpectedNativeClaimSource')
+                code = getattr(function, '__code__', None)
+                if (vars(function).get('__wrapped__') is not None
+                        or type(function.__module__) is not str or function.__module__ != events.__name__
+                        or function.__qualname__ != name
+                        or code is None or code.co_name != name
+                        or Path(code.co_filename).resolve() != ROOT / 'labops/events.py'):
+                    raise RuntimeError('UnexpectedNativeClaimSource')
+            # No extra admission invocation. PostgreSQL model hooks would
+            # change the production admission decision; missing ORM lifecycle
+            # boundaries on a runtime fallback remain explicitly incomplete.
+            if connections[DEFAULT_DB_ALIAS].vendor == 'postgresql':
+                self.claim_strategy_at_install = 'postgresql_helper_only'
+                @wraps(helper)
+                def wrapper(*args, **kwargs):
+                    try:
+                        in_claim = bool(self.scopes and self.scopes[-1] == 'claim_commit_composite')
+                    except BaseException as error:
+                        self._error('publisher_observation_native_scope', error)
+                        in_claim = False
+                    if not in_claim:
+                        return helper(*args, **kwargs)
+                    return self.invoke('claim_atomic_materialization_composite', helper, args, kwargs)
+                self.profile.hooks.append((events, '_claim_event_postgresql', helper, wrapper, True))
+                events._claim_event_postgresql = wrapper
+                self.native_hook_installed = True
+                return
+        self.install_model_hooks()
 
     def install_model_hooks(self):
         from django.db.models import Model
@@ -421,22 +484,31 @@ class PublisherObservation:
 
     def document(self):
         from collections import Counter
-        required = {'claim_query_execute', 'claim_object_construct', 'claim_lease_write_execute',
-            'claim_physical_commit', 'send_composite', 'delivery_ack', 'publication_mark_execute'}
+        common = {'claim_physical_commit', 'send_composite', 'delivery_ack', 'publication_mark_execute'}
         attempts = []
         for sample in self.samples:
             rows = sample['rows']
+            path = sample.get('claim_path', 'unobserved')
+            claim = ({'claim_atomic_claim_execute', 'claim_atomic_materialization_composite'}
+                if path == 'native_postgresql' else
+                {'claim_query_execute', 'claim_object_construct', 'claim_lease_write_execute'})
+            required = common | claim
+            if sample['empty_claim']:
+                required = {'claim_physical_commit'} | ({'claim_atomic_claim_execute', 'claim_atomic_materialization_composite'}
+                    if path == 'native_postgresql' else {'claim_query_execute'})
             observed = {row['stage'] for row in rows if row['complete'] and row['outcome'] in {'returned', 'success'}}
-            missing = sorted(required - observed) if not sample['empty_claim'] else []
+            missing = sorted(required - observed)
             publication = [row for row in rows if row['stage'] == 'publication_mark_execute']
             autocommit = bool(publication) and all(row.get('autocommit') is True
                 and row.get('in_atomic_block') is False for row in publication)
             attempts.append({'ordinal': sample['ordinal'], 'event_id': sample['event_id'],
+                'claim_path': path,
                 'empty_claim': sample['empty_claim'], 'outcome': sample['outcome'],
                 'missing_boundaries': missing,
                 'publication_autocommit_observed': autocommit,
-                'complete': sample['outcome'] == 'returned' and (sample['empty_claim'] or
-                    (sample['event_id'] is not None and not missing and autocommit))})
+                'complete': sample['outcome'] == 'returned' and path in {'native_postgresql', 'orm'}
+                    and not missing and (sample['empty_claim'] or
+                        (sample['event_id'] is not None and autocommit))})
         complete = (bool(attempts) and any(row['event_id'] is not None for row in attempts)
             and all(row['complete'] for row in attempts) and not self.overflow_attempts
             and not self.overflow_records and not self.missing_event_ids and not self.clock_failures
@@ -452,6 +524,11 @@ class PublisherObservation:
             'clock_failures': self.clock_failures, 'ack_unavailable': self.ack_unavailable,
             'ack_nonowner': self.ack_nonowner, 'ack_late': self.ack_late,
             'commit_unavailable': self.commit_unavailable,
+            'native_admitted_at_install': self.native_admitted_at_install,
+            'native_admission_preflight_calls': self.native_admission_preflight_calls,
+            'claim_strategy_at_install': self.claim_strategy_at_install,
+            'native_hook_installed': self.native_hook_installed,
+            'claim_paths': dict(Counter(row['claim_path'] for row in attempts)),
             'complete': complete, 'status': 'COMPLETE' if complete else 'INCOMPLETE',
             'attempts': attempts,
             'boundaries': dict(Counter(row['stage'] for row in self.records)),
@@ -461,6 +538,9 @@ class PublisherObservation:
             'nested_times_additive': False, 'qualification_admissible': False,
             'clock_overhead_scope': 'clock reads only; total instrumentation overhead unmeasured',
             'limitations': ['claim query execute excludes fetching and ORM conversion outside from_db',
+                'native claim helper combines SQL construction, atomic scope, execute, fetch, typed materialization and commit',
+                'native claim execute combines candidate selection and lease update; their separate costs are unmeasured',
+                'PostgreSQL ORM fallback has no model hooks and may have incomplete materialization boundaries',
                 'claim physical commit includes Django bookkeeping and driver commit',
                 'publication mark includes driver autocommit; separate final physical commit unavailable',
                 'delivery callback arrival precedes original callback; send return follows ACK validation',
@@ -491,7 +571,7 @@ def install_publisher_hooks(profile):
                 raise RuntimeError('UnexpectedPublisherSource')
         observer = PublisherObservation(profile)
         profile.publisher_observation = observer
-        observer.install_model_hooks()
+        observer.install_claim_hooks()
         for target, name, phase, original in expected:
             profile.hook(target, name, phase, expected=original, ordinal=name == 'publish_one', observer=observer)
         original = command.database_statement_budget

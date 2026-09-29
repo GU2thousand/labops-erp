@@ -13,6 +13,7 @@ import time
 import uuid
 from datetime import timedelta
 from decimal import Decimal
+from types import FunctionType
 from django.conf import settings
 from django.db import transaction, connection, connections, router, DEFAULT_DB_ALIAS, DatabaseError, IntegrityError, OperationalError
 from django.db import models
@@ -438,10 +439,184 @@ def process_envelope(consumer, event):
         return True
 
 
+_OUTBOX_CLAIM_MODEL = OutboxEvent
+_OUTBOX_CLAIM_MISSING = object()
+_OUTBOX_CLAIM_FIELDS = {
+    'id': models.UUIDField, 'created_at': models.DateTimeField,
+    'event_type': models.CharField, 'transport': models.CharField,
+    'schema_version': models.PositiveIntegerField, 'aggregate_version': models.PositiveIntegerField,
+    'published_at': models.DateTimeField, 'lease_token': models.UUIDField,
+    'aggregate_type': models.CharField, 'aggregate_id': models.UUIDField,
+    'payload_json': models.JSONField, 'payload_hash': models.CharField,
+    'dedupe_key': models.CharField, 'status': models.CharField,
+    'attempts': models.PositiveIntegerField, 'next_attempt_at': models.DateTimeField,
+    'locked_until': models.DateTimeField, 'last_error': models.TextField,
+    'processed_at': models.DateTimeField,
+}
+_OUTBOX_CLAIM_MODEL_METHODS = (
+    '__init__', 'from_db', 'save', 'save_base', '_prepare_related_fields_for_save',
+    '_parse_save_params', '_validate_force_insert', '_save_parents', '_save_table', '_do_update', '_is_pk_set', '_get_pk_val',
+)
+_OUTBOX_CLAIM_MANAGER_METHODS = ('get_queryset', 'filter', 'select_for_update', 'raw')
+_OUTBOX_CLAIM_FIELD_METHODS = ('pre_save', 'get_db_prep_save', 'get_db_prep_value', 'get_prep_value')
+
+# Only the operations replaced by the native claim need admission. Read
+# conversion still belongs to Django's RawModelIterable, rather than a second
+# UUID/JSON/datetime converter or a hand-built model instance.
+_OUTBOX_CLAIM_CAPABILITIES = tuple(
+    (kind, name, inspect.getattr_static(kind, name))
+    for kind, names in (
+        (models.Model, _OUTBOX_CLAIM_MODEL_METHODS),
+        (Manager, _OUTBOX_CLAIM_MANAGER_METHODS),
+        (QuerySet, ('__init__', 'filter', 'exclude', 'select_for_update', 'alias', 'annotate',
+                    'order_by', 'first', 'iterator', '_update', 'raw')),
+        *((kind, _OUTBOX_CLAIM_FIELD_METHODS) for kind in set(_OUTBOX_CLAIM_FIELDS.values())),
+    ) for name in names)
+_OUTBOX_CLAIM_SOURCE_FILES = {name: _MARKER_SOURCE_FILES[name] for name in (
+    'django.db.models.base', 'django.db.models.manager', 'django.db.models.query', 'django.db.models.fields')}
+_OUTBOX_CLAIM_SOURCE_FILES['django.db.models.fields.json'] = str(
+    Path(_MARKER_SOURCE_FILES['django.db.models.fields']).with_name('json.py'))
+
+
+def _outbox_claim_callable_state(kind, descriptor):
+    # Unknown callable/descriptor objects retain the ORM without probing their
+    # __code__, __module__, or module-file getters during module import.
+    function = descriptor.__func__ if type(descriptor) is classmethod else descriptor
+    if type(function) is not FunctionType or type(function.__module__) is not str:
+        return None
+    filename = (_OUTBOX_CLAIM_SOURCE_FILES['django.db.models.manager'] if kind is Manager
+                else _OUTBOX_CLAIM_SOURCE_FILES.get(function.__module__))
+    return (function.__code__, filename) if filename is not None else None
+
+
+_OUTBOX_CLAIM_CALLABLES = {
+    id(descriptor): _outbox_claim_callable_state(kind, descriptor)
+    for kind, _, descriptor in _OUTBOX_CLAIM_CAPABILITIES
+}
+
+
+def _plain_outbox_claim(manager):
+    """Unknown model, manager, field, backend or lifecycle hooks keep the ORM."""
+    try:
+        if (connection.vendor != 'postgresql' or connection.alias != DEFAULT_DB_ALIAS
+                or settings.DATABASE_ROUTERS or router.routers or OutboxEvent is not _OUTBOX_CLAIM_MODEL
+                or uuid.uuid4 is not _MARKER_DEFAULTS[0]
+                or not _marker_original_callable(uuid.uuid4, 'uuid', 'uuid', 'uuid4')
+                or type(settings.EVENT_LEASE_SECONDS) is not int or settings.EVENT_LEASE_SECONDS < 1):
+            return False
+        database = connections[DEFAULT_DB_ALIAS]
+        if (connection.settings_dict['ENGINE'] != 'django.db.backends.postgresql'
+                or type(database) is not postgres_base.DatabaseWrapper
+                or type(connection.ops) is not postgres_operations.DatabaseOperations
+                or connection.ops.compiler('SQLUpdateCompiler') is not postgres_compiler.SQLUpdateCompiler
+                or any(key in database.settings_dict['OPTIONS'] for key in ('isolation_level', 'options'))):
+            return False
+        if database.connection is not None and (
+                database.isolation_level != postgres_base.IsolationLevel.READ_COMMITTED
+                or database.connection.isolation_level not in (None, postgres_base.IsolationLevel.READ_COMMITTED)):
+            return False
+        meta = OutboxEvent._meta
+        if (type(OutboxEvent) is not ModelBase or meta.db_table != 'labops_outboxevent'
+                or meta.proxy or meta.parents or meta.swapped or meta.concrete_model is not OutboxEvent
+                or inspect.getattr_static(ModelBase, '__call__') is not inspect.getattr_static(type, '__call__')
+                or inspect.getattr_static(OutboxEvent, '_claim_previous_status', _OUTBOX_CLAIM_MISSING)
+                   is not _OUTBOX_CLAIM_MISSING):
+            return False
+        for name in ('__new__', '__getattribute__', '__setattr__'):
+            if inspect.getattr_static(OutboxEvent, name) is not inspect.getattr_static(object, name):
+                return False
+        for kind, name, descriptor in _OUTBOX_CLAIM_CAPABILITIES:
+            state = _OUTBOX_CLAIM_CALLABLES[id(descriptor)]
+            if state is None:
+                return False
+            code, filename = state
+            function = _marker_callable(descriptor)
+            if (inspect.getattr_static(kind, name) is not descriptor
+                    or function.__code__ is not code or code.co_filename != filename):
+                return False
+            if kind is models.Model and inspect.getattr_static(OutboxEvent, name) is not descriptor:
+                return False
+        for candidate in (manager, OutboxEvent._base_manager, OutboxEvent._default_manager):
+            if (type(candidate) is not Manager or candidate.model is not OutboxEvent
+                    or candidate._db is not None or candidate._hints or candidate._queryset_class is not QuerySet
+                    or any(inspect.getattr_static(candidate, name) is not inspect.getattr_static(Manager, name)
+                           for name in _OUTBOX_CLAIM_MANAGER_METHODS)):
+                return False
+        fields = tuple(meta.concrete_fields)
+        if (tuple(field.name for field in fields) != tuple(_OUTBOX_CLAIM_FIELDS)
+                or meta.pk is not fields[0] or not fields[0].primary_key):
+            return False
+        for field in fields:
+            descriptor = inspect.getattr_static(OutboxEvent, field.name)
+            if (type(field) is not _OUTBOX_CLAIM_FIELDS[field.name] or field.model is not OutboxEvent
+                    or field.attname != field.name or field.column != field.name or field.generated
+                    or type(descriptor) is not DeferredAttribute or descriptor.field is not field
+                    or any(name in field.__dict__ for name in (*_OUTBOX_CLAIM_FIELD_METHODS, 'get_placeholder'))):
+                return False
+        for name, options in (
+                ('status', {'max_length': 32, 'default': 'PENDING'}),
+                ('lease_token', {'null': True}), ('locked_until', {'null': True})):
+            if meta.get_field(name).deconstruct()[3] != options:
+                return False
+        return not any(signal.has_listeners(OutboxEvent) for signal in (pre_init, post_init, pre_save, post_save))
+    except Exception:
+        return False
+
+
+def _claim_event_postgresql(manager, now, *, shard_index, shard_count):
+    """Lock and lease one ordered event with one statement, then commit."""
+    quote = connection.ops.quote_name
+    table = quote(OutboxEvent._meta.db_table)
+    columns = ', '.join(f'event.{quote(field.column)}' for field in OutboxEvent._meta.concrete_fields)
+    shard = "(('x' || substr(replace(candidate.aggregate_id::text, '-', ''), 1, 8))::bit(32)::bigint %% %s)"
+    shard_select = f', {shard} AS publisher_shard' if shard_count > 1 else ''
+    shard_filter = f' AND {shard} = %s' if shard_count > 1 else ''
+    shard_return = ', claimed.publisher_shard AS publisher_shard' if shard_count > 1 else ''
+    params = [shard_count] if shard_count > 1 else []
+    due = OutboxEvent._meta.get_field('next_attempt_at').get_db_prep_value(now, connection)
+    params += [due, due]
+    if shard_count > 1:
+        params += [shard_count, shard_index]
+    # A plain empty attempt consumes an unused random token. Patched random
+    # sources retain the ORM's candidate-before-token call order via admission.
+    params += [uuid.uuid4(), OutboxEvent._meta.get_field('locked_until').get_db_prep_save(
+        now + timedelta(seconds=settings.EVENT_LEASE_SECONDS), connection)]
+    sql = f'''WITH claimed AS (
+        SELECT candidate.id, candidate.status{shard_select}
+        FROM {table} AS candidate
+        WHERE candidate.transport = 'kafka'
+          AND ((candidate.status = 'PENDING' AND candidate.next_attempt_at <= %s)
+            OR (candidate.status = 'PROCESSING' AND candidate.locked_until < %s))
+          AND NOT EXISTS (SELECT 1 FROM {table} AS earlier
+            WHERE earlier.transport = 'kafka'
+              AND earlier.aggregate_type = candidate.aggregate_type
+              AND earlier.aggregate_id = candidate.aggregate_id
+              AND earlier.aggregate_version < candidate.aggregate_version
+              AND earlier.status <> 'PUBLISHED'){shard_filter}
+        ORDER BY candidate.created_at, candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
+    )
+    UPDATE {table} AS event
+    SET status = 'PROCESSING', lease_token = %s, locked_until = %s
+    FROM claimed WHERE event.id = claimed.id
+    RETURNING {columns}, claimed.status AS _claim_previous_status{shard_return}'''
+    with transaction.atomic():
+        # RawQuerySet fetches at most the one candidate and applies the same
+        # backend/field converters and from_db/__init__ lifecycle as ORM reads.
+        event = next(iter(manager.raw(sql, params)), None)
+        if event is not None and event.__dict__.pop('_claim_previous_status') == 'PROCESSING':
+            # The old status is available only after a successful UPDATE. Like
+            # the ORM counter, a later rollback/commit failure does not undo it.
+            EVENTS.labels('publisher', 'lease_expired').inc()
+    return event
+
+
 def claim_event(*, shard_index=0, shard_count=1):
     if shard_count < 1 or not 0 <= shard_index < shard_count:
         raise ValueError('Invalid publisher shard')
     now = timezone.now()
+    manager = OutboxEvent.objects
+    if _plain_outbox_claim(manager):
+        return _claim_event_postgresql(manager, now, shard_index=shard_index, shard_count=shard_count)
     earlier = OutboxEvent.objects.filter(transport='kafka', aggregate_type=OuterRef('aggregate_type'),
         aggregate_id=OuterRef('aggregate_id'), aggregate_version__lt=OuterRef('aggregate_version')).exclude(status='PUBLISHED')
     with transaction.atomic():

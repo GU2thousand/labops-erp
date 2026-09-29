@@ -214,6 +214,7 @@ class Harness:
         self.rejected_child_generations = {}
         self.cleanup_errors = []
         self.worker_closures = {}
+        self.worker_exit_observations = {}
         self.workers = {}
         self.shutdowns = []
         self.supervisor_restarts = []
@@ -378,7 +379,10 @@ class Harness:
                     self.record_cleanup_error('consumer_stop', error, label)
         for child in self.children:
             try:
-                if self.child_groups.get(child.pid) != self.consumer_group(name) or child.poll() is not None:
+                if self.child_groups.get(child.pid) != self.consumer_group(name):
+                    continue
+                if child.poll() is not None:
+                    self.observe_worker_close(child, expected_fault_exit=expected_fault_exit)
                     continue
                 child.send_signal(signal.SIGTERM)
                 escalated = False
@@ -392,7 +396,8 @@ class Harness:
                 self.shutdowns.append({'worker': name + '-untracked-instance', 'pid': child.pid,
                     'requested_signal': 'SIGTERM', 'forced_SIGKILL': escalated,
                     'exit_code': child.returncode, 'elapsed_seconds': time.monotonic() - began})
-                self.observe_worker_close(child, expected_fault_exit=expected_fault_exit)
+                self.observe_worker_close(child, expected_fault_exit=expected_fault_exit,
+                                          forced_sigkill=escalated)
             except BaseException as error:
                 if first is None:
                     first = error
@@ -570,14 +575,14 @@ class Harness:
         assert time.monotonic() < deadline, 'Late restored groups cannot pass original readiness deadline'
         return result
 
-    def ensure_consumer_pool(self, name, *, timeout=90):
+    def ensure_consumer_pool(self, name, *, timeout=90, expected_fault_exit=False):
         """Replace only missing/exited declared slots, keeping live owners unchanged."""
         deadline = time.monotonic() + timeout
         for label in self.pool_roles(name):
             process = self.workers.get(label)
             if process is None or process.poll() is not None:
                 if process is not None:
-                    self.stop(label, expected_fault_exit=True)
+                    self.stop(label, expected_fault_exit=expected_fault_exit)
                 suffix = label[len(name):]
                 if suffix:
                     self.start_consumer(name, suffix)
@@ -592,7 +597,7 @@ class Harness:
     def supervisor_after_postgres_restart(self, reason):
         before = {name: {'pid': process.pid, 'exit_code_before_restart': process.poll()}
                   for name, process in self.workers.items()}
-        self.stop('publisher')
+        self.stop('publisher', expected_fault_exit=True)
         self.stop_consumer_role('notification', expected_fault_exit=True)
         self.stop_consumer_role('analytics', expected_fault_exit=True)
         self.settle_worker_sessions()
@@ -608,9 +613,13 @@ class Harness:
 
     def stop(self, name, *, kill=False, expected_fault_exit=False):
         process = self.workers.pop(name, None)
+        escalated = False
+        if process and kill and process.poll() is not None:
+            error = AssertionError('Intentional SIGKILL target already exited')
+            self.record_cleanup_error('intentional_sigkill_target_exited', error, name, process.pid)
+            raise error
         if process and process.poll() is None:
             started = time.monotonic()
-            escalated = False
             process.send_signal(signal.SIGKILL if kill else signal.SIGTERM)
             try:
                 process.wait(timeout=30)
@@ -624,10 +633,46 @@ class Harness:
                 'elapsed_seconds': time.monotonic() - started})
         if process:
             self.observe_worker_close(process, expected_fault_exit=expected_fault_exit,
-                                      expected_sigkill=kill)
+                                      expected_sigkill=kill, forced_sigkill=escalated)
         self.sync_metrics_targets()
 
-    def observe_worker_close(self, process, *, expected_fault_exit=False, expected_sigkill=False):
+    def observe_worker_exit(self, process, *, expected_fault_exit=False,
+                            expected_sigkill=False, forced_sigkill=False):
+        """Qualify every owned exit independently of optional DB-close receipts.
+
+        The first observation keeps its explicit drill exception for later final
+        cleanup. A stage label alone never exempts an unexpected worker exit.
+        """
+        if not hasattr(self, 'worker_exit_observations'):
+            self.worker_exit_observations = {}
+        key = id(process)
+        outcome = self.worker_exit_observations.get(key)
+        if outcome is None:
+            identity = getattr(self, 'child_identities', {}).get(process.pid) or {}
+            exit_code = process.poll()
+            exited = type(exit_code) is int
+            exception = expected_fault_exit or expected_sigkill
+            intentional_kill_observed = expected_sigkill and exit_code == -signal.SIGKILL
+            outcome = {'pid': process.pid, 'role': identity.get('role'),
+                'generation': identity.get('generation'), 'exit_code': exit_code,
+                'expected_fault_exit': expected_fault_exit,
+                'intentional_SIGKILL': expected_sigkill, 'forced_SIGKILL': forced_sigkill,
+                'intentional_SIGKILL_observed': intentional_kill_observed,
+                'normal_exit_required': not exception, 'process_exited': exited,
+                'passed': exited and (expected_fault_exit or intentional_kill_observed
+                    or (not exception and exit_code == 0 and not forced_sigkill))}
+            self.worker_exit_observations[key] = outcome
+            with (self.evidence / 'worker-exit-observations.jsonl').open('a') as output:
+                output.write(json.dumps(outcome, sort_keys=True) + '\n')
+            if not outcome['passed']:
+                self.record_cleanup_error('worker_exit_qualification',
+                    AssertionError('Owned worker exit was not admissible'),
+                    identity.get('role'), process.pid)
+        assert outcome['passed'], 'Owned worker exit was not admissible'
+        return outcome
+
+    def observe_worker_close(self, process, *, expected_fault_exit=False,
+                             expected_sigkill=False, forced_sigkill=False):
         rejected = getattr(self, 'rejected_child_generations', {}).get(id(process))
         if rejected is not None:
             if 'close_outcome' not in rejected:
@@ -640,12 +685,19 @@ class Harness:
                 with (self.evidence / 'worker-close-observations.jsonl').open('a') as output:
                     output.write(json.dumps(outcome, sort_keys=True) + '\n')
             return
+        exit_observation = self.observe_worker_exit(process, expected_fault_exit=expected_fault_exit,
+                                                   expected_sigkill=expected_sigkill,
+                                                   forced_sigkill=forced_sigkill)
         identity = getattr(self, 'child_identities', {}).get(process.pid)
         if not identity or not identity.get('identity_receipt'):
             return
         if not hasattr(self, 'worker_closures'):
             self.worker_closures = {}
         if process.pid in self.worker_closures:
+            prior = self.worker_closures[process.pid]
+            assert (prior['intentional_SIGKILL'] or prior['fault_context']
+                or (prior['exit_code'] == 0 and prior['owning_close_receipt_complete'])), \
+                'Graceful owned worker exit or close receipt failed'
             return
         path = self.evidence / 'logs' / (identity['identity_receipt'] + '.closed')
         value = json.loads(path.read_text()) if path.exists() else None
@@ -656,7 +708,8 @@ class Harness:
             and value.get('expected_application_name') == identity['application_name']
             and snapshot.get('status') == 'available' and snapshot.get('pid') == process.pid
             and snapshot.get('start_time_ticks') == identity['start_time_ticks'])
-        fault_context = expected_fault_exit or identity.get('fault_stage', 'normal') != 'normal'
+        fault_context = exit_observation['expected_fault_exit']
+        expected_sigkill = exit_observation['intentional_SIGKILL_observed']
         outcome = {'pid': process.pid, 'role': identity['role'], 'generation': identity['generation'],
             'exit_code': process.poll(), 'closed_receipt_present': value is not None,
             'owning_close_receipt_complete': complete, 'intentional_SIGKILL': expected_sigkill,
@@ -665,7 +718,11 @@ class Harness:
         with (self.evidence / 'worker-close-observations.jsonl').open('a') as output:
             output.write(json.dumps(outcome, sort_keys=True) + '\n')
         if not expected_sigkill and not fault_context:
-            assert process.poll() == 0 and complete, 'Graceful owned worker exit or close receipt failed'
+            if process.poll() != 0 or not complete:
+                error = AssertionError('Graceful owned worker exit or close receipt failed')
+                self.record_cleanup_error('worker_close_qualification', error,
+                                          identity['role'], process.pid)
+                raise error
 
     def cleanup_workers(self):
         """Attempt every exact owned child; a first failure cannot hide slot1."""
@@ -679,11 +736,13 @@ class Harness:
                 self.record_cleanup_error('final_worker_stop', error, name)
         for process in self.children:
             try:
+                forced_sigkill = False
                 if process.poll() is None:
+                    forced_sigkill = True
                     process.kill()
                     process.wait(timeout=10)
                 assert process.poll() is not None, 'Owned child was not reaped'
-                self.observe_worker_close(process)
+                self.observe_worker_close(process, forced_sigkill=forced_sigkill)
             except BaseException as error:
                 if first is None:
                     first = error
@@ -1878,6 +1937,7 @@ class Harness:
                     assert effect_count == (1 if stage == 'after_commit' else 0)
                     child.kill()
                     assert child.wait(timeout=10) == -signal.SIGKILL
+                    self.observe_worker_close(child, expected_sigkill=True)
                     recovered = self.marker(label + '-recover')
                     child = self.spawn(label + '-recover', [str(HERE / 'workers.py'), 'consumer',
                         '--consumer', name, '--event', eid, '--marker', str(recovered), '--max-messages', '1'], name)
@@ -1912,6 +1972,7 @@ class Harness:
                 if stage != 'stale_owner':
                     child.kill()
                     assert child.wait(timeout=10) == -signal.SIGKILL
+                    self.observe_worker_close(child, expected_sigkill=True)
                 from django.utils import timezone
                 original_claim = self.models.OutboxEvent.objects.get(id=eid)
                 fixture_expiry = timezone.now() - timedelta(seconds=1)
@@ -2056,7 +2117,7 @@ class Harness:
             remaining = self.args.drain_timeout - (time.monotonic() - recovery)
             assert remaining > 0, 'Broker health recovery exhausted the frozen drain window'
             for name in ('notification', 'analytics'):
-                self.ensure_consumer_pool(name, timeout=remaining)
+                self.ensure_consumer_pool(name, timeout=remaining, expected_fault_exit=True)
                 remaining = self.args.drain_timeout - (time.monotonic() - recovery)
                 assert remaining > 0, 'Broker consumer assignment exhausted the frozen drain window'
             self.drained(ids, timeout=remaining)
@@ -2246,6 +2307,7 @@ class Harness:
             Path(str(marker) + '.release').touch()
             error = self.wait_marker(Path(str(marker) + '.error'), child, timeout=30)
             child.wait(timeout=20)
+            self.observe_worker_close(child, expected_fault_exit=True)
         finally:
             self.compose('start', 'postgres')
         self.connections.close_all()
@@ -2299,9 +2361,12 @@ class Harness:
                     error = self.wait_marker(Path(str(marker) + '.error'), child, timeout=30)
                     after_offset = self.offsets()[name][partition]
                     assert after_offset == before_offset and after_offset <= int(offset), 'Offset advanced without durable outcome'
-                    if child.poll() is None:
+                    forced_sigkill = child.poll() is None
+                    if forced_sigkill:
                         child.kill()
                     child.wait(timeout=10)
+                    self.observe_worker_close(child, expected_fault_exit=True,
+                                              forced_sigkill=forced_sigkill)
                 finally:
                     self.compose('start', 'postgres')
                 self.connections.close_all()
@@ -2958,6 +3023,7 @@ class Harness:
             'owned_worker_cleanup_complete': owned_cleanup_complete,
             'owned_worker_cleanup_errors': getattr(self, 'cleanup_errors', []),
             'owned_worker_close_observations': list(getattr(self, 'worker_closures', {}).values()),
+            'owned_worker_exit_observations': list(getattr(self, 'worker_exit_observations', {}).values()),
             'run_id': self.args.run_id, 'unique_generated_events': len(self.events),
             'acceptance_tier': self.args.tier, 'production_ready': False,
             'full_workload_requested': self.args.tier == 'full',

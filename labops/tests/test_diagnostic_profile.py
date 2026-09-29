@@ -1869,8 +1869,14 @@ class PublisherObservationControlTests(SimpleTestCase):
                     raise OSError('PRIVATE hook sink')
                 return super().append(value)
         bindings = PublisherProfileControlTests.bindings(self) + [(OutboxEvent, 'from_db'), (OutboxEvent, 'save')]
+        if hasattr(publisher_events, '_claim_event_postgresql'):
+            bindings.append((publisher_events, '_claim_event_postgresql'))
         originals = [(target, name, inspect.getattr_static(target, name)) for target, name in bindings]
-        for fail_at in range(1, 11):
+        probe, observer = self.recorder()
+        install_publisher_hooks(probe)
+        hook_count = len(probe.hooks)
+        probe.restore()
+        for fail_at in range(1, hook_count + 1):
             with self.subTest(fail_at=fail_at):
                 profile, observer = self.recorder()
                 profile.hooks = BrokenNthHook(fail_at)
@@ -1901,9 +1907,40 @@ class PublisherObservationControlTests(SimpleTestCase):
         self.assertEqual(len(producer.client.calls), 1)
         self.assertNotIn('produce', vars(producer))
 
+    def test_unknown_native_callable_metadata_is_never_read_by_installation(self):
+        getter = Mock(side_effect=OSError('PRIVATE callable metadata'))
+        class UnknownHelper:
+            __class__ = property(lambda self: getter('class'))
+            __code__ = property(lambda self: getter('code'))
+            def __call__(self, *args, **kwargs):
+                return None
+        profile, observer = self.recorder()
+        with patch.object(publisher_events, '_claim_event_postgresql', UnknownHelper()):
+            install_publisher_hooks(profile)
+        getter.assert_not_called()
+        self.assertEqual(profile.errors[-1], {'stage': 'publisher_hook_admission', 'error_type': 'RuntimeError'})
+        self.assertTrue(profile.hooks_restored)
+
+    def test_combined_claim_sql_is_observed_only_inside_native_helper_scope(self):
+        profile, observer = self.recorder()
+        observer.database = SimpleNamespace(autocommit=False, in_atomic_block=True, vendor='postgresql')
+        observer.attempt = {'ordinal': 3, 'event_id': None, 'claim_path': 'unobserved', 'rows': []}
+        sql = 'WITH claimed AS (SELECT id FROM "labops_outboxevent") UPDATE "labops_outboxevent" AS event RETURNING id, status AS _claim_previous_status'
+        params, context, result = [object()], object(), object()
+        execute = Mock(return_value=result)
+        with observer._scope('publish_one_composite'):
+            self.assertIs(observer.execute(execute, sql, params, False, context), result)
+        self.assertEqual(observer.records, [])
+        with observer._scope('claim_atomic_materialization_composite'):
+            self.assertIs(observer.execute(execute, sql, params, False, context), result)
+        self.assertEqual(len(observer.records), 1)
+        self.assertEqual(observer.records[0]['stage'], 'claim_atomic_claim_execute')
+        self.assertEqual(execute.call_count, 2)
+        self.assertTrue(all(call.args[1] is params and call.args[3] is context for call in execute.call_args_list))
+
 
 from django.db import connection, transaction
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from labops.models import OutboxEvent
 from labops.tests.test_publisher_claim_reads import ClaimFixture
@@ -1968,7 +2005,8 @@ class PublisherObservationDatabaseTests(ClaimFixture, TransactionTestCase):
         with patch('confluent_kafka.Producer', DeliveryClientFixture):
             result, document, queries = self.observed(publisher_events.producer(), after_send=after_send)
         self.assertTrue(result)
-        self.assertEqual(sum(row['sql'].startswith('UPDATE') for row in queries), 4)
+        native = document['publisher_observation']['attempts'][0]['claim_path'] == 'native_postgresql'
+        self.assertEqual(sum(row['sql'].startswith('UPDATE') for row in queries), 3 if native else 4)
         self.assertEqual(document['publisher_observation']['boundaries']['publication_mark_execute'], 1)
         self.assertTrue(document['publisher_observation']['complete'])
         event.refresh_from_db()
@@ -2011,3 +2049,87 @@ class PublisherObservationDatabaseTests(ClaimFixture, TransactionTestCase):
         self.assertEqual(returned, [None])
         self.assertEqual(observer.records, [])
         self.assertNotIn('commit', vars(database))
+
+    @skipUnless(connection.vendor == 'postgresql', 'Native claim uses PostgreSQL')
+    def test_native_observation_preserves_typed_claim_sql_and_admission_call_counts(self):
+        baseline, observed = self.row(), None
+        admission_code, claim_code = publisher_events._plain_outbox_claim.__code__, publisher_events.claim_event.__code__
+        counts, claimed, statements = [], [], []
+        current_count, current_claims, current_sql = [0], [], []
+        def tracker(frame, event, result):
+            if event == 'call' and frame.f_code is admission_code:
+                current_count[0] += 1
+            if event == 'return' and frame.f_code is claim_code and result is not None:
+                current_claims.append(result)
+        def sql_capture(execute, sql, params, many, context):
+            current_sql.append(sql)
+            return execute(sql, params, many, context)
+        previous = sys.getprofile()
+        try:
+            with patch('confluent_kafka.Producer', DeliveryClientFixture):
+                producer = publisher_events.producer()
+                sys.setprofile(tracker)
+                with connection.execute_wrapper(sql_capture):
+                    self.assertTrue(publisher_events.publish_one(producer))
+                counts.append(current_count[0]); claimed.append(current_claims[0]); statements.append(list(current_sql))
+                sys.setprofile(previous)
+                observed = self.row()
+                current_count, current_claims, current_sql = [0], [], []
+                observed_producer = publisher_events.producer()
+                sys.setprofile(tracker)
+                with connection.execute_wrapper(sql_capture):
+                    result, document, queries = self.observed(observed_producer)
+                self.assertIs(sys.getprofile(), tracker)
+                counts.append(current_count[0]); claimed.append(current_claims[0]); statements.append(list(current_sql))
+        finally:
+            sys.setprofile(previous)
+        self.assertTrue(result)
+        self.assertEqual(counts, [1, 1])
+        self.assertEqual(statements[0], statements[1])
+        self.assertEqual(sum(sql.lstrip().startswith('WITH claimed AS (') for sql in statements[1]), 1)
+        for event, original in zip(claimed, (baseline, observed)):
+            self.assertIs(type(event), OutboxEvent)
+            self.assertEqual(event.get_deferred_fields(), set())
+            self.assertEqual(event.id, original.id)
+            self.assertEqual(event.payload_json, original.payload_json)
+            self.assertIs(type(event.id), uuid.UUID)
+            self.assertIs(type(event.lease_token), uuid.UUID)
+            self.assertEqual(event.status, 'PROCESSING')
+            self.assertEqual(event._state.db, 'default')
+            self.assertFalse(event._state.adding)
+            self.assertIsNotNone(event.locked_until.tzinfo)
+            self.assertNotIn('_claim_previous_status', vars(event))
+        self.assertEqual([type(getattr(claimed[0], field.attname)) for field in OutboxEvent._meta.concrete_fields],
+                         [type(getattr(claimed[1], field.attname)) for field in OutboxEvent._meta.concrete_fields])
+        observation = document['publisher_observation']
+        self.assertTrue(observation['complete'], observation['attempts'])
+        self.assertEqual(observation['claim_paths'], {'native_postgresql': 1})
+        self.assertEqual(observation['native_admission_preflight_calls'], 0)
+        self.assertIsNone(observation['native_admitted_at_install'])
+        self.assertEqual(observation['boundaries']['claim_atomic_claim_execute'], 1)
+        self.assertEqual(observation['boundaries']['claim_atomic_materialization_composite'], 1)
+        self.assertNotIn('claim_object_construct', observation['boundaries'])
+        self.assertNotIn('claim_lease_write_execute', observation['boundaries'])
+        self.assertEqual(observation['boundaries']['claim_physical_commit'], 1)
+        self.assertEqual(observation['boundaries']['delivery_ack'], 1)
+        self.assertTrue(observation['attempts'][0]['publication_autocommit_observed'])
+        self.assertEqual(Counter(row[0] for row in producer.client.calls),
+                         Counter(row[0] for row in observed_producer.client.calls))
+
+    @skipUnless(connection.vendor == 'postgresql', 'Native fallback strategy uses PostgreSQL')
+    def test_postgresql_orm_fallback_is_observed_without_changing_admission_or_claiming_missing_materialization(self):
+        self.row()
+        with override_settings(EVENT_LEASE_SECONDS=60.0), patch('confluent_kafka.Producer', DeliveryClientFixture):
+            self.assertFalse(publisher_events._plain_outbox_claim(OutboxEvent.objects))
+            result, document, queries = self.observed(publisher_events.producer())
+        self.assertTrue(result)
+        observation = document['publisher_observation']
+        self.assertFalse(observation['complete'])
+        self.assertEqual(observation['claim_paths'], {'orm': 1})
+        self.assertEqual(observation['claim_strategy_at_install'], 'postgresql_helper_only')
+        self.assertEqual(observation['native_admission_preflight_calls'], 0)
+        self.assertEqual(observation['boundaries']['claim_query_execute'], 1)
+        self.assertEqual(observation['boundaries']['claim_lease_write_execute'], 1)
+        self.assertNotIn('claim_atomic_claim_execute', observation['boundaries'])
+        self.assertIn('claim_object_construct', observation['attempts'][0]['missing_boundaries'])
+        self.assertFalse(any(row['sql'].lstrip().startswith('WITH claimed AS (') for row in queries))

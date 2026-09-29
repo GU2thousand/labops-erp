@@ -82,8 +82,11 @@ jobs:
       EVENTS_RUNNER_ARCH: ${{ github.event.inputs.runner_arch }}
       EVENTS_RUNNER_LABEL: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
       EVENTS_REPOSITORY_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
+      EVENTS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Admit joint writer and consumer request before Python setup
         run: |
           case "$PUBLISHER_OBSERVATION" in
@@ -117,7 +120,7 @@ jobs:
           RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
           echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
           python benchmarks/events/consumer_topology.py --preset "$CONSUMER_TOPOLOGY" --writer-topology "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/consumer-topology.json"
-          python benchmarks/events/runner_profile.py --choice "$EVENTS_RUNNER_ARCH" --event-name "$GITHUB_EVENT_NAME" --requested-label "$EVENTS_RUNNER_LABEL" --runner-arch "$RUNNER_ARCH" --runner-environment "$RUNNER_ENVIRONMENT" --runner-os "$RUNNER_OS" --repository-visibility "$EVENTS_REPOSITORY_VISIBILITY" --source-sha "$GITHUB_SHA" --output "infra/events/validation/evidence/$RUN_ID/runner-profile.json"
+          python benchmarks/events/runner_profile.py --choice "$EVENTS_RUNNER_ARCH" --event-name "$GITHUB_EVENT_NAME" --requested-label "$EVENTS_RUNNER_LABEL" --runner-arch "$RUNNER_ARCH" --runner-environment "$RUNNER_ENVIRONMENT" --runner-os "$RUNNER_OS" --repository-visibility "$EVENTS_REPOSITORY_VISIBILITY" --source-sha "$EVENTS_SOURCE_SHA" --output "infra/events/validation/evidence/$RUN_ID/runner-profile.json"
       - name: Install fixed clients
         run: pip install -r requirements.txt
       - name: Verify events monitoring rules and firing/recovery behavior

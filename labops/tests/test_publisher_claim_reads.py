@@ -45,12 +45,20 @@ class ClaimFixture:
     def claim(self, **kwargs):
         with CaptureQueriesContext(connection) as queries:
             record = events.claim_event(**kwargs)
-        selects = [row['sql'] for row in queries
-            if row['sql'].lstrip().startswith('SELECT') and 'FROM "labops_outboxevent"' in row['sql']]
-        self.assertEqual(len(selects), 1)
-        return record, selects[0]
+        claims = [row['sql'] for row in queries
+            if row['sql'].lstrip().startswith(('SELECT', 'WITH'))
+            and 'FROM "labops_outboxevent"' in row['sql']]
+        self.assertEqual(len(claims), 1)
+        return record, claims[0]
 
     def assert_filter_only(self, sql):
+        if sql.lstrip().startswith('WITH'):
+            self.assertNotIn('EXISTS', sql.split('FROM "labops_outboxevent"', 1)[0])
+            self.assertNotIn('blocked', sql)
+            self.assertEqual(sql.count('NOT EXISTS ('), 1)
+            self.assertIn('ORDER BY candidate.created_at, candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED', sql)
+            self.assertIn('RETURNING event."id"', sql)
+            return
         self.assertNotIn('EXISTS', sql.split(' FROM "labops_outboxevent"', 1)[0])
         self.assertNotIn(' AS "blocked"', sql)
         self.assertEqual(sql.count('EXISTS('), 1)
@@ -76,7 +84,10 @@ class PublisherClaimReadTests(ClaimFixture, TestCase):
         record = self.row(attempts=2, last_error='Prior failure')
         before = self.fields(record)
         now = timezone.now()
-        with patch.object(events.timezone, 'now', return_value=now):
+        # Keep the original ORM projection proof explicit. Generic ordering,
+        # visibility and lock-release tests below exercise the default path.
+        with patch.object(events, '_plain_outbox_claim', return_value=False), \
+                patch.object(events.timezone, 'now', return_value=now):
             claimed, sql = self.claim()
         self.assert_filter_only(sql)
         self.assertIsInstance(claimed, OutboxEvent)
@@ -177,7 +188,8 @@ class PublisherClaimReadTests(ClaimFixture, TestCase):
     def test_shard_selection_keeps_payload_and_existing_publisher_shard_annotation(self):
         zero = self.row(aggregate_id=UUID('00000000-0000-0000-0000-000000000001'))
         one = self.row(aggregate_id=UUID('00000001-0000-0000-0000-000000000001'))
-        first, sql = self.claim(shard_index=1, shard_count=2)
+        with patch.object(events, '_plain_outbox_claim', return_value=False):
+            first, sql = self.claim(shard_index=1, shard_count=2)
         self.assertEqual(first.pk, one.pk)
         self.assertEqual(first.payload_json, one.payload_json)
         self.assertFalse(hasattr(first, 'blocked'))

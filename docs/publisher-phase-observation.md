@@ -18,11 +18,20 @@ configuration. Source revision and observer source hashes are persisted before
 execution. No prior failed artifact is overwritten.
 
 The observer records bounded synthetic event UUIDs and absolute epoch,
-monotonic and own-thread CPU clocks around existing calls. It separates claim
-SELECT execution, model construction, lease write, physical transaction commit,
-the original delivery callback, and final publication UPDATE. Query execution
-does not isolate server execution from network or driver work; fetch and
-unobserved Python residuals retain their explicit limits. Parent IDs preserve
+monotonic and own-thread CPU clocks around existing calls. For the ordinary ORM
+path it separates claim SELECT execution, model construction, lease write,
+physical transaction commit, the original delivery callback, and final
+publication UPDATE. The single-record PostgreSQL CTE path instead records
+combined atomic claim driver execution inside a raw-materialization composite;
+that composite also includes SQL construction, atomic entry/exit and commit.
+It does not infer separate SELECT, lease-write or model-conversion timings.
+On PostgreSQL with the validated native helper present, the observer leaves
+model lifecycle methods untouched so it cannot force the production admission
+to fall back. No additional production admission call is made at bootstrap.
+Only an actual helper invocation marks a native attempt. An ORM fallback on
+that strategy retains its missing model boundaries and remains INCOMPLETE.
+Query execution does not isolate server execution from network or driver work;
+fetch and unobserved Python residuals retain their explicit limits. Parent IDs preserve
 nested intervals: inclusive stages must not be summed as independent costs.
 The observer samples inside `publish_one`; its outer ownership assertion,
 timeout-budget setup/restoration, idle wait and producer shutdown are outside
