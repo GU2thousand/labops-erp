@@ -10,6 +10,7 @@ the admission policy, or swaps a real Producer's client after admission.
 """
 from contextlib import contextmanager
 from datetime import timedelta
+import inspect
 import json
 import sys
 from types import CodeType, FunctionType
@@ -749,6 +750,118 @@ class NativeObservationPostgreSQLTests(ClaimFixture, TransactionTestCase):
             self.assertIs(policy.plain(broker, owner, command._budget_aliases(), stop), True)
             self.assertIsNone(events.claim_event(), 'Restored application still runs a real empty native CTE')
             self.assertIsNotNone(worker_metrics.PublisherBatchBudget._session(database))
+
+    def test_standalone_execute_cleanup_controls_restore_before_native_recheck(self):
+        for stage in ('lease_check_execute', 'publication_writeback_execute'):
+            for edge in ('call', 'before_pop', 'after_pop', 'return'):
+                with self.subTest(stage=stage, edge=edge):
+                    self.standalone_cleanup(stage, edge,
+                        OperationDeadlineExceeded('PRIVATE standalone cleanup deadline'))
+
+    def test_standalone_execute_cleanup_preserves_ordinary_primary(self):
+        for edge in ('call', 'before_pop', 'after_pop', 'return'):
+            with self.subTest(edge=edge):
+                primary = RuntimeError('PRIVATE ordinary scope-fixture primary')
+                self.standalone_cleanup('publication_writeback_execute', edge,
+                    OperationDeadlineExceeded('PRIVATE secondary cleanup deadline'), primary)
+
+    def test_standalone_execute_cleanup_ordinary_fault_is_partial_and_restored(self):
+        self.standalone_cleanup('lease_check_execute', 'before_pop',
+            RuntimeError('PRIVATE ordinary cleanup fault'))
+
+    def standalone_cleanup(self, stage, edge, cleanup, business=None):
+        self.row()
+        with self.native_owner() as state:
+            database, broker, policy, stop, owner, owned = state
+            token, primary, injected = owned.begin_attempt(), None, []
+            self.admission(owned, policy, broker, owner, stop)
+            claimed = self.claim(owned)
+            self.assertIsNotNone(claimed)
+            self.assert_restored(database, owned)
+            source, first_line = inspect.getsourcelines(observation.NativePublisherObservation.leave_execute)
+            before_pop = next(first_line + index for index, line in enumerate(source)
+                if line.strip() == 'list.pop(wrappers)')
+            after_pop = next(first_line + index for index, line in enumerate(source)
+                if line.strip() == 'self.hook_restores += 1')
+            target_line = before_pop if edge == 'before_pop' else after_pop
+            targets = {'cleanup': (observation.NativePublisherObservation.leave_execute,
+                lambda frame: frame.f_locals.get('self') is owned)}
+            def inject(label, frame, kind, value):
+                matched = kind == edge if edge in ('call', 'return') else (
+                    kind == 'line' and frame.f_lineno == target_line)
+                if matched and not injected:
+                    self.assertEqual(len(database.execute_wrappers), 1 if edge in ('call', 'before_pop') else 0)
+                    injected.append(cleanup)
+                    raise cleanup
+            try:
+                try:
+                    # This scope fixture follows an actual native claim. It
+                    # executes no query or broker operation of its own.
+                    with CaptureQueriesContext(database) as queries, trace_originals(targets, [], inject):
+                        with owned.execute_scope(stage) as hooks:
+                            hooks.install()
+                            if business is not None:
+                                raise business
+                except BaseException as caught:
+                    primary = caught
+                self.assertEqual(injected, [cleanup])
+                self.assertIs(primary, business if business is not None else (
+                    None if isinstance(cleanup, Exception) else cleanup))
+                self.assertEqual(len(queries), 0, 'Restoration grants no SQL budget')
+                self.assert_restored(database, owned)
+                counts = (owned.hook_installs, owned.hook_restores, owned.hook_failures,
+                    owned.temporary_depth)
+                owned.leave_execute(hooks.token, primary)
+                self.assertEqual(counts, (owned.hook_installs, owned.hook_restores,
+                    owned.hook_failures, owned.temporary_depth), 'Repeated cleanup is inert')
+                self.assertIs(policy.plain(broker, owner, command._budget_aliases(), stop), True)
+                self.assertIsNotNone(worker_metrics.PublisherBatchBudget._session(database))
+                owner.assert_owned()
+            finally:
+                owned.end_attempt(token, primary)
+            next_token = owned.begin_attempt()
+            self.admission(owned, policy, broker, owner, stop)
+            next_event = self.claim(owned)
+            self.assertIsNone(next_event, 'Same session still executes a real empty native CTE')
+            self.assertEqual(next_token['native_claim_results'], [True])
+            self.assert_restored(database, owned)
+            owned.publish_result(False)
+            owned.end_attempt(next_token)
+            document = owned.close()
+            self.assertFalse(document['complete'])
+            self.assertNotIn('PRIVATE', json.dumps(document))
+
+    def test_standalone_execute_cleanup_preserves_foreign_binding_and_repeated_counts(self):
+        self.row()
+        with self.native_owner() as state:
+            database, broker, policy, stop, owner, owned = state
+            token = owned.begin_attempt()
+            self.admission(owned, policy, broker, owner, stop)
+            self.claim(owned)
+            self.assert_restored(database, owned)
+            foreign = Mock(side_effect=AssertionError('Foreign wrapper must never be called'))
+            try:
+                with owned.execute_scope('lease_check_execute') as hooks:
+                    hooks.install()
+                    database.execute_wrappers[0] = foreign
+                self.assertEqual(database.execute_wrappers, [foreign])
+                foreign.assert_not_called()
+                self.assertEqual(owned.temporary_depth, 0)
+                self.assertEqual(owned.hook_failures, 1)
+                counts = (owned.hook_installs, owned.hook_restores, owned.hook_failures)
+                owned.leave_execute(hooks.token)
+                self.assertEqual(counts, (owned.hook_installs, owned.hook_restores, owned.hook_failures))
+                self.assertEqual(database.execute_wrappers, [foreign])
+                foreign.assert_not_called()
+                owned.end_attempt(token)
+                self.assertFalse(token['temporary_hooks_restored'])
+            finally:
+                if len(database.execute_wrappers) == 1 and database.execute_wrappers[0] is foreign:
+                    list.pop(database.execute_wrappers)
+                foreign.assert_not_called()
+            self.assertIs(policy.plain(broker, owner, command._budget_aliases(), stop), True)
+            self.assertIsNone(events.claim_event())
+            self.assertFalse(owned.close()['complete'])
 
     def test_original_business_control_with_unknown_metaclass_never_calls_name_or_mro_getter(self):
         traps = []

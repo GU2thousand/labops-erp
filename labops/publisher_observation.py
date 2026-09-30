@@ -38,7 +38,22 @@ class _ExecuteScope:
     def install(self):
         self.observer.enter_execute(self.stage, self)
     def __exit__(self, kind, error, traceback):
-        self.observer.leave_execute(self.token, error)
+        try:
+            self.observer.leave_execute(self.token, error)
+        except BaseException as cleanup:
+            # Covers a one-shot control at leave_execute's call/return edge,
+            # outside its body. The token makes a second completed cleanup
+            # inert; this is one bounded recovery, not an asynchronous shield.
+            primary = error if error is not None else cleanup
+            try:
+                self.observer.leave_execute(self.token, primary)
+            except BaseException as secondary:
+                self.observer.error('execute_scope_restore', secondary, primary)
+            self.observer.error('execute_scope_restore', cleanup, primary)
+            if error is None:
+                mro = _TypeMROGet(type(cleanup), type(type(cleanup)))
+                if any(base is _Deadline for base in mro) or not any(base is Exception for base in mro):
+                    raise
         return False
 
 
@@ -254,7 +269,8 @@ class NativePublisherObservation:
                 category = 'application_other_execute'
             with self.measure(category):
                 return original(sql, params, many, context)
-        token = (database.execute_wrappers, execute)
+        token = [database.execute_wrappers, execute, self.temporary_depth,
+            False, False, self.hook_restores]
         if type(target) is _ExecuteScope:
             target.token = token
         elif type(target) is list:
@@ -269,20 +285,47 @@ class NativePublisherObservation:
         return token
 
     def leave_execute(self, token, primary=None):
-        if token is None:
+        if token is None or token[3]:
             return
+        wrappers, execute, depth, _, _, restores_before = token
+        errors, changed = [], False
         try:
-            wrappers, execute = token
             if len(wrappers) == 1 and wrappers[0] is execute:
+                token[4] = True
                 list.pop(wrappers)
                 self.hook_restores += 1
             else:
-                self.hook_failures += 1
-                self.error('execute_restore', RuntimeError('NativeObservationExecuteChanged'), primary)
+                changed = True
+                errors.append(RuntimeError('NativeObservationExecuteChanged'))
         except BaseException as error:
-            self.error('execute_restore', error, primary)
-        finally:
-            self.temporary_depth -= 1
+            errors.append(error)
+        # A one-shot control can arrive before the native pop or immediately
+        # after it, before bookkeeping. Try one final removal only while this
+        # exact authored wrapper is still the sole binding. Never call or
+        # remove a foreign replacement. Reconcile a completed native removal
+        # once, including the interrupted post-pop accounting path.
+        try:
+            if type(wrappers) is list and len(wrappers) == 1 and wrappers[0] is execute:
+                token[4] = True
+                list.pop(wrappers)
+            if wrappers:
+                changed = True
+            elif token[4] and self.hook_restores == restores_before:
+                self.hook_restores += 1
+        except BaseException as error:
+            changed = True
+            errors.append(error)
+        self.temporary_depth = depth
+        token[3] = True
+        if changed:
+            self.hook_failures += 1
+        for error in errors:
+            self.error('execute_restore', error, primary if primary is not None else error)
+        if primary is None:
+            for error in errors:
+                mro = _TypeMROGet(type(error), type(type(error)))
+                if any(kind is _Deadline for kind in mro) or not any(kind is Exception for kind in mro):
+                    raise error
 
     def enter_claim(self, target=None):
         if not self.eligible():
@@ -367,7 +410,7 @@ class NativePublisherObservation:
         # absence; a foreign replacement is never deleted or called.
         if execute is not None:
             try:
-                wrappers, wrapper = execute
+                wrappers, wrapper = execute[:2]
                 if type(wrappers) is list and len(wrappers) == 1 and wrappers[0] is wrapper:
                     list.pop(wrappers)
                     self.hook_restores += 1

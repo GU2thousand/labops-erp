@@ -21,4 +21,20 @@ Two hard measurement limits remain:
 1. Native candidate selection and lease update use one existing atomic CTE execute. Their server-side causal shares are **UNKNOWN** and cannot be separated by these client clocks.
 2. The clock around `plain` measures inclusive elapsed time and inclusive own-thread call CPU, including callees. Exclusive function-own CPU is **UNAVAILABLE** on the protected six-writer/dual-consumer topology because profilers remain disabled.
 
+Standalone lease-check/writeback execute scopes also record restoration ownership before installation. After a single cleanup control at a function call/return or native list-removal boundary, one bounded recovery removes only the still-owned wrapper and accounts for removal once. Existing business errors and the original deadline/control retain priority. Foreign replacements remain untouched and incomplete; repeated completed cleanup is inert. This is a tested one-shot recovery bound, not immunity to arbitrary repeated asynchronous interruption.
+
 The prospective tests cover real PostgreSQL original-policy admission and claim/commit/restoration, callback invocation and controls, source clock denominators, zero unknown-hook dispatch and closed CLI declarations. Prepared test source is not execution evidence. A future chosen run must preserve raw observation, journals, manifests, checksums, source hashes, exceptions and scoped cleanup evidence even when incomplete. It cannot replace the separate formal capacity gate.
+
+## Offline profile analysis
+
+Analyze an exported native profile using only Python's standard library:
+
+```sh
+python benchmarks/events/analyze_native_observation.py \
+  --profile /path/to/logs/publisher-profile-001.json \
+  --output /path/to/new-native-analysis.json
+```
+
+The command leaves the input unchanged and refuses to overwrite an existing output. It records input SHA256 and size, raw attempt/record/empty/overflow/callback/hook counters and separate inclusive phase distributions. It independently checks literal admission/return values, all expected boundaries, successful native callback markers, restored hooks and record identities rather than trusting a claimed `complete` flag. Exit 0 means the profile data passed these checks; exit 2 writes a partial report with missing or invalid data retained. Invalid JSON, duplicate JSON keys and unsupported shapes fail before an output is written.
+
+The report checks one profile only. Source/run identity, the original event set, six origin journals, physical PostgreSQL effects, resource pins, normal worker cleanup and business/generation gates still need their own original evidence and review. `PROFILE_DATA_COMPLETE` is not completion of L1 or a hosted/capacity acceptance result. No application is imported and no SQL, network, workload, polling or dispatch is performed. The `delivery_ack` span measures a marker after the original callback; its duration is not broker acknowledgement latency.
