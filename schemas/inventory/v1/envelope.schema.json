@@ -1,0 +1,316 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.labops.example/inventory/v1/envelope.schema.json",
+  "title": "Immutable inventory movement v1 envelope",
+  "description": "Whole immutable envelope SHA256; max serialized UTF-8 size 262144 bytes is enforced at producer and consumer ingress. Inventory movement version is not a global batch/warehouse sequence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "aggregate_type",
+    "aggregate_id",
+    "aggregate_version",
+    "schema_version",
+    "occurred_at",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "event_type": {
+      "enum": [
+        "inventory.opening.posted",
+        "inventory.receipt.posted",
+        "inventory.issue.posted",
+        "inventory.transfer.posted",
+        "inventory.adjustment.posted",
+        "inventory.reversal.posted"
+      ]
+    },
+    "aggregate_type": {
+      "const": "stockmovement"
+    },
+    "aggregate_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "aggregate_version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "occurred_at": {
+      "$ref": "#/$defs/utc"
+    },
+    "trace_context": {
+      "$ref": "#/$defs/trace"
+    },
+    "payload": {
+      "$ref": "#/$defs/payload"
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$(?![\\s\\S])",
+      "minLength": 36,
+      "maxLength": 36
+    },
+    "utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$(?![\\s\\S])",
+      "maxLength": 32
+    },
+    "trace": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[^\\u0000]+$(?![\\s\\S])"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 2048,
+        "pattern": "^[^\\u0000]*$(?![\\s\\S])"
+      }
+    },
+    "line": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "batch_id",
+        "warehouse_id",
+        "delta_qty",
+        "unit_cost"
+      ],
+      "properties": {
+        "batch_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "warehouse_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "delta_qty": {
+          "allOf": [
+            {
+              "type": "string",
+              "pattern": "^-?(?:0|[1-9][0-9]{0,11})(?:\\.[0-9]{1,6})?$(?![\\s\\S])",
+              "maxLength": 20
+            },
+            {
+              "not": {
+                "pattern": "^-?0(?:\\.0{1,6})?$(?![\\s\\S])"
+              }
+            }
+          ]
+        },
+        "unit_cost": {
+          "allOf": [
+            {
+              "type": "string",
+              "pattern": "^-?(?:0|[1-9][0-9]{0,11})(?:\\.[0-9]{1,6})?$(?![\\s\\S])",
+              "maxLength": 20
+            },
+            {
+              "anyOf": [
+                {
+                  "pattern": "^[^-]"
+                },
+                {
+                  "pattern": "^-0(?:\\.0{1,6})?$(?![\\s\\S])"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "movement_id",
+        "movement_type",
+        "title",
+        "body",
+        "recipients",
+        "lines"
+      ],
+      "properties": {
+        "movement_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "movement_type": {
+          "enum": [
+            "OPENING",
+            "RECEIPT",
+            "ISSUE",
+            "TRANSFER",
+            "ADJUSTMENT",
+            "REVERSAL"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[^\\u0000]+$(?![\\s\\S])"
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^[^\\u0000]*$(?![\\s\\S])"
+        },
+        "recipients": {
+          "type": "array",
+          "maxItems": 1000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/uuid"
+          }
+        },
+        "lines": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1000,
+          "items": {
+            "$ref": "#/$defs/line"
+          }
+        },
+        "_trace_context": {
+          "$ref": "#/$defs/trace"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "inventory.opening.posted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "movement_type": {
+                "const": "OPENING"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "inventory.receipt.posted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "movement_type": {
+                "const": "RECEIPT"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "inventory.issue.posted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "movement_type": {
+                "const": "ISSUE"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "inventory.transfer.posted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "movement_type": {
+                "const": "TRANSFER"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "inventory.adjustment.posted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "movement_type": {
+                "const": "ADJUSTMENT"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "inventory.reversal.posted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "movement_type": {
+                "const": "REVERSAL"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "topics": [
+    {
+      "name_env": "KAFKA_TOPIC",
+      "default_name": "labops.inventory.v1",
+      "partitions": 3,
+      "replication_factor": 3,
+      "config": {
+        "cleanup.policy": "delete",
+        "retention.ms": "2592000000",
+        "retention.bytes": "-1",
+        "max.message.bytes": "1048576",
+        "write.caching": "false"
+      }
+    },
+    {
+      "name_env": "KAFKA_DLQ_TOPIC",
+      "default_name": "labops.inventory.dlq.v1",
+      "partitions": 3,
+      "replication_factor": 3,
+      "config": {
+        "cleanup.policy": "delete",
+        "retention.ms": "7776000000",
+        "retention.bytes": "-1",
+        "max.message.bytes": "2097152",
+        "write.caching": "false"
+      }
+    }
+  ],
+  "internal_topics": [
+    {"name": "__consumer_offsets", "replication_factor": 3, "verify_only": true}
+  ]
+}

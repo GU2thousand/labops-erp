@@ -1,0 +1,194 @@
+name: Kafka RF3 acceptance
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      runner_arch:
+        description: 'Standard hosted runner architecture (workload and acceptance gates stay fixed)'
+        type: choice
+        options: [x64, arm64]
+        default: x64
+      tier:
+        description: 'full freezes the plan targets; smoke permits smaller integration inputs'
+        type: choice
+        options: [full, smoke]
+        default: full
+      events:
+        description: 'Unique inventory events (staging target: 90000)'
+        type: number
+        default: 90000
+      rate:
+        description: 'Target inventory events/sec (staging target: 50)'
+        type: number
+        default: 50
+      duration:
+        description: 'Minimum workload seconds (staging target: 1800)'
+        type: number
+        default: 1800
+      fault_repetitions:
+        description: 'Repetitions per crash boundary (staging target: 20)'
+        type: number
+        default: 20
+      runtime_diagnostics:
+        description: 'Opt in to timed CPU/SQL/PostgreSQL/container measurements (diagnostic and capacity probes)'
+        type: boolean
+        default: false
+      diagnostic_profile:
+        description: 'Own-thread CPU profiling only: an enabled run is never acceptance-admissible'
+        type: boolean
+        default: false
+      publisher_observation:
+        description: 'One finite steady publisher-phase diagnostic; never capacity acceptance or a fault matrix'
+        type: boolean
+        default: false
+      diagnostic_profile_engine:
+        description: 'Explicit diagnostic engine; python-profile-owned requires diagnostic_profile=true'
+        type: choice
+        options: [cprofile, python-profile-owned]
+        default: cprofile
+      writer_topology:
+        description: 'Explicit writer profile; writers-6 requires function profiling OFF'
+        type: choice
+        options: [writers-4, writers-6]
+        default: writers-4
+      consumer_topology:
+        description: 'Predeclared consumer pool; notification-dual requires function profiling OFF'
+        type: choice
+        options: [single, notification-dual]
+        default: single
+permissions:
+  contents: read
+concurrency:
+  group: events-rf3-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  same-host-rf3:
+    runs-on: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 240
+    env:
+      EVENTS_COUNT: ${{ github.event.inputs.events || '60' }}
+      EVENTS_RATE: ${{ github.event.inputs.rate || '10' }}
+      EVENTS_DURATION: ${{ github.event.inputs.duration || '0' }}
+      FAULT_REPETITIONS: ${{ github.event.inputs.fault_repetitions || '1' }}
+      EVENTS_TIER: ${{ github.event.inputs.tier || 'smoke' }}
+      RUNTIME_DIAGNOSTICS: ${{ github.event.inputs.runtime_diagnostics || 'false' }}
+      DIAGNOSTIC_PROFILE: ${{ github.event.inputs.diagnostic_profile || 'false' }}
+      PUBLISHER_OBSERVATION: ${{ github.event.inputs.publisher_observation || 'false' }}
+      DIAGNOSTIC_PROFILE_ENGINE: ${{ github.event.inputs.diagnostic_profile_engine || 'cprofile' }}
+      CONSUMER_TOPOLOGY: ${{ github.event.inputs.consumer_topology || 'single' }}
+      WRITER_TOPOLOGY: ${{ github.event.inputs.writer_topology || 'writers-4' }}
+      EVENTS_RUNNER_ARCH: ${{ github.event.inputs.runner_arch }}
+      EVENTS_RUNNER_LABEL: ${{ github.event.inputs.runner_arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+      EVENTS_REPOSITORY_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
+      EVENTS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Admit joint writer and consumer request before Python setup
+        run: |
+          case "$PUBLISHER_OBSERVATION" in
+            true) [ "$DIAGNOSTIC_PROFILE" = false ] && [ "$EVENTS_TIER" = smoke ] || { echo 'Publisher observation requires smoke and function profiling OFF'; exit 2; } ;;
+            false) ;;
+            *) echo 'Invalid publisher observation boolean'; exit 2 ;;
+          esac
+          if [ "$PUBLISHER_OBSERVATION" = true ]; then
+            python3 benchmarks/events/publisher_probe.py --admit-only --run-id "ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --evidence-dir "infra/events/validation/evidence/ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY"
+          fi
+          case "$DIAGNOSTIC_PROFILE_ENGINE" in
+            cprofile) ;;
+            python-profile-owned) [ "$DIAGNOSTIC_PROFILE" = true ] || { echo 'Explicit Python engine requires profiling enabled'; exit 2; } ;;
+            *) echo 'Invalid diagnostic profile engine'; exit 2 ;;
+          esac
+          RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
+          python3 benchmarks/events/consumer_topology.py --preset "$CONSUMER_TOPOLOGY" --writer-topology "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/consumer-topology.json"
+          python3 benchmarks/events/writer_topology.py --preset "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/writer-topology.json"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Admit and freeze standard runner before services
+        id: runner_profile
+        run: |
+          case "$DIAGNOSTIC_PROFILE_ENGINE" in
+            cprofile) ;;
+            python-profile-owned) [ "$DIAGNOSTIC_PROFILE" = true ] || { echo 'Explicit Python engine requires profiling enabled'; exit 2; } ;;
+            *) echo 'Invalid diagnostic profile engine'; exit 2 ;;
+          esac
+          RUN_ID="ci${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
+          echo "EVENTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          python benchmarks/events/consumer_topology.py --preset "$CONSUMER_TOPOLOGY" --writer-topology "$WRITER_TOPOLOGY" --diagnostic-profile "$DIAGNOSTIC_PROFILE" --run-id "$RUN_ID" --output "infra/events/validation/evidence/$RUN_ID/consumer-topology.json"
+          python benchmarks/events/runner_profile.py --choice "$EVENTS_RUNNER_ARCH" --event-name "$GITHUB_EVENT_NAME" --requested-label "$EVENTS_RUNNER_LABEL" --runner-arch "$RUNNER_ARCH" --runner-environment "$RUNNER_ENVIRONMENT" --runner-os "$RUNNER_OS" --repository-visibility "$EVENTS_REPOSITORY_VISIBILITY" --source-sha "$EVENTS_SOURCE_SHA" --output "infra/events/validation/evidence/$RUN_ID/runner-profile.json"
+      - name: Install fixed clients
+        run: pip install -r requirements.txt
+      - name: Verify events monitoring rules and firing/recovery behavior
+        run: |
+          docker run --rm --entrypoint /bin/promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" prom/prometheus:v3.3.0 check rules /etc/prometheus/alerts.yml
+          docker run --rm --entrypoint /bin/promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" -w /etc/prometheus prom/prometheus:v3.3.0 test rules /etc/prometheus/events-alerts.test.yml
+      - name: Create isolated secrets and configuration
+        run: |
+          python infra/events/validation/prepare.py --run-id "$EVENTS_RUN_ID"
+          mkdir -p "infra/events/validation/evidence/$EVENTS_RUN_ID/logs"
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml config --quiet
+      - name: Start three brokers and PostgreSQL
+        run: |
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml up -d
+          python infra/events/validation/wait_ready.py --env-file infra/events/validation/generated/client.env --timeout 180
+      - name: Create and verify identities, ACLs and RF3 topics
+        run: |
+          python infra/events/admin.py users --env-file infra/events/validation/generated/client.env --identities infra/events/validation/generated/secrets.json --report "infra/events/validation/evidence/$EVENTS_RUN_ID/users.json"
+          python infra/events/admin.py topics --env-file infra/events/validation/generated/client.env --report "infra/events/validation/evidence/$EVENTS_RUN_ID/topics-before.json"
+          python infra/events/admin.py acls --env-file infra/events/validation/generated/client.env --identities infra/events/validation/generated/secrets.json --report "infra/events/validation/evidence/$EVENTS_RUN_ID/acls.json"
+          docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics up -d kafka-exporter prometheus
+      - name: Real business effects and fault matrix
+        run: |
+          set -a
+          . infra/events/validation/generated/client.env
+          set +a
+          if [ "$EVENTS_TIER" = full ]; then
+            SINGLE_BROKER_SECONDS=300
+            ALL_BROKER_SECONDS=600
+            CONSUMER_SECONDS=600
+            FAULT_EVENTS=30000
+          else
+            SINGLE_BROKER_SECONDS=5
+            ALL_BROKER_SECONDS=5
+            CONSUMER_SECONDS=5
+            FAULT_EVENTS=20
+          fi
+          DIAGNOSTIC_ARGS=()
+          case "$RUNTIME_DIAGNOSTICS" in
+            true) DIAGNOSTIC_ARGS+=(--runtime-diagnostics) ;;
+            false) ;;
+            *) echo 'Invalid runtime diagnostics boolean'; exit 2 ;;
+          esac
+          case "$DIAGNOSTIC_PROFILE" in
+            true) DIAGNOSTIC_ARGS+=(--diagnostic-profile --diagnostic-profile-engine "$DIAGNOSTIC_PROFILE_ENGINE") ;;
+            false) ;;
+            *) echo 'Invalid diagnostic profile boolean'; exit 2 ;;
+          esac
+          if [ "$PUBLISHER_OBSERVATION" = true ]; then
+            python benchmarks/events/publisher_probe.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+          else
+            python benchmarks/events/acceptance.py --writer-topology "$WRITER_TOPOLOGY" --consumer-topology "$CONSUMER_TOPOLOGY" --tier "$EVENTS_TIER" --run-id "$EVENTS_RUN_ID" --events "$EVENTS_COUNT" --rate "$EVENTS_RATE" --duration "$EVENTS_DURATION" --fault-repetitions "$FAULT_REPETITIONS" --single-broker-outage-seconds "$SINGLE_BROKER_SECONDS" --all-broker-outage-seconds "$ALL_BROKER_SECONDS" --consumer-outage-seconds "$CONSUMER_SECONDS" --fault-events "$FAULT_EVENTS" --duplicate-events 10000 --drain-timeout-seconds 900 --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID" "${DIAGNOSTIC_ARGS[@]}"
+          fi
+      - name: Verify actual offsets topic replication and topic configuration
+        if: ${{ always() && steps.runner_profile.outcome == 'success' }}
+        run: |
+          python infra/events/admin.py topics --env-file infra/events/validation/generated/client.env --verify-only --verify-offsets --report "infra/events/validation/evidence/$EVENTS_RUN_ID/topics-after.json"
+      - name: Collect bounded evidence without secrets
+        if: ${{ always() && steps.runner_profile.outcome == 'success' }}
+        run: |
+          python infra/events/validation/collect.py --env-file infra/events/validation/generated/client.env --run-id "$EVENTS_RUN_ID" --evidence-dir "infra/events/validation/evidence/$EVENTS_RUN_ID"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kafka-rf3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: infra/events/validation/evidence/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Remove only this disposable project after evidence upload
+        if: ${{ always() && steps.runner_profile.outcome == 'success' }}
+        run: docker compose --env-file infra/events/validation/generated/client.env -f infra/events/validation/compose.yaml --profile metrics down --volumes

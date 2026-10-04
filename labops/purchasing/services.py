@@ -1,6 +1,11 @@
 from collections import defaultdict
+from django.db.models import Sum
 from labops.common import *
 from labops.models import *
+
+def _related_obj(model,id,*relations):
+    try: return model.objects.select_related(*relations).get(pk=id)
+    except (model.DoesNotExist,ValueError,ValidationError): fail('NOT_FOUND','Record not found or no longer available',404)
 
 def request_scope(user,request,write=False):
     r=roles(user)
@@ -12,7 +17,10 @@ def request_scope(user,request,write=False):
 def request_available(line,exclude=None):
     return line.qty-sum((x.qty for x in line.order_lines.exclude(order__status='CANCELLED').exclude(order_id=exclude)),Decimal(0))
 def received_qty(line):
-    return sum((x.qty for x in line.receipt_lines.filter(receipt__status='POSTED')),Decimal(0))
+    total=line.receipt_lines.filter(receipt__status='POSTED').aggregate(
+        total=Sum('qty',output_field=ReceiptLine._meta.get_field('qty')))['total']
+    # Fixed6Field converts the summed stored micro-units to an exact Decimal.
+    return Decimal(0) if total is None else total
 def order_state(order):
     if order.status in ['CONFIRMED','CLOSED']:
         lines=list(order.lines.all())
@@ -121,14 +129,14 @@ def order_action(user,id,action,data,rid):
 @atomic_command
 def create_receipt(user,data,rid):
     allow(user,'ADMIN','STORE')
-    po=obj(PurchaseOrder,data.get('order_id'))
+    po=_related_obj(PurchaseOrder,data.get('order_id'),'supplier')
     require(po.status in ['CONFIRMED','CLOSED'],'ORDER_NOT_CONFIRMED','Receipts require a confirmed purchase order')
     require(po.supplier.is_active,'INACTIVE_SUPPLIER','Supplier is inactive')
     lines=data.get('lines',[]); require(isinstance(lines,list) and 0<len(lines)<=100,'EMPTY_LINES','Add 1 to 100 receipt lines')
     receipt=new(Receipt,user,rid,receipt_no=number('RCV'),order=po)
     totals=defaultdict(Decimal)
     for n,x in enumerate(lines,1):
-        line=obj(OrderLine,x.get('order_line_id')); require(line.order_id==po.id,'WRONG_ORDER','The receipt line does not belong to the selected order')
+        line=_related_obj(OrderLine,x.get('order_line_id'),'request_line__item'); require(line.order_id==po.id,'WRONG_ORDER','The receipt line does not belong to the selected order')
         item=line.request_line.item; require(item.is_active,'INACTIVE_ITEM','Item is inactive')
         warehouse=obj(Warehouse,x.get('warehouse_id')); require(warehouse.is_active,'INACTIVE_WAREHOUSE','Warehouse is inactive')
         q=qty(x.get('qty')); totals[line.id]+=q

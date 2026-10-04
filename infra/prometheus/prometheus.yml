@@ -19,3 +19,19 @@ scrape_configs:
   - job_name: kafka-exporter
     static_configs:
       - targets: ['kafka-exporter:9308']
+
+  - job_name: labops-events-workers
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /tmp/labops-metrics-token
+    static_configs:
+      - targets: ['publisher:9100']
+        labels: {worker: publisher}
+      - targets: ['notification-consumer:9100']
+        labels: {worker: notification}
+      - targets: ['analytics-consumer:9100']
+        labels: {worker: analytics}
+      - targets: ['retry-worker:9100']
+        labels: {worker: retry}
+      - targets: ['dlq-publisher:9100']
+        labels: {worker: dlq}

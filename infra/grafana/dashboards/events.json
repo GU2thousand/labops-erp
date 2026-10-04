@@ -1,0 +1,355 @@
+{
+  "uid": "labops-events",
+  "title": "LabOps inventory events",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": [
+    "labops",
+    "events"
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Worker scrape availability",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"labops-events-workers\"}",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "Worker heartbeat age",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "time() - labops_worker_heartbeat_timestamp_seconds",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Durable outbox by state",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (status) (labops_worker_outbox_events)",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "Unresolved and dead deliveries",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (consumer,status) (labops_worker_failed_deliveries{status!=\"RESOLVED\"})",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "Consumer-group broker lag",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (consumergroup,topic) (kafka_consumergroup_lag)",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "title": "Oldest parked retry",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (consumer) (labops_worker_retry_oldest_seconds)",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "Publish ack p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (worker,le) (rate(labops_worker_publish_ack_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "Committed database effect latency p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (consumer,le) (rate(labops_worker_effect_latency_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "title": "Synchronous offset commit outcomes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (consumer,outcome) (rate(labops_worker_offset_commits_total[5m]))",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "title": "Rejected ownership / schema",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (worker,code) (increase(labops_worker_lease_rejections_total[5m]) or increase(labops_worker_schema_rejections_total[5m]))",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "title": "Broker quorum / replicas",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (__name__) (redpanda_cluster_health_leaderless_partitions or redpanda_cluster_health_nodes_down or redpanda_cluster_health_under_replicated_partitions)",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "title": "Broker free disk",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "redpanda_storage_disk_free_bytes / redpanda_storage_disk_total_bytes",
+          "refId": "A",
+          "legendFormat": "{{consumer}}{{worker}}{{status}}{{outcome}}{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "description": "Broker offsets and durable RETRY/DEAD represent different completion boundaries. Effect histograms cover completed database effects; raw acceptance artifacts retain failures and unfinished inputs. Same-host validation does not establish AZ availability."
+}

@@ -44,17 +44,16 @@ class EventTests(Fixture, TestCase):
     def test_expired_lease_is_recovered(self):
         event=self.event();event.transport='kafka';event.status='PROCESSING';event.locked_until=timezone.now()-timedelta(seconds=1);event.save()
         self.assertEqual(claim_event().id,event.id)
-    def test_poison_message_retry_dlq_and_manual_replay(self):
+    def test_poison_message_is_dead_without_changing_original_payload(self):
         event=self.event();bad={**envelope(event),'schema_version':999}
         self.assertFalse(deliver('analytics',bad,'topic:0:1'))
-        for _ in range(4):
-            FailedDelivery.objects.update(next_attempt_at=timezone.now());retry_deliveries()
         row=FailedDelivery.objects.get();self.assertEqual(row.status,'DEAD')
+        self.assertEqual(retry_deliveries(),0)
         self.assertFalse(ProcessedEvent.objects.exists())
         with patch('labops.events.send') as send_mock:
             publish_dlq(None);self.assertEqual(send_mock.call_count,1)
-        row.envelope=envelope(event);row.status='RETRY';row.next_attempt_at=timezone.now();row.save();retry_deliveries()
-        row.refresh_from_db();self.assertEqual(row.status,'RESOLVED');self.assertEqual(InventoryProjection.objects.get().quantity,10)
+        self.assertEqual(row.envelope,bad)
+
     def test_later_aggregate_version_waits_for_earlier(self):
         event=self.event();event.transport='kafka';event.status='DEAD';event.save()
         later=OutboxEvent.objects.create(event_type=event.event_type,transport='kafka',aggregate_id=event.aggregate_id,aggregate_type=event.aggregate_type,aggregate_version=event.aggregate_version+1,dedupe_key='later')
@@ -77,14 +76,14 @@ from unittest import skipUnless
 
 @skipUnless(connection.vendor=='postgresql','PostgreSQL deferred constraints')
 class DeferredConstraintRetryTests(TransactionTestCase):
-    def test_invalid_foreign_key_advances_retry_and_reaches_dead(self):
+    def test_invalid_foreign_key_is_quarantined_without_partial_effect(self):
         import uuid
-        event={'event_id':str(uuid.uuid4()),'schema_version':1,'event_type':'inventory.issue.posted',
-               'aggregate_id':str(uuid.uuid4()),'aggregate_version':1,'payload':{'lines':[
-               {'batch_id':str(uuid.uuid4()),'warehouse_id':str(uuid.uuid4()),'delta_qty':'-1'}]}}
-        self.assertFalse(deliver('analytics',event,'missing-fk:0:0'))
-        for attempts in range(2,6):
-            FailedDelivery.objects.update(next_attempt_at=timezone.now())
-            self.assertEqual(retry_deliveries(),1)
-            row=FailedDelivery.objects.get();self.assertEqual(row.attempts,attempts)
-        self.assertEqual(row.status,'DEAD');self.assertFalse(ProcessedEvent.objects.exists())
+        from django.utils import timezone
+        movement_id=uuid.uuid4()
+        row=OutboxEvent.objects.create(event_type='inventory.issue.posted',aggregate_type='stockmovement',
+            aggregate_id=movement_id,dedupe_key='invalid-fk',payload_json={'movement_id':str(movement_id),
+            'movement_type':'ISSUE','title':'Issue posted','body':'missing batch','recipients':[], 'lines':[
+            {'batch_id':str(uuid.uuid4()),'warehouse_id':str(uuid.uuid4()),'delta_qty':'-1','unit_cost':'1'}]})
+        self.assertFalse(deliver('analytics',envelope(row),'missing-fk:0:0'))
+        failed=FailedDelivery.objects.get();self.assertEqual(failed.status,'DEAD')
+        self.assertFalse(ProcessedEvent.objects.exists());self.assertFalse(InventoryProjection.objects.exists())

@@ -1,0 +1,20 @@
+# Reference for a new production cluster; review capacity and identity policy
+# before importing with the version-matched rpk administration profile.
+# Broker listeners, TLS files, persistent disks, racks and CPU/memory require
+# per-node/operator configuration in addition to these cluster properties.
+# Use per-listener authentication_method: sasl with the explicit authorization
+# flag. Do not additionally enable the legacy global enable_sasl mode.
+kafka_enable_authorization: true
+admin_api_require_auth: true
+superusers:
+  - admin
+auto_create_topics_enabled: false
+default_topic_partitions: 3
+default_topic_replications: 3
+internal_topic_replication_factor: 3
+enable_rack_awareness: true
+write_caching_default: disabled
+# Initial operational assumptions, to be frozen against measured workload.
+storage_space_alert_free_threshold_percent: 20
+storage_space_alert_free_threshold_bytes: 0
+storage_min_free_bytes: 5368709120
